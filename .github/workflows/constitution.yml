@@ -62,10 +62,11 @@ jobs:
           sudo mkdir -p "$trusted_root/scripts" "$trusted_root/tests" \
             "$current_root/scripts" "$current_root/tests" "$test_home"
 
-          # Both suites exercise the proposed auditor only after the trusted
-          # constitutional auditor above has certified the checkout. Neither
-          # workspace contains the archive or Git metadata.
-          sudo cp -- scripts/audit_constitution.py "$trusted_root/scripts/"
+          # The frozen regression process receives only the trusted-baseline
+          # auditor. The proposed auditor is confined to the separate current
+          # suite below, after the trusted suite has completed successfully.
+          sudo install -m 0444 -- "$BLUE_FORGE_TRUSTED_AUDITOR" \
+            "$trusted_root/scripts/audit_constitution.py"
           sudo cp -- scripts/audit_constitution.py "$current_root/scripts/"
 
           # Materialize the frozen baseline tests from the trusted ref. PR-added
