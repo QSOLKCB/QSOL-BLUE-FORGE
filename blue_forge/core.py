@@ -382,9 +382,21 @@ class HardeningCase:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class HardeningResult:
-    payload: dict[str, Any]
+    """Immutable evaluated result with defensive-copy payload access."""
+
+    _payload_bytes: bytes
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        object.__setattr__(self, "_payload_bytes", canonical_bytes(payload))
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        value = loads_strict(self._payload_bytes.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise AssertionError("hardening result payload is not an object")
+        return value
 
     @property
     def hardened(self) -> bool:
@@ -443,13 +455,17 @@ def evaluate(case: HardeningCase) -> HardeningResult:
 
     failed = [name for name, passed in predicates.items() if not passed]
     decision = v.decision
-    if failed and decision is Decision.ALLOW:
+    if not predicates["authority_not_expanded"]:
+        decision = Decision.DENY
+    elif failed and decision is Decision.ALLOW:
         decision = Decision.REVIEW
 
+    case_sha256 = digest(_case_material(case))
     material: dict[str, Any] = {
         "schema": RESULT_SCHEMA,
         "contract": CONTRACT,
         "case_id": case.case_id,
+        "case_sha256": case_sha256,
         "invariant_id": case.invariant_id,
         "attack_class": case.attack_class,
         "mitigation_id": p.mitigation_id,
@@ -468,19 +484,24 @@ def evaluate(case: HardeningCase) -> HardeningResult:
 
 def regression_record(case: HardeningCase, result: HardeningResult) -> dict[str, Any]:
     """Create deterministic permanent-regression memory bound to this exact case."""
-    expected = evaluate(case)
-    if result.payload != expected.payload:
+    result_payload = result.payload
+    expected_payload = evaluate(case).payload
+    if result_payload != expected_payload:
         raise ValidationError("hardening result does not match supplied case")
+
+    case_sha256 = digest(_case_material(case))
+    if result_payload["case_sha256"] != case_sha256:
+        raise ValidationError("hardening result case digest does not match supplied case")
 
     material: dict[str, Any] = {
         "schema": REGRESSION_SCHEMA,
         "contract": CONTRACT,
         "case_id": case.case_id,
-        "case_sha256": digest(_case_material(case)),
+        "case_sha256": case_sha256,
         "invariant_id": case.invariant_id,
         "attack_class": case.attack_class,
         "mitigation_id": case.proposal.mitigation_id,
-        "hardening_status": result.payload["status"],
+        "hardening_status": result_payload["status"],
         "hardening_receipt_sha256": result.receipt_sha256,
         "hostile_evidence_ids": [
             case.verification.original.evidence_id,
@@ -490,7 +511,7 @@ def regression_record(case: HardeningCase, result: HardeningResult) -> dict[str,
             item.evidence_id for item in case.verification.benign_controls
         ],
         "source_sha256": sorted(item.source_sha256 for item in case.evidence()),
-        "failed_predicates": list(result.payload["failed_predicates"]),
+        "failed_predicates": list(result_payload["failed_predicates"]),
     }
     record = dict(material)
     record["record_sha256"] = digest(material)
