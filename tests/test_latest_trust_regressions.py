@@ -114,7 +114,9 @@ class LatestTrustBoundaryTests(unittest.TestCase):
         self.assert_fails("trusted regression test removed from HEAD")
 
     def test_new_regression_test_symlink_is_rejected(self) -> None:
-        link_path = self.repo / "tests/test_archive.py"
+        tests_dir = self.repo / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        link_path = tests_dir / "test_archive.py"
         link_path.symlink_to("../archive/HERESY-SEC-0.3.0.zip")
         base.git(self.repo, "add", "tests/test_archive.py")
         base.git(self.repo, "commit", "-m", "add symlinked regression test")
