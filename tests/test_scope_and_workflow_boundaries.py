@@ -95,6 +95,23 @@ class ScopeAndWorkflowBoundaryTests(unittest.TestCase):
         base.git(self.repo, "commit", "-m", "add default archive execution workflow")
         self.assert_fails("default-triggered workflow introduced outside trusted baseline")
 
+    def test_block_sequence_default_workflow_is_governed(self) -> None:
+        base.write(
+            self.repo,
+            ".github/workflows/execute-archive-sequence.yml",
+            "name: forbidden block-sequence archive execution\n\n"
+            "on:\n"
+            "  - pull_request\n\n"
+            "jobs:\n"
+            "  execute:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - run: unzip archive/HERESY-SEC-0.3.0.zip -d /tmp/heresy && python3 /tmp/heresy/tool.py\n",
+        )
+        base.git(self.repo, "add", ".github/workflows/execute-archive-sequence.yml")
+        base.git(self.repo, "commit", "-m", "add block-sequence default workflow")
+        self.assert_fails("default-triggered workflow introduced outside trusted baseline")
+
 
 if __name__ == "__main__":
     unittest.main()
