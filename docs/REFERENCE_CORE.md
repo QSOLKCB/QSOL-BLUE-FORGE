@@ -51,6 +51,9 @@ The runtime parser is intentionally narrower than general JSON tooling:
 - JSON nesting is bounded;
 - arrays are bounded at the public strict-parser boundary, including nested arrays;
 - strings are bounded;
+- leading/trailing whitespace follows one explicit shared policy across runtime and schema;
+- hostile variants are bounded to 255 entries so the original plus hostile IDs remain within the 256-item canonical array ceiling;
+- benign controls are bounded to 256 entries;
 - unknown top-level or nested fields are rejected;
 - constitutional invariant identifiers are restricted to `BF-INV-001` through
   `BF-INV-016`.
@@ -89,6 +92,9 @@ it inside the same immutable case.
 If any mandatory hardening predicate fails while a supplied verification
 decision is `ALLOW`, the reference core clamps the emitted result to at least
 `REVIEW`.
+
+Authority expansion is stricter: `authority_not_expanded=false` forces
+`DENY`, matching `BF-INV-001`.
 
 Unknown or incomplete evidence therefore cannot manufacture an `ALLOW`.
 
@@ -173,8 +179,15 @@ OOM
 
 ### `replay_exact`
 
-Each evidence record contains a reference-result digest and replay-result
-digest. They must match exactly.
+Replay equality has three mandatory conditions:
+
+1. every evidence item in the case must use the **same pinned reference engine identity**;
+2. each evidence item's `replay_engine_sha256` must equal its own `reference_engine_sha256`;
+3. each evidence item's `replay_result_sha256` must equal its `reference_result_sha256`.
+
+Equal result digests from different engine builds are therefore not treated as
+exact replay. Both engine identities are bound into the canonical case digest
+and hardening receipt.
 
 ### `authority_not_expanded`
 
@@ -209,11 +222,17 @@ deterministic `blue-forge.regression-record/v1` object containing:
 - invariant and attack-class identity;
 - mitigation identity;
 - hardening receipt digest;
-- hostile evidence IDs;
-- benign-control IDs;
-- source evidence digests;
+- hostile evidence IDs in canonical sorted order;
+- benign-control IDs in canonical sorted order;
+- source evidence digests keyed by evidence ID;
+- reference and replay engine identities keyed by evidence ID;
 - failed predicates;
 - a deterministic record digest.
+
+Using keyed digest/engine maps avoids creating a combined evidence array larger
+than the canonical 256-item array ceiling. Equivalent case JSON with different
+object member order therefore produces the same regression record and
+`record_sha256`.
 
 The record is data. The command does not write into the repository or execute
 fixtures automatically.
@@ -240,7 +259,7 @@ Exit codes:
 3  valid input but NOT_HARDENED
 ```
 
-Output is canonical single-line JSON.
+Output is canonical UTF-8 single-line JSON.
 
 ## Synthetic reference fixture
 
@@ -261,7 +280,8 @@ The case includes:
 - two hostile attack-class variants;
 - two benign controls;
 - narrowed authority;
-- exact replay receipts;
+- a single pinned reference engine identity across the case;
+- exact replay engine/result receipts;
 - exact reference/candidate equivalence.
 
 ## Deliberate omissions
