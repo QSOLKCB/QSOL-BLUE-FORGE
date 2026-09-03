@@ -126,6 +126,13 @@ def populate(repo: Path, value: dict) -> None:
     write(repo, "CONTRACT_VERSION", CONTRACT + "\n")
     write(repo, "contracts/core-invariants-v1.json", json.dumps(value, indent=2) + "\n")
     write(repo, "docs/CORE_INVARIANTS.md", core_markdown(value))
+    write(
+        repo,
+        "docs/CONTRACT_MIGRATIONS.md",
+        "# Contract migrations\n\n"
+        "Schema `blue-forge.contract-migration/v1`.\n"
+        "Mode `additive-preserve-v1`.\n",
+    )
     write(repo, "README.md", readme_markdown(value))
     write(repo, "README4AI.md", f"# AI\n\nContract `{CONTRACT}`. HERESY verify.\n")
     write(
