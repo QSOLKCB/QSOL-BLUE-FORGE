@@ -11,7 +11,7 @@ MAX_CASE_BYTES = 1_048_576
 from .core import (
     BlueForgeError,
     HardeningCase,
-    canonical_text,
+    canonical_bytes,
     evaluate,
     loads_strict,
     regression_record,
@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = result.payload
         if args.command == "regression":
             payload = regression_record(case, result)
-        print(canonical_text(payload))
+        sys.stdout.buffer.write(canonical_bytes(payload) + b"\n")
         return 0 if result.hardened else 3
     except BlueForgeError as exc:
         print(f"blue_forge=FAIL reason={exc}", file=sys.stderr)
