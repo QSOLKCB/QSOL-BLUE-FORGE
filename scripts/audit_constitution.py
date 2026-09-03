@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -36,6 +37,8 @@ SECURITY_PATH = Path("SECURITY.md")
 ETHICS_PATH = Path("CODE_OF_ETHICS.md")
 README4AI_PATH = Path("README4AI.md")
 AGENTS_PATH = Path("AGENTS.md")
+WORKFLOW_ROOT = Path(".github/workflows")
+DEFAULT_WORKFLOW_TRIGGERS = {"push", "pull_request", "pull_request_target"}
 
 REQUIRED_FILES = [
     Path("README.md"),
@@ -57,7 +60,7 @@ REQUIRED_FILES = [
 ]
 
 # These artifacts define immutable v1 semantics, machine-facing policy,
-# security/ethical policy, or source provenance. Their committed objects and raw
+# security/ethical policy, or source provenance. Their HEAD objects and raw
 # checked-out bytes must match the trusted external baseline. General explanatory
 # prose remains editable when its targeted semantic checks continue to hold.
 PINNED_V1_PATHS = [
@@ -167,17 +170,10 @@ def tree_entry(commit: str, path: Path) -> tuple[str, str] | None:
     return mode, oid
 
 
-def committed_entry(path: Path) -> tuple[str, str]:
-    output = run_git("ls-files", "--stage", "--", str(path))
-    lines = [line for line in output.splitlines() if line]
-    require(len(lines) == 1, f"expected exactly one committed index entry for {path}")
-    metadata, separator, listed_path = lines[0].partition("\t")
-    require(separator == "\t" and listed_path == str(path), f"unexpected index entry for {path}")
-    fields = metadata.split()
-    require(len(fields) == 3, f"malformed index metadata for {path}")
-    mode, oid, stage = fields
-    require(stage == "0", f"non-stage-0 index entry for {path}")
-    return mode, oid
+def head_entry(path: Path) -> tuple[str, str]:
+    entry = tree_entry("HEAD", path)
+    require(entry is not None, f"required constitutional path is not committed in HEAD: {path}")
+    return entry
 
 
 def commit_text(commit: str, path: Path) -> str | None:
@@ -189,6 +185,64 @@ def commit_text(commit: str, path: Path) -> str | None:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return None
+
+
+def tree_paths(commit: str, prefix: Path | None = None) -> list[Path]:
+    args = ["ls-tree", "-r", "--name-only", commit]
+    if prefix is not None:
+        args.extend(["--", str(prefix)])
+    output = run_git(*args)
+    return [Path(line) for line in output.splitlines() if line]
+
+
+def agent_policy_paths(commit: str) -> set[Path]:
+    return {path for path in tree_paths(commit) if path.name == "AGENTS.md"}
+
+
+def workflow_paths(commit: str) -> set[Path]:
+    return {
+        path
+        for path in tree_paths(commit, WORKFLOW_ROOT)
+        if path.suffix.lower() in {".yml", ".yaml"}
+    }
+
+
+def workflow_has_default_trigger(text: str) -> bool:
+    """Recognize the default automatic triggers we govern without a YAML dependency."""
+    lines = text.splitlines()
+    for index, raw_line in enumerate(lines):
+        line = raw_line.split("#", 1)[0].rstrip()
+        match = re.match(r"^(?:on|['\"]on['\"])\s*:\s*(.*)$", line)
+        if not match:
+            continue
+
+        tail = match.group(1).strip().lower()
+        if any(re.search(rf"\b{re.escape(trigger)}\b", tail) for trigger in DEFAULT_WORKFLOW_TRIGGERS):
+            return True
+        if tail:
+            return False
+
+        for nested_raw in lines[index + 1 :]:
+            nested = nested_raw.split("#", 1)[0].rstrip()
+            if not nested.strip():
+                continue
+            if not nested.startswith((" ", "\t")):
+                break
+            key = nested.strip().split(":", 1)[0].strip().strip("'\"")
+            if key in DEFAULT_WORKFLOW_TRIGGERS:
+                return True
+        return False
+    return False
+
+
+def default_workflow_paths(commit: str) -> set[Path]:
+    result: set[Path] = set()
+    for path in workflow_paths(commit):
+        text = commit_text(commit, path)
+        require(text is not None, f"workflow is not UTF-8 text at {commit}: {path}")
+        if workflow_has_default_trigger(text):
+            result.add(path)
+    return result
 
 
 def trusted_baseline_commit() -> str:
@@ -215,19 +269,19 @@ def audit_required_files() -> None:
         target = ROOT / path
         require(not target.is_symlink(), f"required constitutional path is a symlink: {path}")
         require(target.is_file(), f"required constitutional path is not a regular file: {path}")
-        mode, _ = committed_entry(path)
+        mode, _ = head_entry(path)
         require(mode == "100644", f"required constitutional path mode changed: {path} mode={mode}")
 
 
 def audit_pinned_v1_artifacts(baseline_commit: str) -> dict[Path, str]:
-    """Require current committed and raw checked-out bytes to equal the trusted baseline."""
+    """Require HEAD objects and raw checked-out bytes to equal the trusted baseline."""
     baseline_oids: dict[Path, str] = {}
     for path in PINNED_V1_PATHS:
         baseline = tree_entry(baseline_commit, path)
         require(baseline is not None, f"trusted baseline missing pinned artifact: {path}")
         baseline_mode, baseline_oid = baseline
 
-        current_mode, current_oid = committed_entry(path)
+        current_mode, current_oid = head_entry(path)
         require(current_mode == baseline_mode, f"pinned artifact mode changed: {path} mode={current_mode}")
         require(current_oid == baseline_oid, f"pinned v1 artifact changed without new contract identity: {path}")
 
@@ -237,6 +291,31 @@ def audit_pinned_v1_artifacts(baseline_commit: str) -> dict[Path, str]:
         require(working_oid == baseline_oid, f"checked-out pinned artifact differs from v1 baseline: {path}")
         baseline_oids[path] = baseline_oid
     return baseline_oids
+
+
+def audit_agent_policy_scope(baseline_commit: str) -> None:
+    baseline = agent_policy_paths(baseline_commit)
+    current = agent_policy_paths("HEAD")
+    added = sorted(str(path) for path in current - baseline)
+    removed = sorted(str(path) for path in baseline - current)
+    require(not added, f"scoped AGENTS policy introduced outside trusted baseline: {added}")
+    require(not removed, f"trusted AGENTS policy removed from HEAD: {removed}")
+
+
+def audit_default_workflows(baseline_commit: str) -> None:
+    """Only trusted-baseline automatic workflows may run on push/PR events."""
+    baseline = default_workflow_paths(baseline_commit)
+    current = default_workflow_paths("HEAD")
+    added = sorted(str(path) for path in current - baseline)
+    removed = sorted(str(path) for path in baseline - current)
+    require(not added, f"default-triggered workflow introduced outside trusted baseline: {added}")
+    require(not removed, f"trusted default-triggered workflow removed from HEAD: {removed}")
+
+    for path in sorted(current, key=str):
+        baseline_entry = tree_entry(baseline_commit, path)
+        current_entry = tree_entry("HEAD", path)
+        require(baseline_entry is not None and current_entry is not None, f"missing governed workflow: {path}")
+        require(current_entry == baseline_entry, f"default-triggered workflow changed outside trusted baseline: {path}")
 
 
 def audit_version(registry: dict) -> None:
@@ -307,8 +386,7 @@ def audit_documentation(registry: dict) -> None:
     for effect in ("DISRUPT", "TURN", "FIX", "BLOCK"):
         require(effect in engagement, f"ENGAGEMENT_AREA lost defensive effect {effect}")
 
-    # These token checks remain as readable diagnostics. SECURITY.md is also pinned
-    # byte-for-byte to the trusted v1 baseline, so contradictory additions cannot pass.
+    # Readable diagnostics; the complete policy documents are baseline-pinned above.
     security_lower = security.lower()
     require(
         "default ci inspects them only with bounded, non-executing mechanisms" in security_lower,
@@ -324,9 +402,6 @@ def audit_documentation(registry: dict) -> None:
         require(core.count(heading) == 1, f"missing or duplicated normative heading: {heading}")
         require(invariant_id in readme, f"README no longer exposes {invariant_id}")
 
-    # These path checks remain as readable diagnostics. AGENTS.md is also pinned
-    # byte-for-byte to the trusted v1 baseline, so its hard rules cannot be replaced
-    # while retaining only the expected path strings.
     require(str(REGISTRY_PATH) in agents, "AGENTS.md does not point to the registry")
     require("scripts/audit_constitution.py" in agents, "AGENTS.md does not require this audit")
 
@@ -359,6 +434,8 @@ def main() -> int:
         audit_required_files()
         baseline_commit = trusted_baseline_commit()
         baseline_oids = audit_pinned_v1_artifacts(baseline_commit)
+        audit_agent_policy_scope(baseline_commit)
+        audit_default_workflows(baseline_commit)
         registry = load_registry()
         audit_version(registry)
         audit_registry(registry)
