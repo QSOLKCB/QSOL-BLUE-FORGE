@@ -242,7 +242,7 @@ def workflow_has_default_trigger(text: str) -> bool:
     This is deliberately not a general YAML parser. Supported block/scalar/flow
     forms are recognized only to prove the narrow manual-only case. Any document
     form that cannot be proved manual-only, including root flow mappings, aliases,
-    or future syntax, is governed as automatic.
+    mixed inline mappings, or future syntax, is governed as automatic.
     """
     lines = text.splitlines()
     for index, raw_line in enumerate(lines):
@@ -263,7 +263,9 @@ def workflow_has_default_trigger(text: str) -> bool:
                 return events != {MANUAL_WORKFLOW_TRIGGER}
             if lowered.startswith("{") and lowered.endswith("}"):
                 body = lowered[1:-1].strip()
-                if re.fullmatch(r"['\"]?workflow_dispatch['\"]?\s*:\s*\{.*\}", body):
+                # Only the exact trivial manual mapping is exempt. Any comma,
+                # nested payload, second event, or ambiguous mapping is governed.
+                if re.fullmatch(r"['\"]?workflow_dispatch['\"]?\s*:\s*\{\s*\}", body):
                     return False
                 return True
             return _event_name(lowered) != MANUAL_WORKFLOW_TRIGGER
@@ -369,11 +371,18 @@ def audit_agent_policy_scope(baseline_commit: str) -> None:
 
 
 def audit_regression_test_floor(baseline_commit: str) -> None:
-    """The trusted baseline regression suite may be extended but not removed/replaced."""
+    """Trusted tests stay exact; every current test must be a regular committed file."""
     baseline = regression_test_paths(baseline_commit)
     current = regression_test_paths("HEAD")
     removed = sorted(str(path) for path in baseline - current)
     require(not removed, f"trusted regression test removed from HEAD: {removed}")
+
+    for path in sorted(current, key=str):
+        entry = tree_entry("HEAD", path)
+        require(entry is not None, f"regression test missing from HEAD: {path}")
+        mode, _ = entry
+        require(mode == "100644", f"regression test is not regular mode 100644: {path} mode={mode}")
+        _require_worktree_matches_head(path)
 
     for path in sorted(baseline, key=str):
         baseline_entry = tree_entry(baseline_commit, path)
@@ -406,6 +415,25 @@ def _validated_repo_path(value: object, label: str) -> Path:
     require(".." not in path.parts and "." not in path.parts, f"{label} must be normalized and non-escaping")
     require(str(path) == value, f"{label} must be normalized")
     return path
+
+
+def _authorized_artifacts(value: object, label: str) -> list[tuple[Path, str]]:
+    require(isinstance(value, list) and value, f"migration authorization needs {label}")
+    result: list[tuple[Path, str]] = []
+    for index, item in enumerate(value):
+        require(type(item) is dict, f"{label}[{index}] must be an object")
+        require(set(item) == {"path", "git_oid"}, f"{label}[{index}] fields changed")
+        path = _validated_repo_path(item.get("path"), f"{label}[{index}].path")
+        oid = item.get("git_oid")
+        require(
+            type(oid) is str and re.fullmatch(r"[0-9a-f]{40}", oid) is not None,
+            f"{label}[{index}].git_oid must be a lowercase 40-hex Git object id",
+        )
+        result.append((path, oid))
+
+    paths = [path for path, _ in result]
+    require(len(set(paths)) == len(paths), f"duplicate paths in migration authorization {label}")
+    return result
 
 
 def _trusted_migration_authorization(baseline_commit: str, current_version: str) -> tuple[Path, dict] | None:
@@ -444,21 +472,33 @@ def _trusted_migration_authorization(baseline_commit: str, current_version: str)
     require(baseline_entry is not None and current_entry == baseline_entry, f"migration authorization is not trusted-baseline exact: {path}")
     _require_worktree_matches_head(path)
 
-    successor = value["successor_contract_files"]
-    evidence = value["conformance_evidence"]
-    require(isinstance(successor, list) and successor, f"migration authorization needs successor contract files: {path}")
-    require(isinstance(evidence, list) and evidence, f"migration authorization needs conformance evidence: {path}")
-
-    successor_paths = [_validated_repo_path(item, "successor contract path") for item in successor]
-    evidence_paths = [_validated_repo_path(item, "conformance evidence path") for item in evidence]
-    require(len(set(successor_paths)) == len(successor_paths), "duplicate successor contract paths in migration authorization")
-    require(len(set(evidence_paths)) == len(evidence_paths), "duplicate conformance evidence paths in migration authorization")
-    require(any(path.parts and path.parts[0] == "contracts" for path in successor_paths), "successor contract files must include a contracts/ artifact")
+    successor = _authorized_artifacts(value["successor_contract_files"], "successor contract files")
+    evidence = _authorized_artifacts(value["conformance_evidence"], "conformance evidence")
+    successor_paths = [artifact_path for artifact_path, _ in successor]
+    evidence_paths = [artifact_path for artifact_path, _ in evidence]
+    require(
+        any(artifact_path.parts and artifact_path.parts[0] == "contracts" for artifact_path in successor_paths),
+        "successor contract files must include a contracts/ artifact",
+    )
+    require(
+        set(successor_paths).isdisjoint(evidence_paths),
+        "successor contract and conformance evidence paths must be disjoint",
+    )
 
     frozen = set(PINNED_V1_PATHS) | {CONTRACT_VERSION_PATH}
-    for listed_path in successor_paths + evidence_paths:
+    for listed_path, authorized_oid in successor + evidence:
         require(listed_path not in frozen, f"migration cannot repurpose frozen v1 path: {listed_path}")
-        _require_worktree_matches_head(listed_path)
+        current_mode, current_oid = head_entry(listed_path)
+        require(current_mode == "100644", f"authorized migration artifact is not regular mode 100644: {listed_path}")
+        require(
+            current_oid == authorized_oid,
+            f"authorized migration artifact object mismatch: {listed_path}",
+        )
+        working_oid = _require_worktree_matches_head(listed_path)
+        require(
+            working_oid == authorized_oid,
+            f"authorized migration artifact working bytes mismatch: {listed_path}",
+        )
 
     return path, value
 
