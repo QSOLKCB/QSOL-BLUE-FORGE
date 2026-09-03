@@ -35,10 +35,48 @@ jobs:
           python-version: "3.12"
 
       - name: Compile audit tooling
-        run: python3 -m py_compile scripts/audit_constitution.py tests/test_audit_constitution.py
+        run: python3 -m py_compile scripts/audit_constitution.py
 
       - name: Audit constitutional contract
         run: python3 scripts/audit_constitution.py
 
-      - name: Audit regression tests
-        run: python3 -m unittest discover -s tests -v
+      - name: Prepare isolated regression workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_root="${RUNNER_TEMP}/blue-forge-regression"
+          test_home="${RUNNER_TEMP}/blue-forge-regression-home"
+          rm -rf "$test_root" "$test_home"
+          mkdir -p "$test_root/scripts" "$test_root/tests" "$test_home"
+          cp scripts/audit_constitution.py "$test_root/scripts/"
+          cp tests/test*.py "$test_root/tests/"
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin blueforge-test
+          sudo chown -R blueforge-test:blueforge-test "$test_root" "$test_home"
+          printf 'BLUE_FORGE_TEST_ROOT=%s\n' "$test_root" >> "$GITHUB_ENV"
+          printf 'BLUE_FORGE_TEST_HOME=%s\n' "$test_home" >> "$GITHUB_ENV"
+
+      - name: Audit regression tests in sterile sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+
+          restore_workspace() {
+            sudo chmod 0755 "$GITHUB_WORKSPACE" || true
+            sudo chown "$runner_uid:$runner_gid" "$GITHUB_WORKSPACE" || true
+          }
+          trap restore_workspace EXIT
+
+          test ! -e "${BLUE_FORGE_TEST_ROOT}/archive"
+          test ! -e "${BLUE_FORGE_TEST_ROOT}/.git"
+
+          sudo chown root:root "$GITHUB_WORKSPACE"
+          sudo chmod 000 "$GITHUB_WORKSPACE"
+
+          cd "$BLUE_FORGE_TEST_ROOT"
+          sudo unshare --net -- \
+            runuser -u blueforge-test -- \
+            env HOME="$BLUE_FORGE_TEST_HOME" PATH="$PATH" \
+            "$python_bin" -m unittest discover -s tests -v
