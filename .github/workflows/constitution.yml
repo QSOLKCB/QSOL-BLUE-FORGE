@@ -34,11 +34,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Compile audit tooling
-        run: python3 -m py_compile scripts/audit_constitution.py
+      - name: Materialize trusted constitutional auditor
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_auditor="/tmp/blue-forge-trusted-audit-${GITHUB_RUN_ID}.py"
+          git show "${BLUE_FORGE_TRUSTED_REF}:scripts/audit_constitution.py" > "$trusted_auditor"
+          chmod 0444 "$trusted_auditor"
+          python3 -m py_compile "$trusted_auditor"
+          printf 'BLUE_FORGE_TRUSTED_AUDITOR=%s\n' "$trusted_auditor" >> "$GITHUB_ENV"
 
-      - name: Audit constitutional contract
-        run: python3 scripts/audit_constitution.py
+      - name: Audit constitutional contract with trusted auditor
+        shell: bash
+        run: |
+          set -euo pipefail
+          BLUE_FORGE_AUDIT_ROOT="$GITHUB_WORKSPACE" \
+            python3 "$BLUE_FORGE_TRUSTED_AUDITOR"
 
       - name: Prepare isolated regression workspace
         shell: bash
