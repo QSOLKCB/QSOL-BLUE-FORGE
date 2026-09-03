@@ -80,10 +80,10 @@ jobs:
             esac
           done < <(git ls-tree -r -z --name-only "$BLUE_FORGE_TRUSTED_REF" -- tests)
 
-          # Materialize trusted reference-core source and inert fixtures.
+          # Materialize trusted reference-core source, schemas and inert fixtures.
           while IFS= read -r -d '' source_path; do
             case "$source_path" in
-              blue_forge/*.py|fixtures/*.json|fixtures/*/*.json|fixtures/*/README.md)
+              blue_forge/*.py|fixtures/*.json|fixtures/*/*.json|fixtures/*/README.md|schemas/*.json)
                 mode="$(git ls-tree "$BLUE_FORGE_TRUSTED_REF" -- "$source_path" | awk '{print $1}')"
                 test "$mode" = "100644"
                 destination="$trusted_root/$source_path"
@@ -91,7 +91,7 @@ jobs:
                 git show "${BLUE_FORGE_TRUSTED_REF}:$source_path" | sudo tee "$destination" >/dev/null
                 ;;
             esac
-          done < <(git ls-tree -r -z --name-only "$BLUE_FORGE_TRUSTED_REF" -- blue_forge fixtures)
+          done < <(git ls-tree -r -z --name-only "$BLUE_FORGE_TRUSTED_REF" -- blue_forge fixtures schemas)
 
           # Materialize current tests from committed Git blobs, never by following
           # working-tree links.
@@ -107,11 +107,11 @@ jobs:
             esac
           done < <(git ls-tree -r -z --name-only HEAD -- tests)
 
-          # Materialize proposed reference-core source and inert fixtures from
-          # committed Git blobs. Non-regular modes fail before any import.
+          # Materialize proposed reference-core source, schemas and inert fixtures
+          # from committed Git blobs. Non-regular modes fail before any import.
           while IFS= read -r -d '' source_path; do
             case "$source_path" in
-              blue_forge/*.py|fixtures/*.json|fixtures/*/*.json|fixtures/*/README.md)
+              blue_forge/*.py|fixtures/*.json|fixtures/*/*.json|fixtures/*/README.md|schemas/*.json)
                 mode="$(git ls-tree HEAD -- "$source_path" | awk '{print $1}')"
                 test "$mode" = "100644"
                 destination="$current_root/$source_path"
@@ -119,7 +119,7 @@ jobs:
                 git show "HEAD:$source_path" | sudo tee "$destination" >/dev/null
                 ;;
             esac
-          done < <(git ls-tree -r -z --name-only HEAD -- blue_forge fixtures)
+          done < <(git ls-tree -r -z --name-only HEAD -- blue_forge fixtures schemas)
 
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin blueforge-test
           sudo chown -R blueforge-test:blueforge-test "$trusted_root" "$current_root" "$test_home"
