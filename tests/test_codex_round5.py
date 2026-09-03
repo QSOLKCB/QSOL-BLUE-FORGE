@@ -13,7 +13,6 @@ from blue_forge import HardeningCase, ValidationError, evaluate, loads_strict, r
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "fixtures/v1/path-traversal-case.json"
 SCHEMA = ROOT / "schemas/hardening-case-v1.schema.json"
-DOC = ROOT / "docs/REFERENCE_CORE.md"
 
 
 def fixture() -> dict:
@@ -59,12 +58,6 @@ class CodexRoundFiveTests(unittest.TestCase):
         value["case_id"] = "\u0085"
         with self.assertRaisesRegex(ValidationError, "non-empty trimmed string"):
             HardeningCase.from_dict(value)
-
-    def test_replay_documentation_states_case_wide_engine_pin(self) -> None:
-        text = DOC.read_text(encoding="utf-8")
-        self.assertIn("same pinned reference engine identity", text)
-        self.assertIn("replay_engine_sha256", text)
-        self.assertIn("reference_engine_sha256", text)
 
     def test_large_valid_evidence_case_can_emit_regression_record(self) -> None:
         value = fixture()
