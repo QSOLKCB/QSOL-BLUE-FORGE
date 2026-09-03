@@ -14,23 +14,53 @@
     "verification"
   ],
   "properties": {
-    "schema": {"const": "blue-forge.hardening-case/v1"},
-    "contract": {"const": "blue-forge.core-invariants/v1"},
-    "case_id": {"$ref": "#/$defs/nonempty"},
-    "invariant_id": {"type": "string", "pattern": "^BF-INV-(00[1-9]|01[0-6])$"},
-    "attack_class": {"$ref": "#/$defs/nonempty"},
-    "proposal": {"$ref": "#/$defs/proposal"},
-    "verification": {"$ref": "#/$defs/verification"}
+    "schema": {
+      "const": "blue-forge.hardening-case/v1"
+    },
+    "contract": {
+      "const": "blue-forge.core-invariants/v1"
+    },
+    "case_id": {
+      "$ref": "#/$defs/nonempty"
+    },
+    "invariant_id": {
+      "type": "string",
+      "pattern": "^BF-INV-(00[1-9]|01[0-6])$"
+    },
+    "attack_class": {
+      "$ref": "#/$defs/nonempty"
+    },
+    "proposal": {
+      "$ref": "#/$defs/proposal"
+    },
+    "verification": {
+      "$ref": "#/$defs/verification"
+    }
   },
   "$defs": {
-    "nonempty": {"type": "string", "minLength": 1, "maxLength": 4096},
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "decision": {"enum": ["ALLOW", "REVIEW", "DENY"]},
+    "nonempty": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "decision": {
+      "enum": [
+        "ALLOW",
+        "REVIEW",
+        "DENY"
+      ]
+    },
     "authority": {
       "type": "array",
       "maxItems": 256,
       "uniqueItems": true,
-      "items": {"$ref": "#/$defs/nonempty"}
+      "items": {
+        "$ref": "#/$defs/nonempty"
+      }
     },
     "evidence": {
       "type": "object",
@@ -46,14 +76,33 @@
         "replay_result_sha256"
       ],
       "properties": {
-        "id": {"$ref": "#/$defs/nonempty"},
-        "kind": {"enum": ["hostile", "benign"]},
-        "before": {"$ref": "#/$defs/nonempty"},
-        "after": {"$ref": "#/$defs/nonempty"},
-        "provenance": {"$ref": "#/$defs/nonempty"},
-        "source_sha256": {"$ref": "#/$defs/sha256"},
-        "reference_result_sha256": {"$ref": "#/$defs/sha256"},
-        "replay_result_sha256": {"$ref": "#/$defs/sha256"}
+        "id": {
+          "$ref": "#/$defs/nonempty"
+        },
+        "kind": {
+          "enum": [
+            "hostile",
+            "benign"
+          ]
+        },
+        "before": {
+          "$ref": "#/$defs/nonempty"
+        },
+        "after": {
+          "$ref": "#/$defs/nonempty"
+        },
+        "provenance": {
+          "$ref": "#/$defs/nonempty"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reference_result_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "replay_result_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
       }
     },
     "proposal": {
@@ -68,12 +117,24 @@
         "policy_authority"
       ],
       "properties": {
-        "producer": {"$ref": "#/$defs/nonempty"},
-        "mitigation_id": {"$ref": "#/$defs/nonempty"},
-        "decision": {"$ref": "#/$defs/decision"},
-        "pre_mitigation_authority": {"$ref": "#/$defs/authority"},
-        "requested_authority": {"$ref": "#/$defs/authority"},
-        "policy_authority": {"$ref": "#/$defs/authority"}
+        "producer": {
+          "$ref": "#/$defs/producer"
+        },
+        "mitigation_id": {
+          "$ref": "#/$defs/nonempty"
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "pre_mitigation_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "requested_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "policy_authority": {
+          "$ref": "#/$defs/authority"
+        }
       }
     },
     "verification": {
@@ -90,23 +151,73 @@
         "candidate_result_sha256"
       ],
       "properties": {
-        "producer": {"$ref": "#/$defs/nonempty"},
-        "decision": {"$ref": "#/$defs/decision"},
-        "observed_authority": {"$ref": "#/$defs/authority"},
-        "original": {"$ref": "#/$defs/evidence"},
+        "producer": {
+          "$ref": "#/$defs/producer"
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "observed_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "original": {
+          "$ref": "#/$defs/hostileEvidence"
+        },
         "variants": {
           "type": "array",
           "maxItems": 256,
-          "items": {"$ref": "#/$defs/evidence"}
+          "items": {
+            "$ref": "#/$defs/hostileEvidence"
+          }
         },
         "benign_controls": {
           "type": "array",
           "maxItems": 256,
-          "items": {"$ref": "#/$defs/evidence"}
+          "items": {
+            "$ref": "#/$defs/benignEvidence"
+          }
         },
-        "reference_result_sha256": {"$ref": "#/$defs/sha256"},
-        "candidate_result_sha256": {"$ref": "#/$defs/sha256"}
+        "reference_result_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "candidate_result_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
       }
+    },
+    "producer": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:@/-]{0,127})$"
+    },
+    "hostileEvidence": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/evidence"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "hostile"
+            }
+          }
+        }
+      ]
+    },
+    "benignEvidence": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/evidence"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "benign"
+            }
+          }
+        }
+      ]
     }
   }
 }
