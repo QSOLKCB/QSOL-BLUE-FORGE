@@ -25,14 +25,15 @@ EXPECTED_PREDICATES = (
     "reference_equivalence_preserved",
 )
 
-FAIL_CLOSED_STATES = frozenset({
-    "UNKNOWN", "MALFORMED", "UNSUPPORTED", "INCOMPLETE",
-    "BUDGET_EXCEEDED", "DECODE_ERROR", "TIMEOUT", "OOM",
+COMPLETE_EVIDENCE_STATES = frozenset({
+    "VULNERABLE", "BLOCKED", "HARMLESS", "ALLOWED", "PRESERVED",
 })
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+PRODUCER_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._:@/-]{0,127})$")
 MAX_JSON_DEPTH = 32
 MAX_ARRAY_ITEMS = 256
 MAX_STRING_CHARS = 4096
+MAX_INTEGER_DIGITS = 128
 INVARIANT = re.compile(r"^BF-INV-(?:00[1-9]|01[0-6])$")
 
 
@@ -71,6 +72,18 @@ def _reject_constant(value: str) -> Any:
     raise ValidationError(f"non-finite JSON value is not allowed: {value}")
 
 
+def _parse_int(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > MAX_INTEGER_DIGITS:
+        raise ValidationError(
+            f"integer exceeds {MAX_INTEGER_DIGITS} decimal digits"
+        )
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValidationError(f"invalid JSON integer: {value!r}") from exc
+
+
 def _validate_json_value(value: Any, path: str = "$", depth: int = 0) -> None:
     if depth > MAX_JSON_DEPTH:
         raise ValidationError(f"JSON nesting exceeds {MAX_JSON_DEPTH} at {path}")
@@ -83,6 +96,8 @@ def _validate_json_value(value: Any, path: str = "$", depth: int = 0) -> None:
     if isinstance(value, float):
         raise ValidationError(f"floating-point values are not allowed at {path}")
     if isinstance(value, list):
+        if len(value) > MAX_ARRAY_ITEMS:
+            raise ValidationError(f"array exceeds {MAX_ARRAY_ITEMS} items at {path}")
         for index, item in enumerate(value):
             _validate_json_value(item, f"{path}[{index}]", depth + 1)
         return
@@ -101,11 +116,12 @@ def loads_strict(text: str) -> Any:
             text,
             object_pairs_hook=_pairs_no_duplicates,
             parse_float=_reject_float,
+            parse_int=_parse_int,
             parse_constant=_reject_constant,
         )
     except ValidationError:
         raise
-    except (json.JSONDecodeError, RecursionError) as exc:
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise ValidationError(f"invalid or over-deep JSON: {exc}") from exc
     _validate_json_value(value)
     return value
@@ -160,6 +176,15 @@ def _string(value: Any, label: str) -> str:
     if type(value) is not str or not value.strip() or value != value.strip():
         raise ValidationError(f"{label} must be a non-empty trimmed string")
     return value
+
+
+def _producer_id(value: Any, label: str) -> str:
+    text = _string(value, label)
+    if not PRODUCER_ID.fullmatch(text):
+        raise ValidationError(
+            f"{label} must use canonical ASCII producer-id syntax"
+        )
+    return text
 
 
 def _sha256(value: Any, label: str) -> str:
@@ -224,7 +249,10 @@ class Evidence:
         )
 
     def complete(self) -> bool:
-        return self.before not in FAIL_CLOSED_STATES and self.after not in FAIL_CLOSED_STATES
+        return (
+            self.before in COMPLETE_EVIDENCE_STATES
+            and self.after in COMPLETE_EVIDENCE_STATES
+        )
 
 
 @dataclass(frozen=True)
@@ -244,7 +272,7 @@ class Proposal:
             "pre_mitigation_authority", "requested_authority", "policy_authority",
         }, "proposal")
         return cls(
-            producer=_string(obj["producer"], "proposal.producer"),
+            producer=_producer_id(obj["producer"], "proposal.producer"),
             mitigation_id=_string(obj["mitigation_id"], "proposal.mitigation_id"),
             decision=_decision(obj["decision"], "proposal.decision"),
             pre_mitigation_authority=_authority(
@@ -278,7 +306,7 @@ class Verification:
             "benign_controls", "reference_result_sha256", "candidate_result_sha256",
         }, "verification")
         return cls(
-            producer=_string(obj["producer"], "verification.producer"),
+            producer=_producer_id(obj["producer"], "verification.producer"),
             decision=_decision(obj["decision"], "verification.decision"),
             observed_authority=_authority(
                 obj["observed_authority"], "verification.observed_authority"
@@ -439,7 +467,11 @@ def evaluate(case: HardeningCase) -> HardeningResult:
 
 
 def regression_record(case: HardeningCase, result: HardeningResult) -> dict[str, Any]:
-    """Create deterministic permanent-regression memory."""
+    """Create deterministic permanent-regression memory bound to this exact case."""
+    expected = evaluate(case)
+    if result.payload != expected.payload:
+        raise ValidationError("hardening result does not match supplied case")
+
     material: dict[str, Any] = {
         "schema": REGRESSION_SCHEMA,
         "contract": CONTRACT,
