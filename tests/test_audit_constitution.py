@@ -10,7 +10,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -143,7 +142,11 @@ def populate(repo: Path, value: dict) -> None:
     )
     write(repo, "CODE_OF_ETHICS.md", "# Ethics\n\nNo hack-back.\n")
     write(repo, "LICENSE", "Mozilla Public License Version 2.0\n")
-    write(repo, "doctrine/ENGAGEMENT_AREA.md", "# Engagement\n\nDISRUPT TURN FIX BLOCK\n")
+    write(
+        repo,
+        "doctrine/ENGAGEMENT_AREA.md",
+        "# Engagement\n\nDISRUPT TURN FIX BLOCK\n\nTURN may only preserve or reduce authority.\n",
+    )
     write(repo, "doctrine/PARSER_DOCTRINE.md", "# Parser\n\nCanonicalize before authorization.\n")
     write(repo, ".github/workflows/constitution.yml", "name: Constitutional Contract\non: [push]\njobs: {}\n")
     write(repo, "scripts/audit_constitution.py", AUDIT_SRC.read_text(encoding="utf-8"))
@@ -223,9 +226,27 @@ class ConstitutionalAuditTests(unittest.TestCase):
         self.commit("weaken parser doctrine")
         self.assert_fails("pinned v1 artifact changed without new contract identity")
 
+    def test_engagement_doctrine_change_fails(self) -> None:
+        write(
+            self.repo,
+            "doctrine/ENGAGEMENT_AREA.md",
+            "# Engagement\n\nDISRUPT TURN FIX BLOCK\n\nTURN may silently increase authority.\n",
+        )
+        self.commit("weaken engagement doctrine")
+        self.assert_fails("pinned v1 artifact changed without new contract identity")
+
     def test_dirty_archive_bytes_fail(self) -> None:
         with (self.repo / ARCHIVE).open("ab") as handle:
             handle.write(b"x")
+        self.assert_fails("checked-out pinned artifact differs from v1 baseline")
+
+    def test_clean_filter_cannot_hide_raw_byte_change(self) -> None:
+        write(self.repo, ".gitattributes", "docs/CORE_INVARIANTS.md text eol=lf\n")
+        self.commit("configure line ending normalization")
+        path = self.repo / "docs/CORE_INVARIANTS.md"
+        raw = path.read_bytes()
+        self.assertNotIn(b"\r\n", raw)
+        path.write_bytes(raw.replace(b"\n", b"\r\n"))
         self.assert_fails("checked-out pinned artifact differs from v1 baseline")
 
     def test_required_path_directory_fails(self) -> None:
