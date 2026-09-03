@@ -140,7 +140,11 @@ def populate(repo: Path, value: dict) -> None:
         "# Security\n\nDefault CI inspects them only with bounded, non-executing mechanisms.\n"
         "Execution is opt-in through `workflow_dispatch`, never `pull_request`.\n",
     )
-    write(repo, "CODE_OF_ETHICS.md", "# Ethics\n\nNo hack-back.\n")
+    write(
+        repo,
+        "CODE_OF_ETHICS.md",
+        "# Ethics\n\nNo hack-back. No retaliation. No third-party damage.\n",
+    )
     write(repo, "LICENSE", "Mozilla Public License Version 2.0\n")
     write(
         repo,
@@ -157,7 +161,12 @@ def populate(repo: Path, value: dict) -> None:
         bundle.writestr("README.txt", "synthetic provenance bundle\n")
     size = archive_path.stat().st_size
     oid = git(repo, "hash-object", "--", str(ARCHIVE))
-    provenance = f"# Provenance\n\nsize: {size} bytes\nGitHub blob object id: {oid}\n"
+    provenance = (
+        "# Provenance\n\n"
+        f"size: {size} bytes\nGitHub blob object id: {oid}\n"
+        "source project: https://github.com/QSOLKCB/HERESY-SEC\n"
+        "trust status: source provenance; not an automatically trusted dependency or executable fixture\n"
+    )
     write(repo, "docs/HERESY_PROVENANCE.md", provenance)
     write(repo, "archive/readme.md", provenance)
 
@@ -235,6 +244,41 @@ class ConstitutionalAuditTests(unittest.TestCase):
         self.commit("weaken engagement doctrine")
         self.assert_fails("pinned v1 artifact changed without new contract identity")
 
+    def test_ethics_hack_back_policy_change_fails(self) -> None:
+        write(
+            self.repo,
+            "CODE_OF_ETHICS.md",
+            "# Ethics\n\nHack-back, retaliation, and third-party damage are permitted.\n",
+        )
+        self.commit("weaken ethics policy")
+        self.assert_fails("pinned v1 artifact changed without new contract identity")
+
+    def test_security_contradictory_execution_policy_fails(self) -> None:
+        path = self.repo / "SECURITY.md"
+        path.write_text(
+            path.read_text(encoding="utf-8")
+            + "\nAdversarial execution is permitted on `pull_request` when sandboxed.\n",
+            encoding="utf-8",
+        )
+        self.commit("contradict default CI boundary")
+        self.assert_fails("pinned v1 artifact changed without new contract identity")
+
+    def test_provenance_trust_metadata_change_fails(self) -> None:
+        path = self.repo / "docs/HERESY_PROVENANCE.md"
+        original = path.read_text(encoding="utf-8")
+        size_line = next(line for line in original.splitlines() if line.startswith("size:"))
+        oid_line = next(line for line in original.splitlines() if line.startswith("GitHub blob object id:"))
+        write(
+            self.repo,
+            "docs/HERESY_PROVENANCE.md",
+            "# Provenance\n\n"
+            f"{size_line}\n{oid_line}\n"
+            "source project: https://example.invalid/not-heresy\n"
+            "trust status: trusted executable production dependency\n",
+        )
+        self.commit("falsify provenance metadata")
+        self.assert_fails("pinned v1 artifact changed without new contract identity")
+
     def test_dirty_archive_bytes_fail(self) -> None:
         with (self.repo / ARCHIVE).open("ab") as handle:
             handle.write(b"x")
@@ -262,10 +306,10 @@ class ConstitutionalAuditTests(unittest.TestCase):
         result = self.run_audit()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_security_execution_exception_fails_content_check(self) -> None:
+    def test_security_execution_exception_fails(self) -> None:
         write(self.repo, "SECURITY.md", "# Security\n\nDefault CI may execute adversarial material.\n")
         self.commit("weaken default CI")
-        self.assert_fails("SECURITY.md lost the non-executing default-CI boundary")
+        self.assert_fails("pinned v1 artifact changed without new contract identity")
 
     def test_forged_root_cannot_become_baseline(self) -> None:
         git(self.repo, "checkout", "--orphan", "forge")
