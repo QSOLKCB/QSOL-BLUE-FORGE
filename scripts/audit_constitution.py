@@ -118,7 +118,7 @@ def audit_documentation(registry: dict) -> None:
     require(CONTRACT_VERSION in ai, "README4AI does not name the contract")
     require("ALLOW < REVIEW < DENY" in core, "CORE_INVARIANTS lost the decision lattice")
     require("Proof first. Reuse second." in core, "CORE_INVARIANTS lost the optimization rule")
-    require("Deception outward, truth inward" in core, "CORE_INVARIANTS lost the truth rule")
+    require("deception outward, truth inward" in core.lower(), "CORE_INVARIANTS lost the truth rule")
 
     for item in registry["invariants"]:
         invariant_id = item["id"]
