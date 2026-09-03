@@ -17,6 +17,7 @@ import blue_forge.cli as cli
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "fixtures/v1/path-traversal-case.json"
 SCHEMA = ROOT / "schemas/hardening-case-v1.schema.json"
+ORIGINAL = "original:HOSTILE-PATH-001"
 
 
 def fixture() -> dict:
@@ -45,12 +46,10 @@ class CodexRoundOneTests(unittest.TestCase):
     def test_regression_record_rejects_result_from_other_case(self) -> None:
         case_a = HardeningCase.from_dict(fixture())
         result_a = evaluate(case_a)
-
         value_b = copy.deepcopy(fixture())
         value_b["case_id"] = "BF-CASE-PATH-OTHER"
         value_b["proposal"]["mitigation_id"] = "MIT-PATH-ROOT-OTHER"
         case_b = HardeningCase.from_dict(value_b)
-
         with self.assertRaisesRegex(ValidationError, "does not match supplied case"):
             regression_record(case_b, result_a)
 
@@ -87,13 +86,13 @@ class CodexRoundOneTests(unittest.TestCase):
 
     def test_unrecognized_evidence_state_is_incomplete(self) -> None:
         value = fixture()
-        value["verification"]["original"]["after"] = "RESOURCE_LIMIT"
+        value["verification"]["original"][ORIGINAL]["after"] = "RESOURCE_LIMIT"
         result = evaluate(HardeningCase.from_dict(value))
         self.assertFalse(result.payload["predicates"]["verification_complete"])
         self.assertIn("verification_complete", result.payload["failed_predicates"])
 
         value = fixture()
-        value["verification"]["original"]["after"] = "NOVEL_STATE"
+        value["verification"]["original"][ORIGINAL]["after"] = "NOVEL_STATE"
         result = evaluate(HardeningCase.from_dict(value))
         self.assertFalse(result.payload["predicates"]["verification_complete"])
 
@@ -109,14 +108,9 @@ class CodexRoundOneTests(unittest.TestCase):
             "benign",
         )
         verification = defs["verification"]["properties"]
-        self.assertEqual(verification["original"]["$ref"], "#/$defs/hostileEvidence")
-        self.assertEqual(
-            verification["variants"]["items"]["$ref"], "#/$defs/hostileEvidence"
-        )
-        self.assertEqual(
-            verification["benign_controls"]["items"]["$ref"],
-            "#/$defs/benignEvidence",
-        )
+        self.assertEqual(verification["original"]["$ref"], "#/$defs/originalEvidenceMap")
+        self.assertEqual(verification["variants"]["$ref"], "#/$defs/variantEvidenceMap")
+        self.assertEqual(verification["benign_controls"]["$ref"], "#/$defs/benignEvidenceMap")
 
     def test_unicode_equivalent_producer_ids_are_rejected(self) -> None:
         value = fixture()
