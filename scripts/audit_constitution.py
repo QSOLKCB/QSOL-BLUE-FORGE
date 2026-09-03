@@ -208,7 +208,7 @@ def workflow_paths(commit: str) -> set[Path]:
 
 
 def workflow_has_default_trigger(text: str) -> bool:
-    """Recognize the default automatic triggers we govern without a YAML dependency."""
+    """Recognize mapping, scalar, flow-list, and block-sequence workflow triggers."""
     lines = text.splitlines()
     for index, raw_line in enumerate(lines):
         line = raw_line.split("#", 1)[0].rstrip()
@@ -217,18 +217,32 @@ def workflow_has_default_trigger(text: str) -> bool:
             continue
 
         tail = match.group(1).strip().lower()
-        if any(re.search(rf"\b{re.escape(trigger)}\b", tail) for trigger in DEFAULT_WORKFLOW_TRIGGERS):
-            return True
         if tail:
-            return False
+            return any(
+                re.search(rf"\b{re.escape(trigger)}\b", tail)
+                for trigger in DEFAULT_WORKFLOW_TRIGGERS
+            )
 
+        nested_lines: list[tuple[int, str]] = []
         for nested_raw in lines[index + 1 :]:
             nested = nested_raw.split("#", 1)[0].rstrip()
             if not nested.strip():
                 continue
-            if not nested.startswith((" ", "\t")):
+            indent = len(nested) - len(nested.lstrip(" "))
+            if indent == 0:
                 break
-            key = nested.strip().split(":", 1)[0].strip().strip("'\"")
+            nested_lines.append((indent, nested.strip()))
+
+        if not nested_lines:
+            return False
+
+        direct_indent = min(indent for indent, _ in nested_lines)
+        for indent, item in nested_lines:
+            if indent != direct_indent:
+                continue
+            if item.startswith("-"):
+                item = item[1:].strip()
+            key = item.split(":", 1)[0].strip().strip("'\"").lower()
             if key in DEFAULT_WORKFLOW_TRIGGERS:
                 return True
         return False
