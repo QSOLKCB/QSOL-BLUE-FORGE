@@ -1,4 +1,4 @@
-"""Unit coverage for default GitHub Actions trigger recognition."""
+"""Unit coverage for automatic GitHub Actions trigger recognition."""
 
 from __future__ import annotations
 
@@ -23,11 +23,16 @@ audit = load_audit_module()
 
 
 class WorkflowTriggerFormTests(unittest.TestCase):
-    def test_default_trigger_forms_are_recognized(self) -> None:
+    def test_automatic_trigger_forms_are_recognized(self) -> None:
         samples = (
             "on: pull_request\n",
+            "on: schedule\n",
+            "on: release\n",
+            "on: workflow_run\n",
             "on: [workflow_dispatch, push]\n",
+            "on: [workflow_dispatch, schedule]\n",
             "on:\n  pull_request:\n",
+            "on:\n  schedule:\n    - cron: '0 0 * * *'\n",
             "on:\n  - pull_request\n  - workflow_dispatch\n",
             "'on':\n  - push\n",
         )
@@ -39,6 +44,7 @@ class WorkflowTriggerFormTests(unittest.TestCase):
         samples = (
             "on: workflow_dispatch\n",
             "on: [workflow_dispatch]\n",
+            "on: {workflow_dispatch: {}}\n",
             "on:\n  workflow_dispatch:\n",
             "on:\n  - workflow_dispatch\n",
         )
