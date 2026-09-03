@@ -35,6 +35,7 @@ MAX_ARRAY_ITEMS = 256
 MAX_STRING_CHARS = 4096
 MAX_INTEGER_DIGITS = 128
 INVARIANT = re.compile(r"^BF-INV-(?:00[1-9]|01[0-6])$")
+_EVALUATED_RESULT_TOKEN = object()
 
 
 class BlueForgeError(Exception):
@@ -105,6 +106,10 @@ def _validate_json_value(value: Any, path: str = "$", depth: int = 0) -> None:
         for key, item in value.items():
             if type(key) is not str:
                 raise ValidationError(f"object key is not a string at {path}")
+            if len(key) > MAX_STRING_CHARS:
+                raise ValidationError(
+                    f"object key exceeds {MAX_STRING_CHARS} characters at {path}"
+                )
             _validate_json_value(item, f"{path}.{key}", depth + 1)
         return
     raise ValidationError(f"unsupported JSON value at {path}: {type(value).__name__}")
@@ -384,12 +389,23 @@ class HardeningCase:
 
 @dataclass(frozen=True, init=False)
 class HardeningResult:
-    """Immutable evaluated result with defensive-copy payload access."""
+    """Immutable evaluator-created result with defensive-copy payload access."""
 
     _payload_bytes: bytes
 
-    def __init__(self, payload: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        *,
+        _token: object | None = None,
+    ) -> None:
+        if _token is not _EVALUATED_RESULT_TOKEN:
+            raise ValidationError("HardeningResult must be created by evaluate()")
         object.__setattr__(self, "_payload_bytes", canonical_bytes(payload))
+
+    @classmethod
+    def _from_evaluation(cls, payload: dict[str, Any]) -> "HardeningResult":
+        return cls(payload, _token=_EVALUATED_RESULT_TOKEN)
 
     @property
     def payload(self) -> dict[str, Any]:
@@ -479,7 +495,7 @@ def evaluate(case: HardeningCase) -> HardeningResult:
     }
     payload = dict(material)
     payload["receipt_sha256"] = digest(material)
-    return HardeningResult(payload)
+    return HardeningResult._from_evaluation(payload)
 
 
 def regression_record(case: HardeningCase, result: HardeningResult) -> dict[str, Any]:
