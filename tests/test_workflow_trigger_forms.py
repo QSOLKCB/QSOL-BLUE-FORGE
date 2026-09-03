@@ -35,6 +35,9 @@ class WorkflowTriggerFormTests(unittest.TestCase):
             "on:\n  schedule:\n    - cron: '0 0 * * *'\n",
             "on:\n  - pull_request\n  - workflow_dispatch\n",
             "'on':\n  - push\n",
+            "{on: [push], jobs: {probe: {runs-on: ubuntu-latest, steps: []}}}\n",
+            "{\"on\": [schedule], \"jobs\": {}}\n",
+            "name: unsupported-without-recognized-on\njobs: {}\n",
         )
         for text in samples:
             with self.subTest(text=text):
