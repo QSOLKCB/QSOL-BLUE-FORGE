@@ -45,10 +45,11 @@ The runtime parser is intentionally narrower than general JSON tooling:
 
 - duplicate object keys are rejected;
 - floating-point values are rejected;
+- JSON integers are bounded to 128 decimal digits;
 - non-finite values are rejected;
 - case files are bounded to 1 MiB through the CLI;
 - JSON nesting is bounded;
-- arrays are bounded;
+- arrays are bounded at the public strict-parser boundary, including nested arrays;
 - strings are bounded;
 - unknown top-level or nested fields are rejected;
 - constitutional invariant identifiers are restricted to `BF-INV-001` through
@@ -66,7 +67,9 @@ proposal.producer
 verification.producer
 ```
 
-They must differ.
+They must differ. Producer identities use a canonical ASCII identifier grammar
+(`A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, `@`, `/`, `-`) with a 128-character
+maximum, so canonically equivalent Unicode spellings cannot bypass separation.
 
 This is a deterministic structural enforcement of `BF-INV-003`. It is not a
 cryptographic identity system. Future authenticated verifier adapters may add
@@ -152,8 +155,10 @@ attestation.
 
 ### `verification_complete`
 
-Required hostile variants and benign controls must exist and no evidence
-transition may contain fail-closed states such as:
+Required hostile variants and benign controls must exist. Transition labels are
+complete only when both sides belong to the closed recognized state vocabulary
+`VULNERABLE`, `BLOCKED`, `HARMLESS`, `ALLOWED`, or `PRESERVED`. Fail-closed,
+resource-limit, and previously unseen states therefore remain incomplete, including:
 
 ```text
 UNKNOWN
@@ -195,8 +200,9 @@ NOT_HARDENED
 
 ## Permanent regression memory
 
-The `regression` command emits a deterministic
-`blue-forge.regression-record/v1` object containing:
+The `regression` command first re-evaluates the supplied case and requires the
+provided hardening result to match that exact deterministic result. It then emits a
+deterministic `blue-forge.regression-record/v1` object containing:
 
 - the constitutional contract identity;
 - case identity and semantic case digest;
