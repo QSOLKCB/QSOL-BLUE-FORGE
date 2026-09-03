@@ -51,23 +51,58 @@ jobs:
           BLUE_FORGE_AUDIT_ROOT="$GITHUB_WORKSPACE" \
             python3 "$BLUE_FORGE_TRUSTED_AUDITOR"
 
-      - name: Prepare isolated regression workspace
+      - name: Prepare isolated regression workspaces
         shell: bash
         run: |
           set -euo pipefail
-          test_root="/tmp/blue-forge-regression-${GITHUB_RUN_ID}"
+          trusted_root="/tmp/blue-forge-trusted-regression-${GITHUB_RUN_ID}"
+          current_root="/tmp/blue-forge-current-regression-${GITHUB_RUN_ID}"
           test_home="/tmp/blue-forge-regression-home-${GITHUB_RUN_ID}"
-          sudo rm -rf "$test_root" "$test_home"
-          sudo mkdir -p "$test_root/scripts" "$test_root/tests" "$test_home"
-          sudo cp scripts/audit_constitution.py "$test_root/scripts/"
-          sudo cp tests/test*.py "$test_root/tests/"
+          sudo rm -rf "$trusted_root" "$current_root" "$test_home"
+          sudo mkdir -p "$trusted_root/scripts" "$trusted_root/tests" \
+            "$current_root/scripts" "$current_root/tests" "$test_home"
+
+          # Both suites exercise the proposed auditor only after the trusted
+          # constitutional auditor above has certified the checkout. Neither
+          # workspace contains the archive or Git metadata.
+          sudo cp -- scripts/audit_constitution.py "$trusted_root/scripts/"
+          sudo cp -- scripts/audit_constitution.py "$current_root/scripts/"
+
+          # Materialize the frozen baseline tests from the trusted ref. PR-added
+          # modules are never imported in this first regression process.
+          while IFS= read -r -d '' test_path; do
+            case "$test_path" in
+              tests/test*.py)
+                destination="$trusted_root/$test_path"
+                sudo mkdir -p "$(dirname "$destination")"
+                git show "${BLUE_FORGE_TRUSTED_REF}:$test_path" | sudo tee "$destination" >/dev/null
+                ;;
+            esac
+          done < <(git ls-tree -r -z --name-only "$BLUE_FORGE_TRUSTED_REF" -- tests)
+
+          # The trusted auditor has already rejected tracked test symlinks and
+          # non-100644 modes. Copy only actual regular files into the extended
+          # workspace so filesystem links are never dereferenced here either.
+          if find tests -type l -name 'test*.py' -print -quit | grep -q .; then
+            echo "refusing symlinked regression test" >&2
+            exit 1
+          fi
+          while IFS= read -r -d '' source; do
+            relative="${source#./}"
+            destination="$current_root/$relative"
+            sudo mkdir -p "$(dirname "$destination")"
+            sudo cp -- "$source" "$destination"
+          done < <(find tests -type f -name 'test*.py' -print0)
+
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin blueforge-test
-          sudo chown -R blueforge-test:blueforge-test "$test_root" "$test_home"
-          sudo chmod 0755 /tmp "$test_root" "$test_root/scripts" "$test_root/tests" "$test_home"
-          printf 'BLUE_FORGE_TEST_ROOT=%s\n' "$test_root" >> "$GITHUB_ENV"
+          sudo chown -R blueforge-test:blueforge-test "$trusted_root" "$current_root" "$test_home"
+          sudo chmod 0755 /tmp "$trusted_root" "$trusted_root/scripts" "$trusted_root/tests" \
+            "$current_root" "$current_root/scripts" "$current_root/tests" "$test_home"
+          printf 'BLUE_FORGE_TRUSTED_TEST_ROOT=%s\n' "$trusted_root" >> "$GITHUB_ENV"
+          printf 'BLUE_FORGE_CURRENT_TEST_ROOT=%s\n' "$current_root" >> "$GITHUB_ENV"
           printf 'BLUE_FORGE_TEST_HOME=%s\n' "$test_home" >> "$GITHUB_ENV"
 
-      - name: Audit regression tests in sterile sandbox
+      - name: Run trusted baseline regressions in sterile sandbox
         shell: bash
         run: |
           set -euo pipefail
@@ -78,17 +113,41 @@ jobs:
           restore_workspace() {
             sudo chmod 0755 "$GITHUB_WORKSPACE" || true
             sudo chown "$runner_uid:$runner_gid" "$GITHUB_WORKSPACE" || true
-            sudo rm -rf "$BLUE_FORGE_TEST_ROOT" "$BLUE_FORGE_TEST_HOME" || true
           }
           trap restore_workspace EXIT
 
-          test ! -e "${BLUE_FORGE_TEST_ROOT}/archive"
-          test ! -e "${BLUE_FORGE_TEST_ROOT}/.git"
-
+          test ! -e "${BLUE_FORGE_TRUSTED_TEST_ROOT}/archive"
+          test ! -e "${BLUE_FORGE_TRUSTED_TEST_ROOT}/.git"
           sudo chown root:root "$GITHUB_WORKSPACE"
           sudo chmod 000 "$GITHUB_WORKSPACE"
 
-          cd "$BLUE_FORGE_TEST_ROOT"
+          cd "$BLUE_FORGE_TRUSTED_TEST_ROOT"
+          sudo unshare --net -- \
+            runuser -u blueforge-test -- \
+            env HOME="$BLUE_FORGE_TEST_HOME" PATH="$PATH" \
+            "$python_bin" -m unittest discover -s tests -v
+
+      - name: Run current regression suite in separate sterile sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+
+          cleanup() {
+            sudo chmod 0755 "$GITHUB_WORKSPACE" || true
+            sudo chown "$runner_uid:$runner_gid" "$GITHUB_WORKSPACE" || true
+            sudo rm -rf "$BLUE_FORGE_TRUSTED_TEST_ROOT" "$BLUE_FORGE_CURRENT_TEST_ROOT" "$BLUE_FORGE_TEST_HOME" || true
+          }
+          trap cleanup EXIT
+
+          test ! -e "${BLUE_FORGE_CURRENT_TEST_ROOT}/archive"
+          test ! -e "${BLUE_FORGE_CURRENT_TEST_ROOT}/.git"
+          sudo chown root:root "$GITHUB_WORKSPACE"
+          sudo chmod 000 "$GITHUB_WORKSPACE"
+
+          cd "$BLUE_FORGE_CURRENT_TEST_ROOT"
           sudo unshare --net -- \
             runuser -u blueforge-test -- \
             env HOME="$BLUE_FORGE_TEST_HOME" PATH="$PATH" \
