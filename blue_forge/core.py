@@ -30,12 +30,14 @@ COMPLETE_EVIDENCE_STATES = frozenset({
 })
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 PRODUCER_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._:@/-]{0,127})$")
+EVIDENCE_ID_SUFFIX = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._@/-]{0,126})$")
 MAX_JSON_DEPTH = 32
 MAX_ARRAY_ITEMS = 256
 MAX_STRING_CHARS = 4096
 MAX_INTEGER_DIGITS = 128
 INVARIANT = re.compile(r"^BF-INV-(?:00[1-9]|01[0-6])$")
-_EVALUATED_RESULT_TOKEN = object()
+
+_EVALUATION_TOKEN = object()
 
 
 class BlueForgeError(Exception):
@@ -76,9 +78,7 @@ def _reject_constant(value: str) -> Any:
 def _parse_int(value: str) -> int:
     digits = value[1:] if value.startswith("-") else value
     if len(digits) > MAX_INTEGER_DIGITS:
-        raise ValidationError(
-            f"integer exceeds {MAX_INTEGER_DIGITS} decimal digits"
-        )
+        raise ValidationError(f"integer exceeds {MAX_INTEGER_DIGITS} decimal digits")
     try:
         return int(value)
     except ValueError as exc:
@@ -186,9 +186,15 @@ def _string(value: Any, label: str) -> str:
 def _producer_id(value: Any, label: str) -> str:
     text = _string(value, label)
     if not PRODUCER_ID.fullmatch(text):
-        raise ValidationError(
-            f"{label} must use canonical ASCII producer-id syntax"
-        )
+        raise ValidationError(f"{label} must use canonical ASCII producer-id syntax")
+    return text
+
+
+def _evidence_id(value: Any, prefix: str, label: str) -> str:
+    text = _string(value, label)
+    marker = prefix + ":"
+    if not text.startswith(marker) or not EVIDENCE_ID_SUFFIX.fullmatch(text[len(marker):]):
+        raise ValidationError(f"{label} must use {prefix}:<canonical-id> syntax")
     return text
 
 
@@ -223,33 +229,49 @@ class Evidence:
     after: str
     provenance: str
     source_sha256: str
+    reference_engine_sha256: str
+    replay_engine_sha256: str
     reference_result_sha256: str
     replay_result_sha256: str
 
     @classmethod
-    def from_dict(cls, value: Any, expected_kind: str) -> "Evidence":
-        obj = _object(value, "evidence")
+    def from_entry(
+        cls,
+        evidence_id: Any,
+        value: Any,
+        expected_kind: str,
+        expected_prefix: str,
+    ) -> "Evidence":
+        eid = _evidence_id(evidence_id, expected_prefix, "evidence id")
+        obj = _object(value, f"evidence[{eid}]")
         _exact_keys(obj, {
-            "id", "kind", "before", "after", "provenance",
-            "source_sha256", "reference_result_sha256", "replay_result_sha256",
-        }, "evidence")
-        kind = _string(obj["kind"], "evidence.kind")
+            "kind", "before", "after", "provenance", "source_sha256",
+            "reference_engine_sha256", "replay_engine_sha256",
+            "reference_result_sha256", "replay_result_sha256",
+        }, f"evidence[{eid}]")
+        kind = _string(obj["kind"], f"evidence[{eid}].kind")
         if kind != expected_kind:
             raise ValidationError(
-                f"evidence.kind must be {expected_kind!r}, got {kind!r}"
+                f"evidence[{eid}].kind must be {expected_kind!r}, got {kind!r}"
             )
         return cls(
-            evidence_id=_string(obj["id"], "evidence.id"),
+            evidence_id=eid,
             kind=kind,
-            before=_string(obj["before"], "evidence.before"),
-            after=_string(obj["after"], "evidence.after"),
-            provenance=_string(obj["provenance"], "evidence.provenance"),
-            source_sha256=_sha256(obj["source_sha256"], "evidence.source_sha256"),
+            before=_string(obj["before"], f"evidence[{eid}].before"),
+            after=_string(obj["after"], f"evidence[{eid}].after"),
+            provenance=_string(obj["provenance"], f"evidence[{eid}].provenance"),
+            source_sha256=_sha256(obj["source_sha256"], f"evidence[{eid}].source_sha256"),
+            reference_engine_sha256=_sha256(
+                obj["reference_engine_sha256"], f"evidence[{eid}].reference_engine_sha256"
+            ),
+            replay_engine_sha256=_sha256(
+                obj["replay_engine_sha256"], f"evidence[{eid}].replay_engine_sha256"
+            ),
             reference_result_sha256=_sha256(
-                obj["reference_result_sha256"], "evidence.reference_result_sha256"
+                obj["reference_result_sha256"], f"evidence[{eid}].reference_result_sha256"
             ),
             replay_result_sha256=_sha256(
-                obj["replay_result_sha256"], "evidence.replay_result_sha256"
+                obj["replay_result_sha256"], f"evidence[{eid}].replay_result_sha256"
             ),
         )
 
@@ -310,20 +332,34 @@ class Verification:
             "producer", "decision", "observed_authority", "original", "variants",
             "benign_controls", "reference_result_sha256", "candidate_result_sha256",
         }, "verification")
+
+        original_map = _object(obj["original"], "verification.original")
+        if len(original_map) != 1:
+            raise ValidationError("verification.original must contain exactly one evidence entry")
+        original_id, original_value = next(iter(original_map.items()))
+
+        variants_map = _object(obj["variants"], "verification.variants")
+        if not variants_map or len(variants_map) > MAX_ARRAY_ITEMS:
+            raise ValidationError("verification.variants must contain 1..256 evidence entries")
+
+        benign_map = _object(obj["benign_controls"], "verification.benign_controls")
+        if not benign_map or len(benign_map) > MAX_ARRAY_ITEMS:
+            raise ValidationError("verification.benign_controls must contain 1..256 evidence entries")
+
         return cls(
             producer=_producer_id(obj["producer"], "verification.producer"),
             decision=_decision(obj["decision"], "verification.decision"),
             observed_authority=_authority(
                 obj["observed_authority"], "verification.observed_authority"
             ),
-            original=Evidence.from_dict(obj["original"], "hostile"),
+            original=Evidence.from_entry(original_id, original_value, "hostile", "original"),
             variants=tuple(
-                Evidence.from_dict(item, "hostile")
-                for item in _array(obj["variants"], "verification.variants")
+                Evidence.from_entry(eid, item, "hostile", "variant")
+                for eid, item in variants_map.items()
             ),
             benign_controls=tuple(
-                Evidence.from_dict(item, "benign")
-                for item in _array(obj["benign_controls"], "verification.benign_controls")
+                Evidence.from_entry(eid, item, "benign", "benign")
+                for eid, item in benign_map.items()
             ),
             reference_result_sha256=_sha256(
                 obj["reference_result_sha256"], "verification.reference_result_sha256"
@@ -364,13 +400,6 @@ class HardeningCase:
             raise ValidationError(
                 "verification decision weakens proposal decision within immutable run"
             )
-        evidence_ids = [
-            verification.original.evidence_id,
-            *[item.evidence_id for item in verification.variants],
-            *[item.evidence_id for item in verification.benign_controls],
-        ]
-        if len(set(evidence_ids)) != len(evidence_ids):
-            raise ValidationError("duplicate evidence id in hardening case")
         return cls(
             case_id=_string(obj["case_id"], "case.case_id"),
             invariant_id=invariant,
@@ -389,23 +418,18 @@ class HardeningCase:
 
 @dataclass(frozen=True, init=False)
 class HardeningResult:
-    """Immutable evaluator-created result with defensive-copy payload access."""
+    """Immutable evaluated result with defensive-copy payload access."""
 
     _payload_bytes: bytes
 
-    def __init__(
-        self,
-        payload: dict[str, Any],
-        *,
-        _token: object | None = None,
-    ) -> None:
-        if _token is not _EVALUATED_RESULT_TOKEN:
+    def __init__(self, payload: dict[str, Any], *, _token: object | None = None) -> None:
+        if _token is not _EVALUATION_TOKEN:
             raise ValidationError("HardeningResult must be created by evaluate()")
         object.__setattr__(self, "_payload_bytes", canonical_bytes(payload))
 
     @classmethod
     def _from_evaluation(cls, payload: dict[str, Any]) -> "HardeningResult":
-        return cls(payload, _token=_EVALUATED_RESULT_TOKEN)
+        return cls(payload, _token=_EVALUATION_TOKEN)
 
     @property
     def payload(self) -> dict[str, Any]:
@@ -423,12 +447,76 @@ class HardeningResult:
         return self.payload["receipt_sha256"]
 
 
+def _evidence_body(item: Evidence) -> dict[str, Any]:
+    return {
+        "kind": item.kind,
+        "before": item.before,
+        "after": item.after,
+        "provenance": item.provenance,
+        "source_sha256": item.source_sha256,
+        "reference_engine_sha256": item.reference_engine_sha256,
+        "replay_engine_sha256": item.replay_engine_sha256,
+        "reference_result_sha256": item.reference_result_sha256,
+        "replay_result_sha256": item.replay_result_sha256,
+    }
+
+
+def _case_input_material(case: HardeningCase) -> dict[str, Any]:
+    try:
+        p = case.proposal
+        v = case.verification
+        variant_ids = [item.evidence_id for item in v.variants]
+        benign_ids = [item.evidence_id for item in v.benign_controls]
+        all_ids = [v.original.evidence_id, *variant_ids, *benign_ids]
+        if len(set(all_ids)) != len(all_ids):
+            raise ValidationError("duplicate evidence id in directly constructed hardening case")
+        return {
+            "schema": CASE_SCHEMA,
+            "contract": CONTRACT,
+            "case_id": case.case_id,
+            "invariant_id": case.invariant_id,
+            "attack_class": case.attack_class,
+            "proposal": {
+                "producer": p.producer,
+                "mitigation_id": p.mitigation_id,
+                "decision": p.decision.value,
+                "pre_mitigation_authority": sorted(p.pre_mitigation_authority),
+                "requested_authority": sorted(p.requested_authority),
+                "policy_authority": sorted(p.policy_authority),
+            },
+            "verification": {
+                "producer": v.producer,
+                "decision": v.decision.value,
+                "observed_authority": sorted(v.observed_authority),
+                "original": {v.original.evidence_id: _evidence_body(v.original)},
+                "variants": {
+                    item.evidence_id: _evidence_body(item) for item in v.variants
+                },
+                "benign_controls": {
+                    item.evidence_id: _evidence_body(item) for item in v.benign_controls
+                },
+                "reference_result_sha256": v.reference_result_sha256,
+                "candidate_result_sha256": v.candidate_result_sha256,
+            },
+        }
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValidationError(f"invalid directly constructed hardening case: {exc}") from exc
+
+
+def _validated_case(case: HardeningCase) -> HardeningCase:
+    if not isinstance(case, HardeningCase):
+        raise ValidationError("evaluate() requires a HardeningCase")
+    return HardeningCase.from_dict(_case_input_material(case))
+
+
 def evaluate(case: HardeningCase) -> HardeningResult:
-    """Derive BLUE_HARDENED from evidence. Nothing in this function executes evidence."""
+    """Derive BLUE_HARDENED from validated evidence without executing it."""
+    case = _validated_case(case)
     v = case.verification
     p = case.proposal
     all_evidence = case.evidence()
 
+    engine_ids = {item.reference_engine_sha256 for item in all_evidence}
     predicates = {
         "original_attack_neutralized": (
             v.original.before == "VULNERABLE"
@@ -455,9 +543,13 @@ def evaluate(case: HardeningCase) -> HardeningResult:
             and bool(v.benign_controls)
             and all(item.complete() for item in all_evidence)
         ),
-        "replay_exact": all(
-            item.reference_result_sha256 == item.replay_result_sha256
-            for item in all_evidence
+        "replay_exact": (
+            len(engine_ids) == 1
+            and all(
+                item.reference_engine_sha256 == item.replay_engine_sha256
+                and item.reference_result_sha256 == item.replay_result_sha256
+                for item in all_evidence
+            )
         ),
         "authority_not_expanded": (
             v.observed_authority <= (p.requested_authority & p.policy_authority)
@@ -500,33 +592,37 @@ def evaluate(case: HardeningCase) -> HardeningResult:
 
 def regression_record(case: HardeningCase, result: HardeningResult) -> dict[str, Any]:
     """Create deterministic permanent-regression memory bound to this exact case."""
+    validated_case = _validated_case(case)
     result_payload = result.payload
-    expected_payload = evaluate(case).payload
+    expected_payload = evaluate(validated_case).payload
     if result_payload != expected_payload:
         raise ValidationError("hardening result does not match supplied case")
 
-    case_sha256 = digest(_case_material(case))
+    case_sha256 = digest(_case_material(validated_case))
     if result_payload["case_sha256"] != case_sha256:
         raise ValidationError("hardening result case digest does not match supplied case")
 
     material: dict[str, Any] = {
         "schema": REGRESSION_SCHEMA,
         "contract": CONTRACT,
-        "case_id": case.case_id,
+        "case_id": validated_case.case_id,
         "case_sha256": case_sha256,
-        "invariant_id": case.invariant_id,
-        "attack_class": case.attack_class,
-        "mitigation_id": case.proposal.mitigation_id,
+        "invariant_id": validated_case.invariant_id,
+        "attack_class": validated_case.attack_class,
+        "mitigation_id": validated_case.proposal.mitigation_id,
         "hardening_status": result_payload["status"],
         "hardening_receipt_sha256": result.receipt_sha256,
         "hostile_evidence_ids": [
-            case.verification.original.evidence_id,
-            *[item.evidence_id for item in case.verification.variants],
+            validated_case.verification.original.evidence_id,
+            *[item.evidence_id for item in validated_case.verification.variants],
         ],
         "benign_control_ids": [
-            item.evidence_id for item in case.verification.benign_controls
+            item.evidence_id for item in validated_case.verification.benign_controls
         ],
-        "source_sha256": sorted(item.source_sha256 for item in case.evidence()),
+        "source_sha256": sorted(item.source_sha256 for item in validated_case.evidence()),
+        "engine_sha256": sorted({
+            item.reference_engine_sha256 for item in validated_case.evidence()
+        }),
         "failed_predicates": list(result_payload["failed_predicates"]),
     }
     record = dict(material)
@@ -535,39 +631,5 @@ def regression_record(case: HardeningCase, result: HardeningResult) -> dict[str,
 
 
 def _case_material(case: HardeningCase) -> dict[str, Any]:
-    p = case.proposal
-    v = case.verification
-    return {
-        "contract": CONTRACT,
-        "case_id": case.case_id,
-        "invariant_id": case.invariant_id,
-        "attack_class": case.attack_class,
-        "proposal": {
-            "producer": p.producer,
-            "mitigation_id": p.mitigation_id,
-            "decision": p.decision.value,
-            "pre_mitigation_authority": sorted(p.pre_mitigation_authority),
-            "requested_authority": sorted(p.requested_authority),
-            "policy_authority": sorted(p.policy_authority),
-        },
-        "verification": {
-            "producer": v.producer,
-            "decision": v.decision.value,
-            "observed_authority": sorted(v.observed_authority),
-            "evidence": [
-                {
-                    "id": item.evidence_id,
-                    "kind": item.kind,
-                    "before": item.before,
-                    "after": item.after,
-                    "provenance": item.provenance,
-                    "source_sha256": item.source_sha256,
-                    "reference_result_sha256": item.reference_result_sha256,
-                    "replay_result_sha256": item.replay_result_sha256,
-                }
-                for item in case.evidence()
-            ],
-            "reference_result_sha256": v.reference_result_sha256,
-            "candidate_result_sha256": v.candidate_result_sha256,
-        },
-    }
+    """Canonical semantic case material bound into every result receipt."""
+    return _case_input_material(case)
