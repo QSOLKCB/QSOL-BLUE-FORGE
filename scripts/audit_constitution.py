@@ -51,14 +51,15 @@ REQUIRED_FILES = [
     Path(".github/workflows/constitution.yml"),
 ]
 
-# Only artifacts that define the immutable v1 contract semantics or source identity
-# are byte-pinned. Operational prose remains required and receives targeted semantic
+# Only artifacts that define immutable v1 contract semantics or source identity are
+# byte-pinned. Operational prose remains required and receives targeted semantic
 # checks, so typo and clarification fixes do not require a new contract identity.
 PINNED_V1_PATHS = [
     Path("CONTRACT_VERSION"),
     REGISTRY_PATH,
     CORE_INVARIANTS_PATH,
     PARSER_DOCTRINE_PATH,
+    ENGAGEMENT_DOCTRINE_PATH,
     ARCHIVE_PATH,
 ]
 
@@ -207,7 +208,7 @@ def audit_required_files() -> None:
 
 
 def audit_pinned_v1_artifacts(baseline_commit: str) -> dict[Path, str]:
-    """Require current committed and checked-out artifacts to equal the trusted baseline."""
+    """Require current committed and raw checked-out bytes to equal the trusted baseline."""
     baseline_oids: dict[Path, str] = {}
     for path in PINNED_V1_PATHS:
         baseline = tree_entry(baseline_commit, path)
@@ -220,7 +221,7 @@ def audit_pinned_v1_artifacts(baseline_commit: str) -> dict[Path, str]:
 
         target = ROOT / path
         require(not target.is_symlink() and target.is_file(), f"pinned artifact is not a regular working-tree file: {path}")
-        working_oid = run_git("hash-object", "--", str(path))
+        working_oid = run_git("hash-object", "--no-filters", "--", str(path))
         require(working_oid == baseline_oid, f"checked-out pinned artifact differs from v1 baseline: {path}")
         baseline_oids[path] = baseline_oid
     return baseline_oids
