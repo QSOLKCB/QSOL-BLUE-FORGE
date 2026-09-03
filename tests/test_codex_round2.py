@@ -57,13 +57,21 @@ class CodexRoundTwoTests(unittest.TestCase):
 
     def test_schema_nonempty_requires_trimmed_nonwhitespace_strings(self) -> None:
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
-        pattern = schema["$defs"]["nonempty"]["pattern"]
-        self.assertEqual(pattern, r"^\S(?:[\s\S]*\S)?$")
+        nonempty = schema["$defs"]["nonempty"]
+        self.assertNotIn("pattern", nonempty)
+        pattern = nonempty["allOf"][0]["pattern"]
         compiled = re.compile(pattern)
         for invalid in ("", " ", "  value", "value  ", "\tvalue", "value\n"):
             with self.subTest(invalid=invalid):
                 self.assertIsNone(compiled.fullmatch(invalid))
-        for valid in ("value", "value with spaces", "évidence", "a\nb"):
+        for valid in (
+            "value",
+            "value with spaces",
+            "évidence",
+            "a\nb",
+            "\ufeffvalue",
+            "value\ufeff",
+        ):
             with self.subTest(valid=valid):
                 self.assertIsNotNone(compiled.fullmatch(valid))
 
