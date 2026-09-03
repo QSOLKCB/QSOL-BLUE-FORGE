@@ -34,11 +34,12 @@ PARSER_DOCTRINE_PATH = Path("doctrine/PARSER_DOCTRINE.md")
 ENGAGEMENT_DOCTRINE_PATH = Path("doctrine/ENGAGEMENT_AREA.md")
 SECURITY_PATH = Path("SECURITY.md")
 ETHICS_PATH = Path("CODE_OF_ETHICS.md")
+README4AI_PATH = Path("README4AI.md")
 AGENTS_PATH = Path("AGENTS.md")
 
 REQUIRED_FILES = [
     Path("README.md"),
-    Path("README4AI.md"),
+    README4AI_PATH,
     AGENTS_PATH,
     SECURITY_PATH,
     ETHICS_PATH,
@@ -55,7 +56,7 @@ REQUIRED_FILES = [
     Path(".github/workflows/constitution.yml"),
 ]
 
-# These artifacts define immutable v1 semantics, machine-agent policy,
+# These artifacts define immutable v1 semantics, machine-facing policy,
 # security/ethical policy, or source provenance. Their committed objects and raw
 # checked-out bytes must match the trusted external baseline. General explanatory
 # prose remains editable when its targeted semantic checks continue to hold.
@@ -65,6 +66,7 @@ PINNED_V1_PATHS = [
     CORE_INVARIANTS_PATH,
     PARSER_DOCTRINE_PATH,
     ENGAGEMENT_DOCTRINE_PATH,
+    README4AI_PATH,
     AGENTS_PATH,
     SECURITY_PATH,
     ETHICS_PATH,
@@ -292,7 +294,7 @@ def audit_documentation(registry: dict) -> None:
     parser = read_text(PARSER_DOCTRINE_PATH)
     engagement = read_text(ENGAGEMENT_DOCTRINE_PATH)
     readme = read_text(Path("README.md"))
-    ai = read_text(Path("README4AI.md"))
+    ai = read_text(README4AI_PATH)
     agents = read_text(AGENTS_PATH)
     security = read_text(SECURITY_PATH)
 
