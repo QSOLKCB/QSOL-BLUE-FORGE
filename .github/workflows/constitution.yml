@@ -44,14 +44,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test_root="${RUNNER_TEMP}/blue-forge-regression"
-          test_home="${RUNNER_TEMP}/blue-forge-regression-home"
-          rm -rf "$test_root" "$test_home"
-          mkdir -p "$test_root/scripts" "$test_root/tests" "$test_home"
-          cp scripts/audit_constitution.py "$test_root/scripts/"
-          cp tests/test*.py "$test_root/tests/"
+          test_root="/tmp/blue-forge-regression-${GITHUB_RUN_ID}"
+          test_home="/tmp/blue-forge-regression-home-${GITHUB_RUN_ID}"
+          sudo rm -rf "$test_root" "$test_home"
+          sudo mkdir -p "$test_root/scripts" "$test_root/tests" "$test_home"
+          sudo cp scripts/audit_constitution.py "$test_root/scripts/"
+          sudo cp tests/test*.py "$test_root/tests/"
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin blueforge-test
           sudo chown -R blueforge-test:blueforge-test "$test_root" "$test_home"
+          sudo chmod 0755 /tmp "$test_root" "$test_root/scripts" "$test_root/tests" "$test_home"
           printf 'BLUE_FORGE_TEST_ROOT=%s\n' "$test_root" >> "$GITHUB_ENV"
           printf 'BLUE_FORGE_TEST_HOME=%s\n' "$test_home" >> "$GITHUB_ENV"
 
@@ -66,6 +67,7 @@ jobs:
           restore_workspace() {
             sudo chmod 0755 "$GITHUB_WORKSPACE" || true
             sudo chown "$runner_uid:$runner_gid" "$GITHUB_WORKSPACE" || true
+            sudo rm -rf "$BLUE_FORGE_TEST_ROOT" "$BLUE_FORGE_TEST_HOME" || true
           }
           trap restore_workspace EXIT
 
