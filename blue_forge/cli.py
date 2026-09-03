@@ -32,7 +32,8 @@ def parser() -> argparse.ArgumentParser:
 
 def _load(path: Path) -> HardeningCase:
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_CASE_BYTES + 1)
     except OSError as exc:
         raise BlueForgeError(f"cannot read case: {exc}") from exc
     if len(raw) > MAX_CASE_BYTES:
