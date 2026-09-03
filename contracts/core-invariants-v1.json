@@ -1,0 +1,131 @@
+{
+  "schema": "blue-forge.core-invariants/v1",
+  "status": "constitutional",
+  "decision_order": ["ALLOW", "REVIEW", "DENY"],
+  "blue_hardened": {
+    "all_of": [
+      "original_attack_neutralized",
+      "attack_class_invariant_holds",
+      "benign_controls_pass",
+      "provenance_valid",
+      "verification_complete",
+      "replay_exact",
+      "authority_not_expanded",
+      "reference_equivalence_preserved"
+    ]
+  },
+  "invariants": [
+    {
+      "id": "BF-INV-001",
+      "name": "Authority Cannot Silently Expand",
+      "rule": "Effective authority must be a subset of requested authority intersected with policy authority.",
+      "failure_state": "DENY",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-002",
+      "name": "Defensive Decisions Are Monotonic",
+      "rule": "Within one immutable run, automated stages may preserve or tighten ALLOW < REVIEW < DENY but may not weaken a prior decision.",
+      "failure_state": "CONTRACT_ERROR",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-003",
+      "name": "No Self-Certification",
+      "rule": "The component proposing a mitigation cannot be the sole authority declaring that mitigation verified.",
+      "failure_state": "VERIFICATION_INCOMPLETE",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-004",
+      "name": "Provenance Before Interpretation",
+      "rule": "Unverified evidence may be inspected but cannot become load-bearing trusted evidence without required provenance.",
+      "failure_state": "VERIFICATION_INCOMPLETE",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-005",
+      "name": "Evidence Is Data",
+      "rule": "Captured hostile evidence must not gain execution authority merely by being ingested, parsed, inspected, or archived.",
+      "failure_state": "DENY",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-006",
+      "name": "Replay Failure Is Verification Failure",
+      "rule": "For a pinned contract, identical captured bytes, policy, and engine identity must reproduce the same canonical result.",
+      "failure_state": "VERIFICATION_INCOMPLETE",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-007",
+      "name": "Benign Behaviour Must Survive",
+      "rule": "A mitigation is incomplete when it neutralizes the hostile case by unnecessarily breaking required legitimate behaviour.",
+      "failure_state": "VERIFICATION_INCOMPLETE",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-008",
+      "name": "Unknown Is Not Safe",
+      "rule": "UNKNOWN, MALFORMED, UNSUPPORTED, INCOMPLETE, TIMEOUT, and resource failures cannot be promoted to ALLOW or VERIFIED.",
+      "failure_state": "DENY_OR_INCOMPLETE",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-009",
+      "name": "Resource Exhaustion Cannot Produce Verification",
+      "rule": "Exhausting a configured CPU, memory, recursion, decompression, worker, fixture, time, or evidence budget must fail explicitly.",
+      "failure_state": "VERIFICATION_INCOMPLETE",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-010",
+      "name": "Optimisation Cannot Reduce the Proof Surface",
+      "rule": "Performance work may reduce proof cost but must not weaken assertions, coverage, provenance, isolation, tolerances, determinism, boundaries, or replay.",
+      "failure_state": "CONTRACT_ERROR",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-011",
+      "name": "Parallelism Is Semantically Invisible",
+      "rule": "Worker count and completion order may affect performance but must not alter canonical security results.",
+      "failure_state": "VERIFICATION_INCOMPLETE",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-012",
+      "name": "Model Agreement Is Not Proof",
+      "rule": "Model consensus cannot elevate a claim into verified evidence without an independent verification predicate.",
+      "failure_state": "VERIFICATION_INCOMPLETE",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-013",
+      "name": "Semantic Changes Require New Contract Identity",
+      "rule": "Changes to policy meaning, normalization, trust, decision ordering, receipt meaning, invariant semantics, or verification semantics require explicit versioning and new conformance vectors.",
+      "failure_state": "CONTRACT_ERROR",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-014",
+      "name": "No Silent Degradation",
+      "rule": "Unavailable required verification mechanisms must produce an explicit incomplete state rather than a weaker silent substitute.",
+      "failure_state": "VERIFICATION_INCOMPLETE",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-015",
+      "name": "Deception Outward, Truth Inward",
+      "rule": "Defensive deception may shape hostile behaviour but must never distort evidence, uncertainty, provenance, or outcomes presented to defenders.",
+      "failure_state": "CONTRACT_ERROR",
+      "constitutional": true
+    },
+    {
+      "id": "BF-INV-016",
+      "name": "Minimum Necessary Intervention",
+      "rule": "For equivalent verified security outcomes, prefer the mitigation that changes the smallest necessary authority, resource, user, service, and time scope.",
+      "failure_state": "REVIEW",
+      "constitutional": true
+    }
+  ]
+}

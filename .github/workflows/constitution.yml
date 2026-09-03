@@ -1,0 +1,155 @@
+name: Constitutional Contract
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: constitution-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BLUE_FORGE_TRUSTED_REF: origin/constitution-v1-baseline
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Fetch trusted constitutional baseline
+        run: git fetch --no-tags --prune origin +refs/heads/constitution-v1-baseline:refs/remotes/origin/constitution-v1-baseline
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Materialize trusted constitutional auditor
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_auditor="/tmp/blue-forge-trusted-audit-${GITHUB_RUN_ID}.py"
+          git show "${BLUE_FORGE_TRUSTED_REF}:scripts/audit_constitution.py" > "$trusted_auditor"
+          chmod 0444 "$trusted_auditor"
+          python3 -m py_compile "$trusted_auditor"
+          printf 'BLUE_FORGE_TRUSTED_AUDITOR=%s\n' "$trusted_auditor" >> "$GITHUB_ENV"
+
+      - name: Audit constitutional contract with trusted auditor
+        shell: bash
+        run: |
+          set -euo pipefail
+          BLUE_FORGE_AUDIT_ROOT="$GITHUB_WORKSPACE" \
+            python3 "$BLUE_FORGE_TRUSTED_AUDITOR"
+
+      - name: Prepare isolated regression workspaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_root="/tmp/blue-forge-trusted-regression-${GITHUB_RUN_ID}"
+          current_root="/tmp/blue-forge-current-regression-${GITHUB_RUN_ID}"
+          test_home="/tmp/blue-forge-regression-home-${GITHUB_RUN_ID}"
+          sudo rm -rf "$trusted_root" "$current_root" "$test_home"
+          sudo mkdir -p "$trusted_root/scripts" "$trusted_root/tests" \
+            "$current_root/scripts" "$current_root/tests" "$test_home"
+
+          # The frozen regression process receives only the trusted-baseline
+          # auditor. The proposed auditor is confined to the separate current
+          # suite below, after the trusted suite has completed successfully.
+          sudo install -m 0444 -- "$BLUE_FORGE_TRUSTED_AUDITOR" \
+            "$trusted_root/scripts/audit_constitution.py"
+          sudo cp -- scripts/audit_constitution.py "$current_root/scripts/"
+
+          # Materialize the frozen baseline tests from the trusted ref. PR-added
+          # modules are never imported in this first regression process.
+          while IFS= read -r -d '' test_path; do
+            case "$test_path" in
+              tests/test*.py)
+                destination="$trusted_root/$test_path"
+                sudo mkdir -p "$(dirname "$destination")"
+                git show "${BLUE_FORGE_TRUSTED_REF}:$test_path" | sudo tee "$destination" >/dev/null
+                ;;
+            esac
+          done < <(git ls-tree -r -z --name-only "$BLUE_FORGE_TRUSTED_REF" -- tests)
+
+          # The trusted auditor has already rejected tracked test symlinks and
+          # non-100644 modes. Copy only actual regular files into the extended
+          # workspace so filesystem links are never dereferenced here either.
+          if find tests -type l -name 'test*.py' -print -quit | grep -q .; then
+            echo "refusing symlinked regression test" >&2
+            exit 1
+          fi
+          while IFS= read -r -d '' source; do
+            relative="${source#./}"
+            destination="$current_root/$relative"
+            sudo mkdir -p "$(dirname "$destination")"
+            sudo cp -- "$source" "$destination"
+          done < <(find tests -type f -name 'test*.py' -print0)
+
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin blueforge-test
+          sudo chown -R blueforge-test:blueforge-test "$trusted_root" "$current_root" "$test_home"
+          sudo chmod 0755 /tmp "$trusted_root" "$trusted_root/scripts" "$trusted_root/tests" \
+            "$current_root" "$current_root/scripts" "$current_root/tests" "$test_home"
+          printf 'BLUE_FORGE_TRUSTED_TEST_ROOT=%s\n' "$trusted_root" >> "$GITHUB_ENV"
+          printf 'BLUE_FORGE_CURRENT_TEST_ROOT=%s\n' "$current_root" >> "$GITHUB_ENV"
+          printf 'BLUE_FORGE_TEST_HOME=%s\n' "$test_home" >> "$GITHUB_ENV"
+
+      - name: Run trusted baseline regressions in sterile sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+
+          restore_workspace() {
+            sudo chmod 0755 "$GITHUB_WORKSPACE" || true
+            sudo chown "$runner_uid:$runner_gid" "$GITHUB_WORKSPACE" || true
+          }
+          trap restore_workspace EXIT
+
+          test ! -e "${BLUE_FORGE_TRUSTED_TEST_ROOT}/archive"
+          test ! -e "${BLUE_FORGE_TRUSTED_TEST_ROOT}/.git"
+          sudo chown root:root "$GITHUB_WORKSPACE"
+          sudo chmod 000 "$GITHUB_WORKSPACE"
+
+          cd "$BLUE_FORGE_TRUSTED_TEST_ROOT"
+          sudo unshare --net -- \
+            runuser -u blueforge-test -- \
+            env HOME="$BLUE_FORGE_TEST_HOME" PATH="$PATH" \
+            "$python_bin" -m unittest discover -s tests -v
+
+      - name: Run current regression suite in separate sterile sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3)"
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+
+          cleanup() {
+            sudo chmod 0755 "$GITHUB_WORKSPACE" || true
+            sudo chown "$runner_uid:$runner_gid" "$GITHUB_WORKSPACE" || true
+            sudo rm -rf "$BLUE_FORGE_TRUSTED_TEST_ROOT" "$BLUE_FORGE_CURRENT_TEST_ROOT" "$BLUE_FORGE_TEST_HOME" || true
+          }
+          trap cleanup EXIT
+
+          test ! -e "${BLUE_FORGE_CURRENT_TEST_ROOT}/archive"
+          test ! -e "${BLUE_FORGE_CURRENT_TEST_ROOT}/.git"
+          sudo chown root:root "$GITHUB_WORKSPACE"
+          sudo chmod 000 "$GITHUB_WORKSPACE"
+
+          cd "$BLUE_FORGE_CURRENT_TEST_ROOT"
+          sudo unshare --net -- \
+            runuser -u blueforge-test -- \
+            env HOME="$BLUE_FORGE_TEST_HOME" PATH="$PATH" \
+            "$python_bin" -m unittest discover -s tests -v
