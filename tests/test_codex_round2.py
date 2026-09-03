@@ -17,6 +17,7 @@ from blue_forge import HardeningCase, ValidationError, evaluate, loads_strict, r
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "fixtures/v1/path-traversal-case.json"
 SCHEMA = ROOT / "schemas/hardening-case-v1.schema.json"
+ORIGINAL = "original:HOSTILE-PATH-001"
 
 
 def fixture() -> dict:
@@ -26,7 +27,7 @@ def fixture() -> dict:
 class CodexRoundTwoTests(unittest.TestCase):
     def test_evaluated_result_payload_is_defensive_copy(self) -> None:
         value = fixture()
-        value["verification"]["original"]["after"] = "UNKNOWN"
+        value["verification"]["original"][ORIGINAL]["after"] = "UNKNOWN"
         result = evaluate(HardeningCase.from_dict(value))
         self.assertFalse(result.hardened)
 
@@ -45,7 +46,7 @@ class CodexRoundTwoTests(unittest.TestCase):
         result_a = evaluate(case_a)
 
         value_b = copy.deepcopy(fixture())
-        value_b["verification"]["original"]["source_sha256"] = "0" * 64
+        value_b["verification"]["original"][ORIGINAL]["source_sha256"] = "0" * 64
         case_b = HardeningCase.from_dict(value_b)
         result_b = evaluate(case_b)
 
