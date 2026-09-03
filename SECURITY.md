@@ -41,7 +41,9 @@ Default CI must not execute, import, install, or automatically extract it. Any f
 
 Static adversarial fixtures are untrusted defensive regression material.
 
-Default CI should inspect them only with bounded, non-executing mechanisms unless a test is explicitly designed for disposable sandbox execution. Live differential or parser testing should use:
+Default CI inspects them only with bounded, non-executing mechanisms. There is no execution exception on `pull_request` or `push` workflows.
+
+Execution of adversarial material, where live differential or parser testing requires it, happens only in a separate, explicitly opt-in `workflow_dispatch` workflow, never `pull_request`. That workflow must use:
 
 - no production credentials;
 - no writable production paths;
@@ -49,6 +51,12 @@ Default CI should inspect them only with bounded, non-executing mechanisms unles
 - bounded CPU, memory, time, recursion, decompression, and output;
 - explicit dependency versions;
 - disposable execution state.
+
+## Auditor trust boundary
+
+The constitutional auditor cannot make its own implementation or workflow immutable. Repository governance must protect `scripts/audit_constitution.py`, `.github/workflows/**`, and the trusted constitutional baseline ref from unreviewed changes.
+
+PR-time audit baselines must come from a ref outside the proposed PR head. Contract v1 currently uses the dedicated `constitution-v1-baseline` branch as that bootstrap anchor. A protected signed tag is preferred for a future release boundary when repository governance is configured for it.
 
 ## Defensive deception
 
