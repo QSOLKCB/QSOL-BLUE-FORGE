@@ -10,7 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+_AUDIT_ROOT = os.environ.get("BLUE_FORGE_AUDIT_ROOT")
+ROOT = Path(_AUDIT_ROOT).resolve() if _AUDIT_ROOT else Path(__file__).resolve().parents[1]
 CONTRACT_VERSION = "blue-forge.core-invariants/v1"
 TRUSTED_REF = os.environ.get("BLUE_FORGE_TRUSTED_REF", "origin/constitution-v1-baseline")
 EXPECTED_IDS = [f"BF-INV-{index:03d}" for index in range(1, 17)]
@@ -38,7 +39,7 @@ ETHICS_PATH = Path("CODE_OF_ETHICS.md")
 README4AI_PATH = Path("README4AI.md")
 AGENTS_PATH = Path("AGENTS.md")
 WORKFLOW_ROOT = Path(".github/workflows")
-DEFAULT_WORKFLOW_TRIGGERS = {"push", "pull_request", "pull_request_target"}
+MANUAL_WORKFLOW_TRIGGER = "workflow_dispatch"
 
 REQUIRED_FILES = [
     Path("README.md"),
@@ -207,8 +208,15 @@ def workflow_paths(commit: str) -> set[Path]:
     }
 
 
+def _event_name(value: str) -> str:
+    item = value.strip()
+    if item.startswith("-"):
+        item = item[1:].strip()
+    return item.split(":", 1)[0].strip().strip("'\"").lower()
+
+
 def workflow_has_default_trigger(text: str) -> bool:
-    """Recognize mapping, scalar, flow-list, and block-sequence workflow triggers."""
+    """Fail closed: only a provably workflow_dispatch-only workflow is manual."""
     lines = text.splitlines()
     for index, raw_line in enumerate(lines):
         line = raw_line.split("#", 1)[0].rstrip()
@@ -216,12 +224,22 @@ def workflow_has_default_trigger(text: str) -> bool:
         if not match:
             continue
 
-        tail = match.group(1).strip().lower()
+        tail = match.group(1).strip()
         if tail:
-            return any(
-                re.search(rf"\b{re.escape(trigger)}\b", tail)
-                for trigger in DEFAULT_WORKFLOW_TRIGGERS
-            )
+            lowered = tail.lower()
+            if lowered.startswith("[") and lowered.endswith("]"):
+                events = {
+                    _event_name(item)
+                    for item in lowered[1:-1].split(",")
+                    if item.strip()
+                }
+                return events != {MANUAL_WORKFLOW_TRIGGER}
+            if lowered.startswith("{") and lowered.endswith("}"):
+                body = lowered[1:-1].strip()
+                if re.fullmatch(r"['\"]?workflow_dispatch['\"]?\s*:\s*\{.*\}", body):
+                    return False
+                return True
+            return _event_name(lowered) != MANUAL_WORKFLOW_TRIGGER
 
         nested_lines: list[tuple[int, str]] = []
         for nested_raw in lines[index + 1 :]:
@@ -234,18 +252,16 @@ def workflow_has_default_trigger(text: str) -> bool:
             nested_lines.append((indent, nested.strip()))
 
         if not nested_lines:
+            # An empty `on:` is not schedulable, so it is not an automatic workflow.
             return False
 
         direct_indent = min(indent for indent, _ in nested_lines)
-        for indent, item in nested_lines:
-            if indent != direct_indent:
-                continue
-            if item.startswith("-"):
-                item = item[1:].strip()
-            key = item.split(":", 1)[0].strip().strip("'\"").lower()
-            if key in DEFAULT_WORKFLOW_TRIGGERS:
-                return True
-        return False
+        events = {
+            _event_name(item)
+            for indent, item in nested_lines
+            if indent == direct_indent
+        }
+        return events != {MANUAL_WORKFLOW_TRIGGER}
     return False
 
 
@@ -317,7 +333,7 @@ def audit_agent_policy_scope(baseline_commit: str) -> None:
 
 
 def audit_default_workflows(baseline_commit: str) -> None:
-    """Only trusted-baseline automatic workflows may run on push/PR events."""
+    """Only trusted-baseline automatic workflows may run without explicit dispatch."""
     baseline = default_workflow_paths(baseline_commit)
     current = default_workflow_paths("HEAD")
     added = sorted(str(path) for path in current - baseline)
