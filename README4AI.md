@@ -15,7 +15,7 @@ SIMULATED RED
   -> HERESY intake
   -> defensive analysis
   -> mitigation + invariant
-  -> independent verification
+  -> HERESY verify
   -> BLUE_HARDENED
   -> permanent regression memory
 ```
@@ -100,6 +100,10 @@ Out of scope:
 `archive/HERESY-SEC-0.3.0.zip` is archived source provenance, not an executable dependency and not automatically trusted implementation code.
 
 Do not execute, import, install, or automatically extract the archive in default CI. Any future import must be independently reviewed, attributed, tested, and made explicit in the target source tree.
+
+## Constitutional baseline
+
+Contract v1 is compared against the repository ref supplied by `BLUE_FORGE_TRUSTED_REF`. PR workflows use `origin/constitution-v1-baseline`, which is outside the proposed PR head. A PR must not replace that trust boundary with `HEAD` or another author-controlled history source.
 
 ## Optimization rule
 
