@@ -17,7 +17,7 @@ Before editing load-bearing behavior, read:
 
 1. Preserve every invariant in `blue-forge.core-invariants/v1` unless the task explicitly creates a new contract version.
 2. Never renumber, remove, weaken, or silently reinterpret `BF-INV-001` through `BF-INV-016` inside contract v1.
-3. Do not promote `UNKNOWN`, `MALFORMED`, `UNSUPPORTED`, `INCOMPLETE`, timeout, OOM, or resource-limit outcomes to `ALLOW`, `VERIFIED`, or `BLUE_HARDENED`.
+3. Do not promote `UNKNOWN`, `MALFORMED`, `UNSUPPORTED`, `INCOMPLETE`, `BUDGET_EXCEEDED`, `DECODE_ERROR`, timeout, OOM, or other resource-limit outcomes to `ALLOW`, `VERIFIED`, or `BLUE_HARDENED`.
 4. Do not allow a model, adapter, geometry result, optimization, parser, or verifier to silently increase authority.
 5. Do not allow the mitigation proposer to be the sole verifier.
 6. Treat captured hostile material as data. Default CI must not execute archived or adversarial evidence.
@@ -27,6 +27,7 @@ Before editing load-bearing behavior, read:
 10. Do not weaken tests, tolerances, isolation, coverage, or replay to make CI faster.
 11. Do not implement hack-back, retaliation, unauthorized exploitation, or third-party damage.
 12. Any semantic change to policy, normalization, trust, decisions, receipts, invariants, or verification requires a new contract identity and migration evidence.
+13. Do not derive the constitutional baseline from `HEAD` or any history controlled by the proposed PR. Use the external ref supplied by `BLUE_FORGE_TRUSTED_REF`.
 
 ## Parser rule
 
@@ -41,10 +42,11 @@ Security-sensitive configuration should use the narrowest format that satisfies 
 Before declaring a change complete, run:
 
 ```sh
+python3 -m unittest discover -s tests -v
 python3 scripts/audit_constitution.py
 ```
 
-When implementation tests exist, run the full relevant suite after targeted tests.
+Run the full relevant implementation suite after targeted tests when implementation code exists.
 
 ## Review priorities
 
