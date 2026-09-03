@@ -28,8 +28,18 @@ The manifest schema is:
   "from": "blue-forge.core-invariants/v1",
   "to": "blue-forge.<successor>/vN",
   "mode": "additive-preserve-v1",
-  "successor_contract_files": ["contracts/..."],
-  "conformance_evidence": ["conformance/..."]
+  "successor_contract_files": [
+    {
+      "path": "contracts/...",
+      "git_oid": "0123456789abcdef0123456789abcdef01234567"
+    }
+  ],
+  "conformance_evidence": [
+    {
+      "path": "conformance/...",
+      "git_oid": "89abcdef0123456789abcdef0123456789abcdef"
+    }
+  ]
 }
 ```
 
@@ -38,11 +48,16 @@ Requirements:
 - `from` MUST equal `blue-forge.core-invariants/v1`.
 - `to` MUST equal the proposed `CONTRACT_VERSION` and MUST differ from v1.
 - `mode` MUST equal `additive-preserve-v1`.
-- `successor_contract_files` MUST be non-empty and identify committed regular files that define the successor contract.
-- `conformance_evidence` MUST be non-empty and identify committed regular files containing migration/conformance evidence.
+- `successor_contract_files` MUST be non-empty and identify the exact Git blob objects that define the successor contract.
+- `conformance_evidence` MUST be non-empty and identify the exact Git blob objects containing migration/conformance evidence.
+- every artifact record MUST contain exactly `path` and `git_oid`.
+- every `git_oid` MUST be a lowercase 40-hex Git blob object id and the committed object at `path` MUST match it exactly.
 - every listed path MUST be repository-relative, normalized, non-escaping, and committed as mode `100644`.
+- the checked-out bytes at every listed path MUST match the authorized Git object without Git filters.
 - the authorization manifest in the PR MUST be byte-identical to the trusted baseline copy.
 - every frozen v1 artifact continues to match the trusted v1 baseline exactly.
+
+Path names alone are not authorization. A successor contract or evidence file whose bytes differ from the trusted `git_oid` is a migration failure even when the path is unchanged.
 
 ## Handoff semantics
 
@@ -56,8 +71,8 @@ A valid migration therefore has this shape:
 trusted v1 artifacts: preserved exactly
 trusted migration authorization: present
 CONTRACT_VERSION: successor identity
-successor contract files: added
-conformance evidence: added
+successor contract blobs: exact authorized Git objects
+conformance evidence blobs: exact authorized Git objects
 ```
 
 Machine-facing successor guidance should be added under new versioned paths rather than rewriting the frozen v1 machine-policy files during the handoff.
