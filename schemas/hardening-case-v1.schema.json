@@ -4,25 +4,62 @@
   "title": "BLUE-FORGE Hardening Case v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "contract", "case_id", "invariant_id", "attack_class", "proposal", "verification"],
+  "required": [
+    "schema",
+    "contract",
+    "case_id",
+    "invariant_id",
+    "attack_class",
+    "proposal",
+    "verification"
+  ],
   "properties": {
-    "schema": {"const": "blue-forge.hardening-case/v1"},
-    "contract": {"const": "blue-forge.core-invariants/v1"},
-    "case_id": {"$ref": "#/$defs/nonempty"},
-    "invariant_id": {"type": "string", "pattern": "^BF-INV-(00[1-9]|01[0-6])$"},
-    "attack_class": {"$ref": "#/$defs/nonempty"},
-    "proposal": {"$ref": "#/$defs/proposal"},
-    "verification": {"$ref": "#/$defs/verification"}
+    "schema": {
+      "const": "blue-forge.hardening-case/v1"
+    },
+    "contract": {
+      "const": "blue-forge.core-invariants/v1"
+    },
+    "case_id": {
+      "$ref": "#/$defs/nonempty"
+    },
+    "invariant_id": {
+      "type": "string",
+      "pattern": "^BF-INV-(00[1-9]|01[0-6])$"
+    },
+    "attack_class": {
+      "$ref": "#/$defs/nonempty"
+    },
+    "proposal": {
+      "$ref": "#/$defs/proposal"
+    },
+    "verification": {
+      "$ref": "#/$defs/verification"
+    }
   },
   "$defs": {
     "nonempty": {
       "type": "string",
       "minLength": 1,
       "maxLength": 4096,
-      "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+      "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
+      "allOf": [
+        {
+          "pattern": "^[^\\u0009-\\u000D\\u001C-\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028-\\u2029\\u202F\\u205F\\u3000](?:[\\s\\S]*[^\\u0009-\\u000D\\u001C-\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028-\\u2029\\u202F\\u205F\\u3000])?$"
+        }
+      ]
     },
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "decision": {"enum": ["ALLOW", "REVIEW", "DENY"]},
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "decision": {
+      "enum": [
+        "ALLOW",
+        "REVIEW",
+        "DENY"
+      ]
+    },
     "producer": {
       "type": "string",
       "minLength": 1,
@@ -33,38 +70,83 @@
       "type": "array",
       "maxItems": 256,
       "uniqueItems": true,
-      "items": {"$ref": "#/$defs/nonempty"}
+      "items": {
+        "$ref": "#/$defs/nonempty"
+      }
     },
     "evidenceBody": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "kind", "before", "after", "provenance", "source_sha256",
-        "reference_engine_sha256", "replay_engine_sha256",
-        "reference_result_sha256", "replay_result_sha256"
+        "kind",
+        "before",
+        "after",
+        "provenance",
+        "source_sha256",
+        "reference_engine_sha256",
+        "replay_engine_sha256",
+        "reference_result_sha256",
+        "replay_result_sha256"
       ],
       "properties": {
-        "kind": {"enum": ["hostile", "benign"]},
-        "before": {"$ref": "#/$defs/nonempty"},
-        "after": {"$ref": "#/$defs/nonempty"},
-        "provenance": {"$ref": "#/$defs/nonempty"},
-        "source_sha256": {"$ref": "#/$defs/sha256"},
-        "reference_engine_sha256": {"$ref": "#/$defs/sha256"},
-        "replay_engine_sha256": {"$ref": "#/$defs/sha256"},
-        "reference_result_sha256": {"$ref": "#/$defs/sha256"},
-        "replay_result_sha256": {"$ref": "#/$defs/sha256"}
+        "kind": {
+          "enum": [
+            "hostile",
+            "benign"
+          ]
+        },
+        "before": {
+          "$ref": "#/$defs/nonempty"
+        },
+        "after": {
+          "$ref": "#/$defs/nonempty"
+        },
+        "provenance": {
+          "$ref": "#/$defs/nonempty"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reference_engine_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "replay_engine_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "reference_result_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "replay_result_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
       }
     },
     "hostileEvidence": {
       "allOf": [
-        {"$ref": "#/$defs/evidenceBody"},
-        {"properties": {"kind": {"const": "hostile"}}}
+        {
+          "$ref": "#/$defs/evidenceBody"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "hostile"
+            }
+          }
+        }
       ]
     },
     "benignEvidence": {
       "allOf": [
-        {"$ref": "#/$defs/evidenceBody"},
-        {"properties": {"kind": {"const": "benign"}}}
+        {
+          "$ref": "#/$defs/evidenceBody"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "benign"
+            }
+          }
+        }
       ]
     },
     "originalEvidenceMap": {
@@ -74,16 +156,20 @@
       "propertyNames": {
         "pattern": "^original:[A-Za-z0-9](?:[A-Za-z0-9._@/-]{0,126})$"
       },
-      "additionalProperties": {"$ref": "#/$defs/hostileEvidence"}
+      "additionalProperties": {
+        "$ref": "#/$defs/hostileEvidence"
+      }
     },
     "variantEvidenceMap": {
       "type": "object",
       "minProperties": 1,
-      "maxProperties": 256,
+      "maxProperties": 255,
       "propertyNames": {
         "pattern": "^variant:[A-Za-z0-9](?:[A-Za-z0-9._@/-]{0,126})$"
       },
-      "additionalProperties": {"$ref": "#/$defs/hostileEvidence"}
+      "additionalProperties": {
+        "$ref": "#/$defs/hostileEvidence"
+      }
     },
     "benignEvidenceMap": {
       "type": "object",
@@ -92,34 +178,80 @@
       "propertyNames": {
         "pattern": "^benign:[A-Za-z0-9](?:[A-Za-z0-9._@/-]{0,126})$"
       },
-      "additionalProperties": {"$ref": "#/$defs/benignEvidence"}
+      "additionalProperties": {
+        "$ref": "#/$defs/benignEvidence"
+      }
     },
     "proposal": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["producer", "mitigation_id", "decision", "pre_mitigation_authority", "requested_authority", "policy_authority"],
+      "required": [
+        "producer",
+        "mitigation_id",
+        "decision",
+        "pre_mitigation_authority",
+        "requested_authority",
+        "policy_authority"
+      ],
       "properties": {
-        "producer": {"$ref": "#/$defs/producer"},
-        "mitigation_id": {"$ref": "#/$defs/nonempty"},
-        "decision": {"$ref": "#/$defs/decision"},
-        "pre_mitigation_authority": {"$ref": "#/$defs/authority"},
-        "requested_authority": {"$ref": "#/$defs/authority"},
-        "policy_authority": {"$ref": "#/$defs/authority"}
+        "producer": {
+          "$ref": "#/$defs/producer"
+        },
+        "mitigation_id": {
+          "$ref": "#/$defs/nonempty"
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "pre_mitigation_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "requested_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "policy_authority": {
+          "$ref": "#/$defs/authority"
+        }
       }
     },
     "verification": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["producer", "decision", "observed_authority", "original", "variants", "benign_controls", "reference_result_sha256", "candidate_result_sha256"],
+      "required": [
+        "producer",
+        "decision",
+        "observed_authority",
+        "original",
+        "variants",
+        "benign_controls",
+        "reference_result_sha256",
+        "candidate_result_sha256"
+      ],
       "properties": {
-        "producer": {"$ref": "#/$defs/producer"},
-        "decision": {"$ref": "#/$defs/decision"},
-        "observed_authority": {"$ref": "#/$defs/authority"},
-        "original": {"$ref": "#/$defs/originalEvidenceMap"},
-        "variants": {"$ref": "#/$defs/variantEvidenceMap"},
-        "benign_controls": {"$ref": "#/$defs/benignEvidenceMap"},
-        "reference_result_sha256": {"$ref": "#/$defs/sha256"},
-        "candidate_result_sha256": {"$ref": "#/$defs/sha256"}
+        "producer": {
+          "$ref": "#/$defs/producer"
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "observed_authority": {
+          "$ref": "#/$defs/authority"
+        },
+        "original": {
+          "$ref": "#/$defs/originalEvidenceMap"
+        },
+        "variants": {
+          "$ref": "#/$defs/variantEvidenceMap"
+        },
+        "benign_controls": {
+          "$ref": "#/$defs/benignEvidenceMap"
+        },
+        "reference_result_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "candidate_result_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
       }
     }
   }
