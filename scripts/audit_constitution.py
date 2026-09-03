@@ -26,40 +26,48 @@ EXPECTED_BLUE_HARDENED = [
 ]
 
 ARCHIVE_PATH = Path("archive/HERESY-SEC-0.3.0.zip")
+ARCHIVE_README_PATH = Path("archive/readme.md")
 REGISTRY_PATH = Path("contracts/core-invariants-v1.json")
 CORE_INVARIANTS_PATH = Path("docs/CORE_INVARIANTS.md")
+HERESY_PROVENANCE_PATH = Path("docs/HERESY_PROVENANCE.md")
 PARSER_DOCTRINE_PATH = Path("doctrine/PARSER_DOCTRINE.md")
 ENGAGEMENT_DOCTRINE_PATH = Path("doctrine/ENGAGEMENT_AREA.md")
 SECURITY_PATH = Path("SECURITY.md")
+ETHICS_PATH = Path("CODE_OF_ETHICS.md")
 
 REQUIRED_FILES = [
     Path("README.md"),
     Path("README4AI.md"),
     Path("AGENTS.md"),
     SECURITY_PATH,
-    Path("CODE_OF_ETHICS.md"),
+    ETHICS_PATH,
     Path("LICENSE"),
     Path("CONTRACT_VERSION"),
     REGISTRY_PATH,
     CORE_INVARIANTS_PATH,
-    Path("docs/HERESY_PROVENANCE.md"),
+    HERESY_PROVENANCE_PATH,
     ENGAGEMENT_DOCTRINE_PATH,
     PARSER_DOCTRINE_PATH,
-    Path("archive/readme.md"),
+    ARCHIVE_README_PATH,
     ARCHIVE_PATH,
     Path("scripts/audit_constitution.py"),
     Path(".github/workflows/constitution.yml"),
 ]
 
-# Only artifacts that define immutable v1 contract semantics or source identity are
-# byte-pinned. Operational prose remains required and receives targeted semantic
-# checks, so typo and clarification fixes do not require a new contract identity.
+# These artifacts define immutable v1 semantics, security/ethical policy, or source
+# provenance. Their committed objects and raw checked-out bytes must match the
+# trusted external baseline. General explanatory prose remains editable when its
+# targeted semantic checks continue to hold.
 PINNED_V1_PATHS = [
     Path("CONTRACT_VERSION"),
     REGISTRY_PATH,
     CORE_INVARIANTS_PATH,
     PARSER_DOCTRINE_PATH,
     ENGAGEMENT_DOCTRINE_PATH,
+    SECURITY_PATH,
+    ETHICS_PATH,
+    HERESY_PROVENANCE_PATH,
+    ARCHIVE_README_PATH,
     ARCHIVE_PATH,
 ]
 
@@ -295,6 +303,8 @@ def audit_documentation(registry: dict) -> None:
     for effect in ("DISRUPT", "TURN", "FIX", "BLOCK"):
         require(effect in engagement, f"ENGAGEMENT_AREA lost defensive effect {effect}")
 
+    # These token checks remain as readable diagnostics. SECURITY.md is also pinned
+    # byte-for-byte to the trusted v1 baseline, so contradictory additions cannot pass.
     security_lower = security.lower()
     require(
         "default ci inspects them only with bounded, non-executing mechanisms" in security_lower,
@@ -329,8 +339,8 @@ def audit_archive(baseline_oids: dict[Path, str]) -> tuple[str, int]:
         raise AuditFailure(f"invalid archived HERESY object size: {size_text!r}") from exc
     require((ROOT / ARCHIVE_PATH).stat().st_size == size, "checked-out HERESY archive size differs from baseline")
 
-    provenance = read_text(Path("docs/HERESY_PROVENANCE.md"))
-    archive_readme = read_text(Path("archive/readme.md"))
+    provenance = read_text(HERESY_PROVENANCE_PATH)
+    archive_readme = read_text(ARCHIVE_README_PATH)
     for text, label in ((provenance, "HERESY provenance"), (archive_readme, "archive README")):
         require(str(size) in text, f"{label} lost archive size")
         require(oid in text, f"{label} lost archive object identity")
