@@ -22,6 +22,9 @@ from blue_forge import (
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "fixtures/v1/path-traversal-case.json"
+ORIGINAL = "original:HOSTILE-PATH-001"
+VARIANT = "variant:HOSTILE-PATH-ENCODED-001"
+BENIGN = "benign:BENIGN-PATH-001"
 
 
 def fixture() -> dict:
@@ -65,7 +68,7 @@ class ReferenceCoreTests(unittest.TestCase):
 
     def test_unknown_cannot_be_hardened(self) -> None:
         value = fixture()
-        value["verification"]["original"]["after"] = "UNKNOWN"
+        value["verification"]["original"][ORIGINAL]["after"] = "UNKNOWN"
         result = evaluate(HardeningCase.from_dict(value))
         self.assertFalse(result.hardened)
         self.assertIn("verification_complete", result.payload["failed_predicates"])
@@ -80,13 +83,13 @@ class ReferenceCoreTests(unittest.TestCase):
 
     def test_benign_control_regression_prevents_hardening(self) -> None:
         value = fixture()
-        value["verification"]["benign_controls"][0]["after"] = "BLOCKED"
+        value["verification"]["benign_controls"][BENIGN]["after"] = "BLOCKED"
         result = evaluate(HardeningCase.from_dict(value))
         self.assertFalse(result.payload["predicates"]["benign_controls_pass"])
 
     def test_replay_divergence_prevents_hardening(self) -> None:
         value = fixture()
-        value["verification"]["variants"][0]["replay_result_sha256"] = "0" * 64
+        value["verification"]["variants"][VARIANT]["replay_result_sha256"] = "0" * 64
         result = evaluate(HardeningCase.from_dict(value))
         self.assertFalse(result.payload["predicates"]["replay_exact"])
 
@@ -94,22 +97,18 @@ class ReferenceCoreTests(unittest.TestCase):
         value = fixture()
         value["verification"]["candidate_result_sha256"] = "1" * 64
         result = evaluate(HardeningCase.from_dict(value))
-        self.assertFalse(
-            result.payload["predicates"]["reference_equivalence_preserved"]
-        )
+        self.assertFalse(result.payload["predicates"]["reference_equivalence_preserved"])
 
     def test_regression_memory_is_deterministic(self) -> None:
         case = HardeningCase.from_dict(fixture())
         result = evaluate(case)
-        self.assertEqual(
-            regression_record(case, result),
-            regression_record(case, result),
-        )
+        self.assertEqual(regression_record(case, result), regression_record(case, result))
 
-    def test_duplicate_evidence_ids_are_rejected(self) -> None:
+    def test_evidence_id_namespaces_are_enforced(self) -> None:
         value = fixture()
-        value["verification"]["variants"][0]["id"] = value["verification"]["original"]["id"]
-        with self.assertRaisesRegex(ValidationError, "duplicate evidence id"):
+        item = value["verification"]["variants"].pop(VARIANT)
+        value["verification"]["variants"]["original:HOSTILE-PATH-ENCODED-001"] = item
+        with self.assertRaisesRegex(ValidationError, "variant:<canonical-id>"):
             HardeningCase.from_dict(value)
 
     def test_over_deep_json_fails_closed(self) -> None:
@@ -142,14 +141,11 @@ class ReferenceCoreTests(unittest.TestCase):
 
         memory = self.run_cli("regression", str(FIXTURE))
         self.assertEqual(memory.returncode, 0, memory.stderr)
-        self.assertEqual(
-            json.loads(memory.stdout)["schema"],
-            "blue-forge.regression-record/v1",
-        )
+        self.assertEqual(json.loads(memory.stdout)["schema"], "blue-forge.regression-record/v1")
 
     def test_cli_incomplete_case_is_nonzero_and_not_allow(self) -> None:
         value = fixture()
-        value["verification"]["original"]["after"] = "UNKNOWN"
+        value["verification"]["original"][ORIGINAL]["after"] = "UNKNOWN"
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "case.json"
             path.write_text(json.dumps(value), encoding="utf-8")
