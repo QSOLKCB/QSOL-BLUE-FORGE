@@ -38,7 +38,7 @@ jobs:
         run: python3 -m py_compile scripts/audit_constitution.py tests/test_audit_constitution.py
 
       - name: Audit regression tests
-        run: python3 -m unittest -v tests.test_audit_constitution
+        run: python3 -m unittest discover -s tests -v
 
       - name: Audit constitutional contract
         run: python3 scripts/audit_constitution.py
