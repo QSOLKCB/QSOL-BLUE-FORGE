@@ -34,11 +34,12 @@ PARSER_DOCTRINE_PATH = Path("doctrine/PARSER_DOCTRINE.md")
 ENGAGEMENT_DOCTRINE_PATH = Path("doctrine/ENGAGEMENT_AREA.md")
 SECURITY_PATH = Path("SECURITY.md")
 ETHICS_PATH = Path("CODE_OF_ETHICS.md")
+AGENTS_PATH = Path("AGENTS.md")
 
 REQUIRED_FILES = [
     Path("README.md"),
     Path("README4AI.md"),
-    Path("AGENTS.md"),
+    AGENTS_PATH,
     SECURITY_PATH,
     ETHICS_PATH,
     Path("LICENSE"),
@@ -54,16 +55,17 @@ REQUIRED_FILES = [
     Path(".github/workflows/constitution.yml"),
 ]
 
-# These artifacts define immutable v1 semantics, security/ethical policy, or source
-# provenance. Their committed objects and raw checked-out bytes must match the
-# trusted external baseline. General explanatory prose remains editable when its
-# targeted semantic checks continue to hold.
+# These artifacts define immutable v1 semantics, machine-agent policy,
+# security/ethical policy, or source provenance. Their committed objects and raw
+# checked-out bytes must match the trusted external baseline. General explanatory
+# prose remains editable when its targeted semantic checks continue to hold.
 PINNED_V1_PATHS = [
     Path("CONTRACT_VERSION"),
     REGISTRY_PATH,
     CORE_INVARIANTS_PATH,
     PARSER_DOCTRINE_PATH,
     ENGAGEMENT_DOCTRINE_PATH,
+    AGENTS_PATH,
     SECURITY_PATH,
     ETHICS_PATH,
     HERESY_PROVENANCE_PATH,
@@ -291,7 +293,7 @@ def audit_documentation(registry: dict) -> None:
     engagement = read_text(ENGAGEMENT_DOCTRINE_PATH)
     readme = read_text(Path("README.md"))
     ai = read_text(Path("README4AI.md"))
-    agents = read_text(Path("AGENTS.md"))
+    agents = read_text(AGENTS_PATH)
     security = read_text(SECURITY_PATH)
 
     require(CONTRACT_VERSION in core, "CORE_INVARIANTS does not name the contract")
@@ -320,6 +322,9 @@ def audit_documentation(registry: dict) -> None:
         require(core.count(heading) == 1, f"missing or duplicated normative heading: {heading}")
         require(invariant_id in readme, f"README no longer exposes {invariant_id}")
 
+    # These path checks remain as readable diagnostics. AGENTS.md is also pinned
+    # byte-for-byte to the trusted v1 baseline, so its hard rules cannot be replaced
+    # while retaining only the expected path strings.
     require(str(REGISTRY_PATH) in agents, "AGENTS.md does not point to the registry")
     require("scripts/audit_constitution.py" in agents, "AGENTS.md does not require this audit")
 
