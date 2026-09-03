@@ -20,66 +20,73 @@
   },
   "schema": "blue-forge.hardening-case/v1",
   "verification": {
-    "benign_controls": [
-      {
+    "benign_controls": {
+      "benign:BENIGN-PATH-001": {
         "after": "PRESERVED",
         "before": "ALLOWED",
-        "id": "BENIGN-PATH-001",
         "kind": "benign",
         "provenance": "VERIFIED",
+        "reference_engine_sha256": "e4acd0a9a6695ec4528514de826c064f22f9eaf10a27294f77074e53b25bd372",
         "reference_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
+        "replay_engine_sha256": "e4acd0a9a6695ec4528514de826c064f22f9eaf10a27294f77074e53b25bd372",
         "replay_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
         "source_sha256": "7d2c9b2bcefacbd45df1c59dda95e0edb051b643e27a932399b243d10d05036a"
       },
-      {
+      "benign:BENIGN-PATH-002": {
         "after": "PRESERVED",
         "before": "ALLOWED",
-        "id": "BENIGN-PATH-002",
         "kind": "benign",
         "provenance": "VERIFIED",
+        "reference_engine_sha256": "e4acd0a9a6695ec4528514de826c064f22f9eaf10a27294f77074e53b25bd372",
         "reference_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
+        "replay_engine_sha256": "e4acd0a9a6695ec4528514de826c064f22f9eaf10a27294f77074e53b25bd372",
         "replay_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
         "source_sha256": "f0d1348e22c622cc3852563a0e1b4ae6d42fadfb1aa7700ffe6d54f180d3a563"
       }
-    ],
+    },
     "candidate_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
     "decision": "DENY",
     "observed_authority": [
       "fs:read:workspace"
     ],
     "original": {
-      "after": "BLOCKED",
-      "before": "VULNERABLE",
-      "id": "HOSTILE-PATH-001",
-      "kind": "hostile",
-      "provenance": "VERIFIED",
-      "reference_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
-      "replay_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
-      "source_sha256": "56d9cb83b04583df3c51c16ce7cd455a49b783b660b2843631518e47e071e649"
+      "original:HOSTILE-PATH-001": {
+        "after": "BLOCKED",
+        "before": "VULNERABLE",
+        "kind": "hostile",
+        "provenance": "VERIFIED",
+        "reference_engine_sha256": "e4acd0a9a6695ec4528514de826c064f22f9eaf10a27294f77074e53b25bd372",
+        "reference_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
+        "replay_engine_sha256": "e4acd0a9a6695ec4528514de826c064f22f9eaf10a27294f77074e53b25bd372",
+        "replay_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
+        "source_sha256": "56d9cb83b04583df3c51c16ce7cd455a49b783b660b2843631518e47e071e649"
+      }
     },
     "producer": "heresy:reference-verifier",
     "reference_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
-    "variants": [
-      {
+    "variants": {
+      "variant:HOSTILE-PATH-ENCODED-001": {
         "after": "BLOCKED",
         "before": "VULNERABLE",
-        "id": "HOSTILE-PATH-ENCODED-001",
         "kind": "hostile",
         "provenance": "VERIFIED",
+        "reference_engine_sha256": "e4acd0a9a6695ec4528514de826c064f22f9eaf10a27294f77074e53b25bd372",
         "reference_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
+        "replay_engine_sha256": "e4acd0a9a6695ec4528514de826c064f22f9eaf10a27294f77074e53b25bd372",
         "replay_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
         "source_sha256": "e85d67813014ea5276af920b0bc5397ccec3e1b9d95c9161d53fd479ce634197"
       },
-      {
+      "variant:HOSTILE-PATH-WINDOWS-001": {
         "after": "BLOCKED",
         "before": "VULNERABLE",
-        "id": "HOSTILE-PATH-WINDOWS-001",
         "kind": "hostile",
         "provenance": "VERIFIED",
+        "reference_engine_sha256": "e4acd0a9a6695ec4528514de826c064f22f9eaf10a27294f77074e53b25bd372",
         "reference_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
+        "replay_engine_sha256": "e4acd0a9a6695ec4528514de826c064f22f9eaf10a27294f77074e53b25bd372",
         "replay_result_sha256": "489037ecba02833ba8a5f09f09f08322fe9be9627e03eb0e1559198fc7d5d426",
         "source_sha256": "0fb844518c4cedddbb056fee470d643e7721ab0779293969fdfe3d77112fb6ff"
       }
-    ]
+    }
   }
 }
