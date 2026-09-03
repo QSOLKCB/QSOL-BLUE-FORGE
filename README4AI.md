@@ -2,6 +2,8 @@
 
 This file is the compact machine-facing entry point for implementation and review agents.
 
+**Constitutional contract:** `blue-forge.core-invariants/v1`
+
 ## Mission
 
 QSOL-BLUE-FORGE converts authorized adversarial findings into reproducible, invariant-driven defensive mitigations.
