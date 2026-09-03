@@ -289,7 +289,7 @@ class ConstitutionalAuditTests(unittest.TestCase):
     def test_dirty_archive_bytes_fail(self) -> None:
         with (self.repo / ARCHIVE).open("ab") as handle:
             handle.write(b"x")
-        self.assert_fails("checked-out pinned artifact differs from v1 baseline")
+        self.assert_fails("checked-out file differs from HEAD")
 
     def test_clean_filter_cannot_hide_raw_byte_change(self) -> None:
         write(self.repo, ".gitattributes", "docs/CORE_INVARIANTS.md text eol=lf\n")
@@ -298,7 +298,7 @@ class ConstitutionalAuditTests(unittest.TestCase):
         raw = path.read_bytes()
         self.assertNotIn(b"\r\n", raw)
         path.write_bytes(raw.replace(b"\n", b"\r\n"))
-        self.assert_fails("checked-out pinned artifact differs from v1 baseline")
+        self.assert_fails("checked-out file differs from HEAD")
 
     def test_required_path_directory_fails(self) -> None:
         path = self.repo / "SECURITY.md"
