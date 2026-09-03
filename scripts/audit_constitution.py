@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_VERSION = "blue-forge.core-invariants/v1"
+TRUSTED_REF = os.environ.get("BLUE_FORGE_TRUSTED_REF", "origin/constitution-v1-baseline")
 EXPECTED_IDS = [f"BF-INV-{index:03d}" for index in range(1, 17)]
 EXPECTED_DECISION_ORDER = ["ALLOW", "REVIEW", "DENY"]
 EXPECTED_BLUE_HARDENED = [
@@ -27,18 +29,21 @@ ARCHIVE_PATH = Path("archive/HERESY-SEC-0.3.0.zip")
 REGISTRY_PATH = Path("contracts/core-invariants-v1.json")
 CORE_INVARIANTS_PATH = Path("docs/CORE_INVARIANTS.md")
 PARSER_DOCTRINE_PATH = Path("doctrine/PARSER_DOCTRINE.md")
+ENGAGEMENT_DOCTRINE_PATH = Path("doctrine/ENGAGEMENT_AREA.md")
+SECURITY_PATH = Path("SECURITY.md")
 
 REQUIRED_FILES = [
     Path("README.md"),
     Path("README4AI.md"),
     Path("AGENTS.md"),
-    Path("SECURITY.md"),
+    SECURITY_PATH,
     Path("CODE_OF_ETHICS.md"),
+    Path("LICENSE"),
     Path("CONTRACT_VERSION"),
     REGISTRY_PATH,
     CORE_INVARIANTS_PATH,
     Path("docs/HERESY_PROVENANCE.md"),
-    Path("doctrine/ENGAGEMENT_AREA.md"),
+    ENGAGEMENT_DOCTRINE_PATH,
     PARSER_DOCTRINE_PATH,
     Path("archive/readme.md"),
     ARCHIVE_PATH,
@@ -46,23 +51,14 @@ REQUIRED_FILES = [
     Path(".github/workflows/constitution.yml"),
 ]
 
-# These artifacts define v1 semantics or provenance. Their expected identities are
-# derived from the earliest historical commit that contains the complete, internally
-# coherent v1 contract. Expected OIDs are deliberately not stored in this mutable
-# audit file.
+# Only artifacts that define the immutable v1 contract semantics or source identity
+# are byte-pinned. Operational prose remains required and receives targeted semantic
+# checks, so typo and clarification fixes do not require a new contract identity.
 PINNED_V1_PATHS = [
-    Path("README.md"),
-    Path("README4AI.md"),
-    Path("AGENTS.md"),
-    Path("SECURITY.md"),
-    Path("CODE_OF_ETHICS.md"),
     Path("CONTRACT_VERSION"),
     REGISTRY_PATH,
     CORE_INVARIANTS_PATH,
-    Path("docs/HERESY_PROVENANCE.md"),
-    Path("doctrine/ENGAGEMENT_AREA.md"),
     PARSER_DOCTRINE_PATH,
-    Path("archive/readme.md"),
     ARCHIVE_PATH,
 ]
 
@@ -182,33 +178,23 @@ def commit_text(commit: str, path: Path) -> str | None:
         return None
 
 
-def find_v1_baseline_commit() -> str:
-    """Find the earliest historical commit containing the coherent v1 contract.
+def trusted_baseline_commit() -> str:
+    """Resolve the v1 baseline from a ref that is external to the proposed PR head."""
+    try:
+        commit = run_git("rev-parse", "--verify", f"{TRUSTED_REF}^{{commit}}")
+    except AuditFailure as exc:
+        raise AuditFailure(
+            f"trusted ref {TRUSTED_REF!r} unavailable; fetch the protected baseline before auditing"
+        ) from exc
 
-    The baseline is derived from immutable Git history rather than OID constants in
-    the proposed audit change. The coherence markers intentionally include the fixes
-    required for the machine-facing contract identity and agent audit pointer.
-    """
-    commits = [line for line in run_git("rev-list", "--reverse", "HEAD").splitlines() if line]
-    require(commits, "repository history is unavailable; checkout must include full history")
-
-    for commit in commits:
-        version = commit_text(commit, Path("CONTRACT_VERSION"))
-        if version is None or version.strip() != CONTRACT_VERSION:
-            continue
-        if any(tree_entry(commit, path) is None for path in PINNED_V1_PATHS):
-            continue
-        ai = commit_text(commit, Path("README4AI.md"))
-        agents = commit_text(commit, Path("AGENTS.md"))
-        if ai is None or CONTRACT_VERSION not in ai:
-            continue
-        if agents is None:
-            continue
-        if str(REGISTRY_PATH) not in agents or "scripts/audit_constitution.py" not in agents:
-            continue
-        return commit
-
-    raise AuditFailure("cannot locate historical v1 constitutional baseline")
+    version = commit_text(commit, Path("CONTRACT_VERSION"))
+    require(version is not None and version.strip() == CONTRACT_VERSION, "trusted baseline contract identity changed")
+    for path in PINNED_V1_PATHS:
+        entry = tree_entry(commit, path)
+        require(entry is not None, f"trusted baseline missing pinned artifact: {path}")
+        mode, _ = entry
+        require(mode == "100644", f"trusted baseline artifact is not regular mode 100644: {path}")
+    return commit
 
 
 def audit_required_files() -> None:
@@ -221,13 +207,12 @@ def audit_required_files() -> None:
 
 
 def audit_pinned_v1_artifacts(baseline_commit: str) -> dict[Path, str]:
-    """Require current committed and checked-out artifacts to equal the history anchor."""
+    """Require current committed and checked-out artifacts to equal the trusted baseline."""
     baseline_oids: dict[Path, str] = {}
     for path in PINNED_V1_PATHS:
         baseline = tree_entry(baseline_commit, path)
-        require(baseline is not None, f"baseline missing pinned artifact: {path}")
+        require(baseline is not None, f"trusted baseline missing pinned artifact: {path}")
         baseline_mode, baseline_oid = baseline
-        require(baseline_mode == "100644", f"baseline pinned artifact is not regular mode 100644: {path}")
 
         current_mode, current_oid = committed_entry(path)
         require(current_mode == baseline_mode, f"pinned artifact mode changed: {path} mode={current_mode}")
@@ -294,9 +279,11 @@ def audit_registry(registry: dict) -> None:
 def audit_documentation(registry: dict) -> None:
     core = read_text(CORE_INVARIANTS_PATH)
     parser = read_text(PARSER_DOCTRINE_PATH)
+    engagement = read_text(ENGAGEMENT_DOCTRINE_PATH)
     readme = read_text(Path("README.md"))
     ai = read_text(Path("README4AI.md"))
     agents = read_text(Path("AGENTS.md"))
+    security = read_text(SECURITY_PATH)
 
     require(CONTRACT_VERSION in core, "CORE_INVARIANTS does not name the contract")
     require(CONTRACT_VERSION in ai, "README4AI does not name the contract")
@@ -304,6 +291,16 @@ def audit_documentation(registry: dict) -> None:
     require("Proof first. Reuse second." in core, "CORE_INVARIANTS lost the optimization rule")
     require("deception outward, truth inward" in core.lower(), "CORE_INVARIANTS lost the truth rule")
     require("canonicalize before authorization" in parser.lower(), "PARSER_DOCTRINE lost canonicalization-before-authorization")
+    for effect in ("DISRUPT", "TURN", "FIX", "BLOCK"):
+        require(effect in engagement, f"ENGAGEMENT_AREA lost defensive effect {effect}")
+
+    security_lower = security.lower()
+    require(
+        "default ci inspects them only with bounded, non-executing mechanisms" in security_lower,
+        "SECURITY.md lost the non-executing default-CI boundary",
+    )
+    require("workflow_dispatch" in security_lower, "SECURITY.md lost the opt-in adversarial execution boundary")
+    require("never `pull_request`" in security_lower, "SECURITY.md permits adversarial execution on pull_request")
 
     for item in registry["invariants"]:
         invariant_id = item["id"]
@@ -342,7 +339,7 @@ def audit_archive(baseline_oids: dict[Path, str]) -> tuple[str, int]:
 def main() -> int:
     try:
         audit_required_files()
-        baseline_commit = find_v1_baseline_commit()
+        baseline_commit = trusted_baseline_commit()
         baseline_oids = audit_pinned_v1_artifacts(baseline_commit)
         registry = load_registry()
         audit_version(registry)
@@ -355,7 +352,7 @@ def main() -> int:
 
     print(
         f"constitution_audit=PASS contract={CONTRACT_VERSION} "
-        f"invariants={len(EXPECTED_IDS)} baseline={baseline_commit}"
+        f"invariants={len(EXPECTED_IDS)} trusted_ref={TRUSTED_REF} baseline={baseline_commit}"
     )
     print(
         "heresy_archive=PASS "
