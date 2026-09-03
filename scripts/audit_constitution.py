@@ -10,7 +10,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_VERSION = "blue-forge.core-invariants/v1"
-EXPECTED_IDS = [f"BF-INV-{index:03d}" for index in range(1, 17)]
 EXPECTED_DECISION_ORDER = ["ALLOW", "REVIEW", "DENY"]
 EXPECTED_BLUE_HARDENED = [
     "original_attack_neutralized",
@@ -22,9 +21,125 @@ EXPECTED_BLUE_HARDENED = [
     "authority_not_expanded",
     "reference_equivalence_preserved",
 ]
+EXPECTED_INVARIANTS = [
+    {
+        "id": "BF-INV-001",
+        "name": "Authority Cannot Silently Expand",
+        "rule": "Effective authority must be a subset of requested authority intersected with policy authority.",
+        "failure_state": "DENY",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-002",
+        "name": "Defensive Decisions Are Monotonic",
+        "rule": "Within one immutable run, automated stages may preserve or tighten ALLOW < REVIEW < DENY but may not weaken a prior decision.",
+        "failure_state": "CONTRACT_ERROR",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-003",
+        "name": "No Self-Certification",
+        "rule": "The component proposing a mitigation cannot be the sole authority declaring that mitigation verified.",
+        "failure_state": "VERIFICATION_INCOMPLETE",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-004",
+        "name": "Provenance Before Interpretation",
+        "rule": "Unverified evidence may be inspected but cannot become load-bearing trusted evidence without required provenance.",
+        "failure_state": "VERIFICATION_INCOMPLETE",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-005",
+        "name": "Evidence Is Data",
+        "rule": "Captured hostile evidence must not gain execution authority merely by being ingested, parsed, inspected, or archived.",
+        "failure_state": "DENY",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-006",
+        "name": "Replay Failure Is Verification Failure",
+        "rule": "For a pinned contract, identical captured bytes, policy, and engine identity must reproduce the same canonical result.",
+        "failure_state": "VERIFICATION_INCOMPLETE",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-007",
+        "name": "Benign Behaviour Must Survive",
+        "rule": "A mitigation is incomplete when it neutralizes the hostile case by unnecessarily breaking required legitimate behaviour.",
+        "failure_state": "VERIFICATION_INCOMPLETE",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-008",
+        "name": "Unknown Is Not Safe",
+        "rule": "UNKNOWN, MALFORMED, UNSUPPORTED, INCOMPLETE, TIMEOUT, and resource failures cannot be promoted to ALLOW or VERIFIED.",
+        "failure_state": "DENY_OR_INCOMPLETE",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-009",
+        "name": "Resource Exhaustion Cannot Produce Verification",
+        "rule": "Exhausting a configured CPU, memory, recursion, decompression, worker, fixture, time, or evidence budget must fail explicitly.",
+        "failure_state": "VERIFICATION_INCOMPLETE",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-010",
+        "name": "Optimisation Cannot Reduce the Proof Surface",
+        "rule": "Performance work may reduce proof cost but must not weaken assertions, coverage, provenance, isolation, tolerances, determinism, boundaries, or replay.",
+        "failure_state": "CONTRACT_ERROR",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-011",
+        "name": "Parallelism Is Semantically Invisible",
+        "rule": "Worker count and completion order may affect performance but must not alter canonical security results.",
+        "failure_state": "VERIFICATION_INCOMPLETE",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-012",
+        "name": "Model Agreement Is Not Proof",
+        "rule": "Model consensus cannot elevate a claim into verified evidence without an independent verification predicate.",
+        "failure_state": "VERIFICATION_INCOMPLETE",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-013",
+        "name": "Semantic Changes Require New Contract Identity",
+        "rule": "Changes to policy meaning, normalization, trust, decision ordering, receipt meaning, invariant semantics, or verification semantics require explicit versioning and new conformance vectors.",
+        "failure_state": "CONTRACT_ERROR",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-014",
+        "name": "No Silent Degradation",
+        "rule": "Unavailable required verification mechanisms must produce an explicit incomplete state rather than a weaker silent substitute.",
+        "failure_state": "VERIFICATION_INCOMPLETE",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-015",
+        "name": "Deception Outward, Truth Inward",
+        "rule": "Defensive deception may shape hostile behaviour but must never distort evidence, uncertainty, provenance, or outcomes presented to defenders.",
+        "failure_state": "CONTRACT_ERROR",
+        "constitutional": True,
+    },
+    {
+        "id": "BF-INV-016",
+        "name": "Minimum Necessary Intervention",
+        "rule": "For equivalent verified security outcomes, prefer the mitigation that changes the smallest necessary authority, resource, user, service, and time scope.",
+        "failure_state": "REVIEW",
+        "constitutional": True,
+    },
+]
+EXPECTED_IDS = [item["id"] for item in EXPECTED_INVARIANTS]
 ARCHIVE_PATH = Path("archive/HERESY-SEC-0.3.0.zip")
 ARCHIVE_SIZE = 120145
 ARCHIVE_GIT_OID = "76ad6138023ebe41c6a715980835403b945648f1"
+ARCHIVE_GIT_MODE = "100644"
 REQUIRED_FILES = [
     Path("README.md"),
     Path("README4AI.md"),
@@ -58,14 +173,45 @@ def read_text(path: Path) -> str:
         raise AuditFailure(f"cannot read {path}: {exc}") from exc
 
 
+def reject_duplicate_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Build a JSON object while rejecting duplicate member names at every depth."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise AuditFailure(f"duplicate JSON key in invariant registry: {key!r}")
+        result[key] = value
+    return result
+
+
 def load_registry() -> dict:
     path = ROOT / "contracts/core-invariants-v1.json"
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_object_pairs,
+        )
+    except AuditFailure:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise AuditFailure(f"invalid invariant registry: {exc}") from exc
     require(isinstance(value, dict), "invariant registry must be a JSON object")
     return value
+
+
+def run_git(*args: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=ROOT,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AuditFailure(f"git {' '.join(args)} failed: {exc}") from exc
+    return completed.stdout.strip()
 
 
 def audit_required_files() -> None:
@@ -81,31 +227,23 @@ def audit_version(registry: dict) -> None:
 
 
 def audit_registry(registry: dict) -> None:
+    require(
+        set(registry) == {"schema", "status", "decision_order", "blue_hardened", "invariants"},
+        "registry top-level fields changed",
+    )
     require(registry.get("decision_order") == EXPECTED_DECISION_ORDER, "decision lattice changed")
 
     hardened = registry.get("blue_hardened")
     require(isinstance(hardened, dict), "blue_hardened must be an object")
+    require(set(hardened) == {"all_of"}, "blue_hardened fields changed")
     require(hardened.get("all_of") == EXPECTED_BLUE_HARDENED, "BLUE_HARDENED predicate changed")
 
     invariants = registry.get("invariants")
     require(isinstance(invariants, list), "invariants must be a list")
-    require(len(invariants) == len(EXPECTED_IDS), "contract v1 must contain exactly 16 invariants")
-
-    ids = []
-    for item in invariants:
-        require(isinstance(item, dict), "each invariant must be an object")
-        invariant_id = item.get("id")
-        ids.append(invariant_id)
-        require(item.get("constitutional") is True, f"{invariant_id}: constitutional flag must remain true")
-        require(isinstance(item.get("name"), str) and item["name"].strip(), f"{invariant_id}: missing name")
-        require(isinstance(item.get("rule"), str) and item["rule"].strip(), f"{invariant_id}: missing rule")
-        require(
-            isinstance(item.get("failure_state"), str) and item["failure_state"].strip(),
-            f"{invariant_id}: missing failure_state",
-        )
-
-    require(ids == EXPECTED_IDS, f"invariant IDs changed or were reordered: {ids!r}")
-    require(len(set(ids)) == len(ids), "duplicate invariant IDs")
+    require(
+        invariants == EXPECTED_INVARIANTS,
+        "contract v1 invariant definitions changed; semantic changes require a new contract identity",
+    )
 
 
 def audit_documentation(registry: dict) -> None:
@@ -135,27 +273,34 @@ def audit_documentation(registry: dict) -> None:
         require(predicate in readme, f"README lost BLUE_HARDENED predicate {predicate}")
 
 
-def git_object_id(path: Path) -> str:
-    try:
-        completed = subprocess.run(
-            ["git", "hash-object", "--", str(path)],
-            cwd=ROOT,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise AuditFailure(f"cannot compute git object identity for {path}: {exc}") from exc
-    return completed.stdout.strip()
+def committed_entry(path: Path) -> tuple[str, str]:
+    """Return the Git index mode and object ID for exactly one stage-0 path."""
+    output = run_git("ls-files", "--stage", "--", str(path))
+    lines = [line for line in output.splitlines() if line]
+    require(len(lines) == 1, f"expected exactly one committed index entry for {path}")
+
+    metadata, separator, listed_path = lines[0].partition("\t")
+    require(separator == "\t" and listed_path == str(path), f"unexpected index entry for {path}")
+    fields = metadata.split()
+    require(len(fields) == 3, f"malformed index metadata for {path}")
+    mode, oid, stage = fields
+    require(stage == "0", f"non-stage-0 index entry for {path}")
+    return mode, oid
 
 
 def audit_archive() -> None:
-    path = ROOT / ARCHIVE_PATH
-    require(path.stat().st_size == ARCHIVE_SIZE, f"archived HERESY size changed: {path.stat().st_size}")
-    oid = git_object_id(ARCHIVE_PATH)
-    require(oid == ARCHIVE_GIT_OID, f"archived HERESY object identity changed: {oid}")
+    mode, oid = committed_entry(ARCHIVE_PATH)
+    require(mode == ARCHIVE_GIT_MODE, f"archived HERESY file mode changed: {mode}")
+    require(oid == ARCHIVE_GIT_OID, f"archived HERESY committed object identity changed: {oid}")
+
+    object_type = run_git("cat-file", "-t", oid)
+    require(object_type == "blob", f"archived HERESY object is not a blob: {object_type}")
+    object_size_text = run_git("cat-file", "-s", oid)
+    try:
+        object_size = int(object_size_text)
+    except ValueError as exc:
+        raise AuditFailure(f"invalid git object size for archived HERESY: {object_size_text!r}") from exc
+    require(object_size == ARCHIVE_SIZE, f"archived HERESY committed size changed: {object_size}")
 
     provenance = read_text(Path("docs/HERESY_PROVENANCE.md"))
     archive_readme = read_text(Path("archive/readme.md"))
@@ -177,7 +322,10 @@ def main() -> int:
         return 1
 
     print(f"constitution_audit=PASS contract={CONTRACT_VERSION} invariants={len(EXPECTED_IDS)}")
-    print(f"heresy_archive=PASS path={ARCHIVE_PATH} size={ARCHIVE_SIZE} git_oid={ARCHIVE_GIT_OID}")
+    print(
+        "heresy_archive=PASS "
+        f"path={ARCHIVE_PATH} mode={ARCHIVE_GIT_MODE} size={ARCHIVE_SIZE} git_oid={ARCHIVE_GIT_OID}"
+    )
     return 0
 
 
