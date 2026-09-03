@@ -33,6 +33,7 @@ PRODUCER_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._:@/-]{0,127})$")
 EVIDENCE_ID_SUFFIX = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._@/-]{0,126})$")
 MAX_JSON_DEPTH = 32
 MAX_ARRAY_ITEMS = 256
+MAX_VARIANT_ITEMS = 255
 MAX_STRING_CHARS = 4096
 MAX_INTEGER_DIGITS = 128
 INVARIANT = re.compile(r"^BF-INV-(?:00[1-9]|01[0-6])$")
@@ -207,11 +208,10 @@ def _sha256(value: Any, label: str) -> str:
 
 def _authority(value: Any, label: str) -> frozenset[str]:
     items = _array(value, label)
-    if any(type(item) is not str or not item.strip() or item != item.strip() for item in items):
-        raise ValidationError(f"{label} entries must be non-empty trimmed strings")
-    if len(set(items)) != len(items):
+    checked = [_string(item, f"{label} entry") for item in items]
+    if len(set(checked)) != len(checked):
         raise ValidationError(f"{label} contains duplicate capabilities")
-    return frozenset(items)
+    return frozenset(checked)
 
 
 def _decision(value: Any, label: str) -> Decision:
@@ -335,16 +335,22 @@ class Verification:
 
         original_map = _object(obj["original"], "verification.original")
         if len(original_map) != 1:
-            raise ValidationError("verification.original must contain exactly one evidence entry")
+            raise ValidationError(
+                "verification.original must contain exactly one evidence entry"
+            )
         original_id, original_value = next(iter(original_map.items()))
 
         variants_map = _object(obj["variants"], "verification.variants")
-        if not variants_map or len(variants_map) > MAX_ARRAY_ITEMS:
-            raise ValidationError("verification.variants must contain 1..256 evidence entries")
+        if not variants_map or len(variants_map) > MAX_VARIANT_ITEMS:
+            raise ValidationError(
+                f"verification.variants must contain 1..{MAX_VARIANT_ITEMS} evidence entries"
+            )
 
         benign_map = _object(obj["benign_controls"], "verification.benign_controls")
         if not benign_map or len(benign_map) > MAX_ARRAY_ITEMS:
-            raise ValidationError("verification.benign_controls must contain 1..256 evidence entries")
+            raise ValidationError(
+                f"verification.benign_controls must contain 1..{MAX_ARRAY_ITEMS} evidence entries"
+            )
 
         return cls(
             producer=_producer_id(obj["producer"], "verification.producer"),
@@ -352,7 +358,9 @@ class Verification:
             observed_authority=_authority(
                 obj["observed_authority"], "verification.observed_authority"
             ),
-            original=Evidence.from_entry(original_id, original_value, "hostile", "original"),
+            original=Evidence.from_entry(
+                original_id, original_value, "hostile", "original"
+            ),
             variants=tuple(
                 Evidence.from_entry(eid, item, "hostile", "variant")
                 for eid, item in variants_map.items()
@@ -418,7 +426,7 @@ class HardeningCase:
 
 @dataclass(frozen=True, init=False)
 class HardeningResult:
-    """Immutable evaluated result with defensive-copy payload access."""
+    """Immutable evaluator-only result with defensive-copy payload access."""
 
     _payload_bytes: bytes
 
@@ -469,7 +477,9 @@ def _case_input_material(case: HardeningCase) -> dict[str, Any]:
         benign_ids = [item.evidence_id for item in v.benign_controls]
         all_ids = [v.original.evidence_id, *variant_ids, *benign_ids]
         if len(set(all_ids)) != len(all_ids):
-            raise ValidationError("duplicate evidence id in directly constructed hardening case")
+            raise ValidationError(
+                "duplicate evidence id in directly constructed hardening case"
+            )
         return {
             "schema": CASE_SCHEMA,
             "contract": CONTRACT,
@@ -488,19 +498,25 @@ def _case_input_material(case: HardeningCase) -> dict[str, Any]:
                 "producer": v.producer,
                 "decision": v.decision.value,
                 "observed_authority": sorted(v.observed_authority),
-                "original": {v.original.evidence_id: _evidence_body(v.original)},
+                "original": {
+                    v.original.evidence_id: _evidence_body(v.original)
+                },
                 "variants": {
-                    item.evidence_id: _evidence_body(item) for item in v.variants
+                    item.evidence_id: _evidence_body(item)
+                    for item in v.variants
                 },
                 "benign_controls": {
-                    item.evidence_id: _evidence_body(item) for item in v.benign_controls
+                    item.evidence_id: _evidence_body(item)
+                    for item in v.benign_controls
                 },
                 "reference_result_sha256": v.reference_result_sha256,
                 "candidate_result_sha256": v.candidate_result_sha256,
             },
         }
     except (AttributeError, TypeError, ValueError) as exc:
-        raise ValidationError(f"invalid directly constructed hardening case: {exc}") from exc
+        raise ValidationError(
+            f"invalid directly constructed hardening case: {exc}"
+        ) from exc
 
 
 def _validated_case(case: HardeningCase) -> HardeningCase:
@@ -516,7 +532,9 @@ def evaluate(case: HardeningCase) -> HardeningResult:
     p = case.proposal
     all_evidence = case.evidence()
 
-    engine_ids = {item.reference_engine_sha256 for item in all_evidence}
+    reference_engine_ids = {
+        item.reference_engine_sha256 for item in all_evidence
+    }
     predicates = {
         "original_attack_neutralized": (
             v.original.before == "VULNERABLE"
@@ -533,18 +551,21 @@ def evaluate(case: HardeningCase) -> HardeningResult:
         "benign_controls_pass": (
             bool(v.benign_controls)
             and all(
-                item.before == "ALLOWED" and item.after == "PRESERVED"
+                item.before == "ALLOWED"
+                and item.after == "PRESERVED"
                 for item in v.benign_controls
             )
         ),
-        "provenance_valid": all(item.provenance == "VERIFIED" for item in all_evidence),
+        "provenance_valid": all(
+            item.provenance == "VERIFIED" for item in all_evidence
+        ),
         "verification_complete": (
             bool(v.variants)
             and bool(v.benign_controls)
             and all(item.complete() for item in all_evidence)
         ),
         "replay_exact": (
-            len(engine_ids) == 1
+            len(reference_engine_ids) == 1
             and all(
                 item.reference_engine_sha256 == item.replay_engine_sha256
                 and item.reference_result_sha256 == item.replay_result_sha256
@@ -600,7 +621,19 @@ def regression_record(case: HardeningCase, result: HardeningResult) -> dict[str,
 
     case_sha256 = digest(_case_material(validated_case))
     if result_payload["case_sha256"] != case_sha256:
-        raise ValidationError("hardening result case digest does not match supplied case")
+        raise ValidationError(
+            "hardening result case digest does not match supplied case"
+        )
+
+    evidence = validated_case.evidence()
+    hostile_ids = sorted([
+        validated_case.verification.original.evidence_id,
+        *[item.evidence_id for item in validated_case.verification.variants],
+    ])
+    benign_ids = sorted(
+        item.evidence_id
+        for item in validated_case.verification.benign_controls
+    )
 
     material: dict[str, Any] = {
         "schema": REGRESSION_SCHEMA,
@@ -612,17 +645,17 @@ def regression_record(case: HardeningCase, result: HardeningResult) -> dict[str,
         "mitigation_id": validated_case.proposal.mitigation_id,
         "hardening_status": result_payload["status"],
         "hardening_receipt_sha256": result.receipt_sha256,
-        "hostile_evidence_ids": [
-            validated_case.verification.original.evidence_id,
-            *[item.evidence_id for item in validated_case.verification.variants],
-        ],
-        "benign_control_ids": [
-            item.evidence_id for item in validated_case.verification.benign_controls
-        ],
-        "source_sha256": sorted(item.source_sha256 for item in validated_case.evidence()),
-        "engine_sha256": sorted({
-            item.reference_engine_sha256 for item in validated_case.evidence()
-        }),
+        "hostile_evidence_ids": hostile_ids,
+        "benign_control_ids": benign_ids,
+        "source_sha256": {
+            item.evidence_id: item.source_sha256 for item in evidence
+        },
+        "reference_engine_sha256": {
+            item.evidence_id: item.reference_engine_sha256 for item in evidence
+        },
+        "replay_engine_sha256": {
+            item.evidence_id: item.replay_engine_sha256 for item in evidence
+        },
         "failed_predicates": list(result_payload["failed_predicates"]),
     }
     record = dict(material)
