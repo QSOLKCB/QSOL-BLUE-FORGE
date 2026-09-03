@@ -31,6 +31,8 @@ class WorkflowTriggerFormTests(unittest.TestCase):
             "on: workflow_run\n",
             "on: [workflow_dispatch, push]\n",
             "on: [workflow_dispatch, schedule]\n",
+            "on: {workflow_dispatch: {}, push: {}}\n",
+            "on: {'workflow_dispatch': {}, 'schedule': {}}\n",
             "on:\n  pull_request:\n",
             "on:\n  schedule:\n    - cron: '0 0 * * *'\n",
             "on:\n  - pull_request\n  - workflow_dispatch\n",
