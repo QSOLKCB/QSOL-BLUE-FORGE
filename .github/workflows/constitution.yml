@@ -149,12 +149,21 @@ jobs:
           done < <(git ls-tree -r -z --name-only HEAD -- blue_forge fixtures schemas)
 
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin blueforge-test
+
+          # Trusted/current suites retain their previous unprivileged ownership.
           sudo chown -R blueforge-test:blueforge-test \
-            "$trusted_root" "$proposed_frozen_root" "$current_root" "$test_home"
+            "$trusted_root" "$current_root" "$test_home"
           sudo chmod 0755 /tmp \
             "$trusted_root" "$trusted_root/scripts" "$trusted_root/tests" \
-            "$proposed_frozen_root" "$proposed_frozen_root/scripts" "$proposed_frozen_root/tests" \
             "$current_root" "$current_root/scripts" "$current_root/tests" "$test_home"
+
+          # Proposed code must be able to read the frozen workspace but must never
+          # own or modify the trusted tests, their directories, schemas, fixtures,
+          # or proposed source between supervised child processes.
+          sudo chown -R root:root "$proposed_frozen_root"
+          sudo find "$proposed_frozen_root" -type d -exec chmod 0555 {} +
+          sudo find "$proposed_frozen_root" -type f -exec chmod 0444 {} +
+
           printf 'BLUE_FORGE_TRUSTED_TEST_ROOT=%s\n' "$trusted_root" >> "$GITHUB_ENV"
           printf 'BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT=%s\n' "$proposed_frozen_root" >> "$GITHUB_ENV"
           printf 'BLUE_FORGE_CURRENT_TEST_ROOT=%s\n' "$current_root" >> "$GITHUB_ENV"
@@ -201,6 +210,8 @@ jobs:
 
           test ! -e "${BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT}/archive"
           test ! -e "${BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT}/.git"
+          test "$(stat -c '%U:%G %a' "${BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT}/tests")" = "root:root 555"
+          test -z "$(find "${BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT}/tests" -type f ! -perm 0444 -print -quit)"
           sudo chown root:root "$GITHUB_WORKSPACE"
           sudo chmod 000 "$GITHUB_WORKSPACE"
 
