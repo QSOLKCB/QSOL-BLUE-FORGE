@@ -1,5 +1,5 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$schema": "https://github.com/QSOLKCB/QSOL-BLUE-FORGE/schemas/blue-forge-hardening-meta-v1.schema.json",
   "$id": "https://github.com/QSOLKCB/QSOL-BLUE-FORGE/schemas/hardening-case-v1.schema.json",
   "title": "BLUE-FORGE Hardening Case v1",
   "type": "object",
@@ -216,6 +216,8 @@
     "verification": {
       "type": "object",
       "additionalProperties": false,
+      "blueForgeUniqueSourceSha256": true,
+      "$comment": "Required BLUE-FORGE vocabulary rule: source_sha256 values across original, variants, and benign_controls are case-wide unique. Validators that do not implement the required source-uniqueness vocabulary must refuse this schema rather than silently ignore the rule.",
       "required": [
         "producer",
         "decision",
