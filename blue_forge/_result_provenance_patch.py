@@ -92,18 +92,90 @@ def _payload_for_validated_case(core: Any, case: Any) -> dict[str, Any]:
 
 
 def install(core: Any) -> None:
-    """Make all result construction equivalent to evaluation of an originating case."""
+    """Make result origin immutable and every read equivalent to fresh evaluation."""
 
     def payload_for_validated_case(case: Any) -> dict[str, Any]:
         return _payload_for_validated_case(core, case)
 
-    def from_evaluation(cls: type[Any], case: Any) -> Any:
-        validated_case = core._validated_case(case)
-        return cls(validated_case, _token=core._EVALUATION_TOKEN)
+    class HardeningResult(tuple):
+        """Evaluator-issued result whose originating case is held in immutable tuple storage."""
+
+        __slots__ = ()
+
+        def __new__(
+            cls,
+            originating_case: Any,
+            *,
+            _token: object | None = None,
+        ) -> Any:
+            if _token is not core._EVALUATION_TOKEN:
+                raise core.ValidationError("HardeningResult must be created by evaluate()")
+            if not isinstance(originating_case, core.HardeningCase):
+                raise core.ValidationError(
+                    "HardeningResult construction requires an originating HardeningCase"
+                )
+            validated_case = core._validated_case(originating_case)
+            case_material = core._case_input_material(validated_case)
+            case_bytes = core.canonical_bytes(case_material)
+            return tuple.__new__(cls, (case_bytes,))
+
+        def __init__(
+            self,
+            originating_case: Any,
+            *,
+            _token: object | None = None,
+        ) -> None:
+            # All state is established immutably by __new__.
+            del originating_case, _token
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            del name, value
+            raise AttributeError("HardeningResult is immutable")
+
+        @property
+        def _case_bytes(self) -> bytes:
+            value = tuple.__getitem__(self, 0)
+            if type(value) is not bytes:
+                raise core.ValidationError("hardening result case provenance is invalid")
+            return value
+
+        @classmethod
+        def _from_evaluation(cls, case: Any) -> Any:
+            return cls(case, _token=core._EVALUATION_TOKEN)
+
+        def _recomputed_payload(self) -> dict[str, Any]:
+            try:
+                case_value = core.loads_strict(self._case_bytes.decode("utf-8"))
+            except (AttributeError, UnicodeDecodeError, IndexError, TypeError) as exc:
+                raise core.ValidationError("hardening result case provenance is invalid") from exc
+            case = core.HardeningCase.from_dict(case_value)
+            validated_case = core._validated_case(case)
+            payload = payload_for_validated_case(validated_case)
+            validator = getattr(core, "_validate_result_payload", None)
+            if not callable(validator):
+                raise core.ValidationError("hardening result validator is unavailable")
+            validator(payload)
+            return payload
+
+        @property
+        def payload(self) -> dict[str, Any]:
+            return self._recomputed_payload()
+
+        @property
+        def hardened(self) -> bool:
+            return self._recomputed_payload()["status"] == "BLUE_HARDENED"
+
+        @property
+        def receipt_sha256(self) -> str:
+            return self._recomputed_payload()["receipt_sha256"]
+
+    HardeningResult.__name__ = "HardeningResult"
+    HardeningResult.__qualname__ = "HardeningResult"
+    HardeningResult.__module__ = core.__name__
 
     def evaluate(case: Any) -> Any:
-        return core.HardeningResult._from_evaluation(case)
+        return HardeningResult._from_evaluation(case)
 
     core._payload_for_validated_case = payload_for_validated_case
-    core.HardeningResult._from_evaluation = classmethod(from_evaluation)
+    core.HardeningResult = HardeningResult
     core.evaluate = evaluate
