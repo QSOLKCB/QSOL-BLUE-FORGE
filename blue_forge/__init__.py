@@ -5,12 +5,14 @@ from ._validation_patch import install as _install_validation
 from ._json_snapshot_patch import install as _install_json_snapshot
 from ._array_preflight_patch import install as _install_array_preflight
 from ._authority_preflight_patch import install as _install_authority_preflight
+from ._case_preflight_patch import install as _install_case_preflight
 from ._result_provenance_patch import install as _install_result_provenance
 
 _install_validation(_core)
 _install_json_snapshot(_core)
 _install_array_preflight(_core)
 _install_authority_preflight(_core)
+_install_case_preflight(_core)
 _install_result_provenance(_core)
 
 from .core import (
