@@ -31,11 +31,11 @@ class CodexRoundFourteenTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             result._case_bytes = b'{}'  # type: ignore[misc]
 
-        # Even a deliberate low-level slot overwrite cannot expose a forged
-        # hardened state without revalidating the originating case material.
-        object.__setattr__(result, "_case_bytes", b'{"status":"BLUE_HARDENED"}')
-        with self.assertRaises(ValidationError):
-            _ = result.hardened
+        # The origin now lives in immutable tuple storage. Even object.__setattr__
+        # cannot replace the read-only provenance property with attacker bytes.
+        with self.assertRaises((AttributeError, TypeError)):
+            object.__setattr__(result, "_case_bytes", b'{"status":"BLUE_HARDENED"}')
+        self.assertFalse(result.hardened)
 
     def test_schema_vocabulary_rejects_semantic_cases_over_cli_byte_budget(self) -> None:
         data = fixture()
