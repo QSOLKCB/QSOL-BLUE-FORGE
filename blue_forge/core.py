@@ -36,6 +36,7 @@ MAX_ARRAY_ITEMS = 256
 MAX_VARIANT_ITEMS = 255
 MAX_STRING_CHARS = 4096
 MAX_INTEGER_DIGITS = 128
+MAX_INTEGER_ABS = 10**MAX_INTEGER_DIGITS - 1
 INVARIANT = re.compile(r"^BF-INV-(?:00[1-9]|01[0-6])$")
 
 _EVALUATION_TOKEN = object()
@@ -89,7 +90,13 @@ def _parse_int(value: str) -> int:
 def _validate_json_value(value: Any, path: str = "$", depth: int = 0) -> None:
     if depth > MAX_JSON_DEPTH:
         raise ValidationError(f"JSON nesting exceeds {MAX_JSON_DEPTH} at {path}")
-    if value is None or type(value) in (int, bool):
+    if value is None or type(value) is bool:
+        return
+    if type(value) is int:
+        if abs(value) > MAX_INTEGER_ABS:
+            raise ValidationError(
+                f"integer exceeds {MAX_INTEGER_DIGITS} decimal digits at {path}"
+            )
         return
     if type(value) is str:
         if len(value) > MAX_STRING_CHARS:
@@ -352,23 +359,33 @@ class Verification:
                 f"verification.benign_controls must contain 1..{MAX_ARRAY_ITEMS} evidence entries"
             )
 
+        original = Evidence.from_entry(
+            original_id, original_value, "hostile", "original"
+        )
+        variants = tuple(
+            Evidence.from_entry(eid, item, "hostile", "variant")
+            for eid, item in variants_map.items()
+        )
+        benign_controls = tuple(
+            Evidence.from_entry(eid, item, "benign", "benign")
+            for eid, item in benign_map.items()
+        )
+        evidence = (original, *variants, *benign_controls)
+        source_digests = [item.source_sha256 for item in evidence]
+        if len(set(source_digests)) != len(source_digests):
+            raise ValidationError(
+                "evidence source_sha256 values must be unique across coverage roles"
+            )
+
         return cls(
             producer=_producer_id(obj["producer"], "verification.producer"),
             decision=_decision(obj["decision"], "verification.decision"),
             observed_authority=_authority(
                 obj["observed_authority"], "verification.observed_authority"
             ),
-            original=Evidence.from_entry(
-                original_id, original_value, "hostile", "original"
-            ),
-            variants=tuple(
-                Evidence.from_entry(eid, item, "hostile", "variant")
-                for eid, item in variants_map.items()
-            ),
-            benign_controls=tuple(
-                Evidence.from_entry(eid, item, "benign", "benign")
-                for eid, item in benign_map.items()
-            ),
+            original=original,
+            variants=variants,
+            benign_controls=benign_controls,
             reference_result_sha256=_sha256(
                 obj["reference_result_sha256"], "verification.reference_result_sha256"
             ),
@@ -613,6 +630,11 @@ def evaluate(case: HardeningCase) -> HardeningResult:
 
 def regression_record(case: HardeningCase, result: HardeningResult) -> dict[str, Any]:
     """Create deterministic permanent-regression memory bound to this exact case."""
+    if type(result) is not HardeningResult:
+        raise ValidationError(
+            "regression_record() requires evaluator-issued HardeningResult"
+        )
+
     validated_case = _validated_case(case)
     result_payload = result.payload
     expected_payload = evaluate(validated_case).payload
@@ -644,7 +666,7 @@ def regression_record(case: HardeningCase, result: HardeningResult) -> dict[str,
         "attack_class": validated_case.attack_class,
         "mitigation_id": validated_case.proposal.mitigation_id,
         "hardening_status": result_payload["status"],
-        "hardening_receipt_sha256": result.receipt_sha256,
+        "hardening_receipt_sha256": expected_payload["receipt_sha256"],
         "hostile_evidence_ids": hostile_ids,
         "benign_control_ids": benign_ids,
         "source_sha256": {
