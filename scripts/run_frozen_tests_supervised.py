@@ -1,35 +1,60 @@
 #!/usr/bin/env python3
-"""Trusted supervisor for frozen tests executed against proposed source.
+"""Run frozen assertions outside proposed Python, using a bounded data bridge.
 
-Frozen unittest code and assertion accounting execute only in the trusted worker
-interpreter. Calls into proposed ``blue_forge`` are proxied into fresh isolated
-Python processes, so proposed code cannot mutate trusted unittest classes, test
-module globals, or worker result accounting.
+Only the trusted worker executes unittest and signs test completion. The actor
+never receives a signing key. Actor responses are untrusted data, not evidence
+that a test passed. CI launches each actor under a distinct UID in a fresh PID
+namespace; the namespace lifetime contains even detached descendants.
+
+The bridge retains real actor-side objects between calls. It does not substitute
+its own implementation of result immutability, factories, or parser validation.
+Trusted test container subclasses are reconstructed in the actor before the
+operation under test, without invoking their iterators during transport.
 """
 from __future__ import annotations
 
 import argparse
 import ast
 import base64
+import builtins
 import copy
-from dataclasses import dataclass
+import dataclasses
 import hashlib
+import hmac
+import importlib
+import importlib.abc
 import importlib.util
+import inspect
+import io
+import itertools
 import json
 import os
 from pathlib import Path
+import re
 import secrets
+import selectors
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
+import time
 import types
 import unittest
+from unittest import mock
 from typing import Any
+
+MAX_FRAME_BYTES = 8 * 1024 * 1024
+MAX_GRAPH_NODES = 32768
+MAX_DIAGNOSTIC_BYTES = 64 * 1024
+MAX_OPERATIONS = 4096
+ACTOR_TIMEOUT = 15
 
 
 class SupervisionFailure(RuntimeError):
-    pass
+    """Transport, isolation, or trusted accounting failed."""
 
 
 class BlueForgeError(Exception):
@@ -40,991 +65,1003 @@ class ValidationError(BlueForgeError):
     pass
 
 
-def require(condition: bool, message: str) -> None:
+def require(condition: bool, reason: str) -> None:
     if not condition:
-        raise SupervisionFailure(message)
+        raise SupervisionFailure(reason)
 
 
-def _is_testcase_base(node: ast.expr) -> bool:
-    return (isinstance(node, ast.Name) and node.id == "TestCase") or (
-        isinstance(node, ast.Attribute) and node.attr == "TestCase"
-    )
+# Capture primitive encoding, not json.dumps: a captured Python function still
+# resolves mutable module globals. No actor-controlled JSONEncoder is consulted.
+def _make_wire_codec():
+    quote = json.encoder.encode_basestring_ascii
+    decoder = json.JSONDecoder()
+    decode = decoder.decode
+    kind = type
+    items = dict.items
+    string = str
+    encode = str.encode
+    join = str.join
+    maximum = MAX_FRAME_BYTES
+    error = SupervisionFailure
 
+    def dump(value):
+        chunks = []
+        size = 0
 
-def expected_tests(root: Path) -> list[tuple[str, str, str]]:
-    tests_root = root / "tests"
-    require(tests_root.is_dir(), f"missing frozen tests directory: {tests_root}")
-    expected: list[tuple[str, str, str]] = []
-    for path in sorted(tests_root.glob("test*.py")):
-        require(path.is_file() and not path.is_symlink(), f"invalid frozen test path: {path}")
+        def emit(text):
+            nonlocal size
+            size += len(text)
+            if size > maximum:
+                raise error("wire frame exceeds byte budget")
+            chunks.append(text)
+
+        def visit(obj, depth=0):
+            if depth > 100:
+                raise error("wire nesting exceeds budget")
+            t = kind(obj)
+            if obj is None:
+                emit("null")
+            elif t is bool:
+                emit("true" if obj else "false")
+            elif t is int:
+                emit(string(obj))
+            elif t is str:
+                emit(quote(obj))
+            elif t is list or t is tuple:
+                emit("[")
+                for i, child in enumerate(obj):
+                    if i:
+                        emit(",")
+                    visit(child, depth + 1)
+                emit("]")
+            elif t is dict:
+                emit("{")
+                for i, (key, child) in enumerate(items(obj)):
+                    if kind(key) is not str:
+                        raise error("wire object key is not an exact string")
+                    if i:
+                        emit(",")
+                    emit(quote(key))
+                    emit(":")
+                    visit(child, depth + 1)
+                emit("}")
+            else:
+                raise error("unsupported wire scalar")
+
+        visit(value)
+        return encode(join("", chunks), "ascii")
+
+    def load(raw):
+        if kind(raw) is not bytes or len(raw) > maximum:
+            raise error("invalid or oversized wire frame")
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (OSError, UnicodeError, SyntaxError) as exc:
-            raise SupervisionFailure(f"cannot statically inspect frozen test {path}: {exc}") from exc
-        for node in tree.body:
-            if not isinstance(node, ast.ClassDef) or not any(
-                _is_testcase_base(base) for base in node.bases
-            ):
-                continue
-            for item in node.body:
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test"):
-                    expected.append((path.stem, node.name, item.name))
-    require(bool(expected), "no frozen unittest methods discovered")
-    require(len(set(expected)) == len(expected), "duplicate frozen unittest identity discovered")
-    return expected
+            return decode(raw.decode("ascii"))
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            raise error("malformed wire JSON") from exc
+
+    return dump, load
 
 
-_MAX_RPC_BYTES = 2 * 1024 * 1024
-
-_PROPOSED_RPC_RUNNER = r'''
-import base64 as _base64
-import builtins as _builtins
-import hashlib as _hashlib
-import json as _json
-import os as _os
-import posix as _posix
-import sys as _sys
-import types as _types
-
-_root = __ROOT__
-_action = __ACTION__
-_request_text = __REQUEST__
-_response_path = __RESPONSE_PATH__
-_secret = __SECRET__
-_trusted_json_loads = _json.loads
-_trusted_json_dumps = _json.dumps
-_trusted_sha256 = _hashlib.sha256
-_trusted_open = _builtins.open
-_trusted_base_exception = BaseException
-_trusted_type = type
-_trusted_tuple = tuple
-_trusted_frozenset = frozenset
-_trusted_object_getattribute = object.__getattribute__
-_request = _trusted_json_loads(_request_text)
-_extra = {}
+_wire_dump, _wire_load = _make_wire_codec()
 
 
-def _blocked(*args, **kwargs):
-    raise RuntimeError("proposed RPC attempted to cross the trusted process boundary")
-
-
-_os._exit = _blocked
-_posix._exit = _blocked
-for _name in (
-    "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe",
-    "fork", "forkpty", "posix_spawn", "posix_spawnp",
-):
-    if hasattr(_os, _name):
-        setattr(_os, _name, _blocked)
-    if hasattr(_posix, _name):
-        setattr(_posix, _name, _blocked)
-for _name in ("_getframe", "_current_frames", "settrace", "setprofile"):
-    if hasattr(_sys, _name):
-        setattr(_sys, _name, _blocked)
-for _module_name in ("ctypes", "_ctypes", "gc"):
-    _sys.modules[_module_name] = None
-_sys.path.insert(0, _root)
-_sys.modules["__main__"] = _types.ModuleType("__main__")
-
-
-def _case_to_material(_core, _case):
-    _p = _trusted_object_getattribute(_case, "proposal")
-    _v = _trusted_object_getattribute(_case, "verification")
-    _original = _trusted_object_getattribute(_v, "original")
-    _variants = _trusted_object_getattribute(_v, "variants")
-    _benign = _trusted_object_getattribute(_v, "benign_controls")
-
-    def _body(_item):
-        return {
-            "kind": _trusted_object_getattribute(_item, "kind"),
-            "before": _trusted_object_getattribute(_item, "before"),
-            "after": _trusted_object_getattribute(_item, "after"),
-            "provenance": _trusted_object_getattribute(_item, "provenance"),
-            "source_sha256": _trusted_object_getattribute(_item, "source_sha256"),
-            "reference_engine_sha256": _trusted_object_getattribute(_item, "reference_engine_sha256"),
-            "replay_engine_sha256": _trusted_object_getattribute(_item, "replay_engine_sha256"),
-            "reference_result_sha256": _trusted_object_getattribute(_item, "reference_result_sha256"),
-            "replay_result_sha256": _trusted_object_getattribute(_item, "replay_result_sha256"),
-        }
-
-    _pd = _trusted_object_getattribute(_p, "decision")
-    _vd = _trusted_object_getattribute(_v, "decision")
-    return {
-        "schema": _core.CASE_SCHEMA,
-        "contract": _core.CONTRACT,
-        "case_id": _trusted_object_getattribute(_case, "case_id"),
-        "invariant_id": _trusted_object_getattribute(_case, "invariant_id"),
-        "attack_class": _trusted_object_getattribute(_case, "attack_class"),
-        "proposal": {
-            "producer": _trusted_object_getattribute(_p, "producer"),
-            "mitigation_id": _trusted_object_getattribute(_p, "mitigation_id"),
-            "decision": _trusted_object_getattribute(_pd, "value"),
-            "pre_mitigation_authority": sorted(_trusted_object_getattribute(_p, "pre_mitigation_authority")),
-            "requested_authority": sorted(_trusted_object_getattribute(_p, "requested_authority")),
-            "policy_authority": sorted(_trusted_object_getattribute(_p, "policy_authority")),
-        },
-        "verification": {
-            "producer": _trusted_object_getattribute(_v, "producer"),
-            "decision": _trusted_object_getattribute(_vd, "value"),
-            "observed_authority": sorted(_trusted_object_getattribute(_v, "observed_authority")),
-            "original": {_trusted_object_getattribute(_original, "evidence_id"): _body(_original)},
-            "variants": {_trusted_object_getattribute(_i, "evidence_id"): _body(_i) for _i in _variants},
-            "benign_controls": {_trusted_object_getattribute(_i, "evidence_id"): _body(_i) for _i in _benign},
-            "reference_result_sha256": _trusted_object_getattribute(_v, "reference_result_sha256"),
-            "candidate_result_sha256": _trusted_object_getattribute(_v, "candidate_result_sha256"),
-        },
-    }
-
-
-def _direct_case(_core, _m):
-    def _ev(_eid, _b):
-        return _core.Evidence(
-            evidence_id=_eid,
-            kind=_b["kind"],
-            before=_b["before"],
-            after=_b["after"],
-            provenance=_b["provenance"],
-            source_sha256=_b["source_sha256"],
-            reference_engine_sha256=_b["reference_engine_sha256"],
-            replay_engine_sha256=_b["replay_engine_sha256"],
-            reference_result_sha256=_b["reference_result_sha256"],
-            replay_result_sha256=_b["replay_result_sha256"],
-        )
-
-    _p = _m["proposal"]
-    _v = _m["verification"]
-    _oid, _ob = next(iter(_v["original"].items()))
-    return _core.HardeningCase(
-        case_id=_m["case_id"],
-        invariant_id=_m["invariant_id"],
-        attack_class=_m["attack_class"],
-        proposal=_core.Proposal(
-            producer=_p["producer"],
-            mitigation_id=_p["mitigation_id"],
-            decision=_core.Decision(_p["decision"]),
-            pre_mitigation_authority=_trusted_frozenset(_p["pre_mitigation_authority"]),
-            requested_authority=_trusted_frozenset(_p["requested_authority"]),
-            policy_authority=_trusted_frozenset(_p["policy_authority"]),
-        ),
-        verification=_core.Verification(
-            producer=_v["producer"],
-            decision=_core.Decision(_v["decision"]),
-            observed_authority=_trusted_frozenset(_v["observed_authority"]),
-            original=_ev(_oid, _ob),
-            variants=_trusted_tuple(_ev(_eid, _b) for _eid, _b in _v["variants"].items()),
-            benign_controls=_trusted_tuple(_ev(_eid, _b) for _eid, _b in _v["benign_controls"].items()),
-            reference_result_sha256=_v["reference_result_sha256"],
-            candidate_result_sha256=_v["candidate_result_sha256"],
-        ),
-    )
-
-
-try:
-    import blue_forge as _bf
-    import blue_forge.core as _core
-
-    if _action == "probe":
-        _value = getattr(_bf, "SENTINEL", None)
-    elif _action == "case_from_dict":
-        _value = _case_to_material(_core, _bf.HardeningCase.from_dict(_request["value"]))
-    elif _action == "evaluate":
-        _value = _bf.evaluate(_direct_case(_core, _request["case"])).payload
-    elif _action == "regression_record":
-        _case = _direct_case(_core, _request["case"])
-        _origin = _direct_case(_core, _request["result_origin"])
-        _value = _bf.regression_record(_case, _bf.evaluate(_origin))
-    elif _action == "loads_strict":
-        _value = _bf.loads_strict(_request["text"])
-    elif _action == "canonical_text":
-        _value = _bf.canonical_text(_request["value"])
-    elif _action == "canonical_bytes":
-        _value = {"b64": _base64.b64encode(_bf.canonical_bytes(_request["value"])).decode("ascii")}
-    elif _action == "digest":
-        _value = _bf.digest(_request["value"])
-    elif _action == "construct_result":
-        _result = _bf.HardeningResult(_request["value"])
-        _value = {
-            "payload": _result.payload,
-            "hardened": bool(_result.hardened),
-            "receipt_sha256": _result.receipt_sha256,
-        }
-    elif _action == "cli_load":
-        import io as _io
-        import blue_forge.cli as _cli
-        _data = _base64.b64decode(_request["payload_b64"].encode("ascii"))
-        _box = {"requested": None}
-
-        class _FakePath:
-            def open(self, mode):
-                if mode != "rb":
-                    raise AssertionError(mode)
-                _outer = _box
-
-                class _Stream(_io.BytesIO):
-                    def read(self, size=-1):
-                        _outer["requested"] = size
-                        return super().read(size)
-
-                return _Stream(_data)
-
-        try:
-            _loaded = _cli._load(_FakePath())
-            _value = {
-                "requested": _box["requested"],
-                "case": _case_to_material(_core, _loaded),
-            }
-        except _trusted_base_exception:
-            _extra["requested"] = _box["requested"]
-            raise
-    else:
-        raise RuntimeError("unsupported proposed RPC action")
-
-    _response = {"ok": True, "value": _value, "extra": _extra}
-except _trusted_base_exception as _exc:
-    _response = {
-        "ok": False,
-        "error_type": _trusted_type(_exc).__name__,
-        "error_module": _trusted_type(_exc).__module__,
-        "message": str(_exc),
-        "extra": _extra,
-    }
-
-_message = _trusted_json_dumps(
-    _response,
-    ensure_ascii=True,
-    sort_keys=True,
-    separators=(",", ":"),
-)
-_mac = _trusted_sha256((_secret + ":" + _message).encode("utf-8")).hexdigest()
-_envelope = _trusted_json_dumps(
-    {"message": _message, "mac": _mac},
-    ensure_ascii=True,
-    sort_keys=True,
-    separators=(",", ":"),
-)
-with _trusted_open(_response_path, "w", encoding="utf-8") as _handle:
-    _handle.write(_envelope)
-'''
-
-
-def _rpc_proposed(root: Path, action: str, payload: Any) -> tuple[Any, dict[str, Any]]:
-    request_text = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    secret = secrets.token_hex(32)
-    with tempfile.TemporaryDirectory(prefix="blue-forge-proposed-rpc-") as temp:
-        temp_root = Path(temp)
-        request_path = temp_root / "request.json"
-        response_path = temp_root / "response.json"
-        request_path.write_text(request_text, encoding="utf-8")
-        command = [
-            sys.executable,
-            "-I",
-            str(Path(__file__).resolve()),
-            "--rpc-root", str(root),
-            "--rpc-action", action,
-            "--rpc-request", str(request_path),
-            "--rpc-response", str(response_path),
-        ]
-        rc, diagnostic, timed_out = _run_process_bounded(
-            command,
-            cwd=root,
-            env={k: v for k, v in os.environ.items() if k != "PYTHONPATH"},
-            timeout_seconds=15,
-            input_bytes=secret.encode("ascii"),
-        )
-        require(not timed_out, f"proposed RPC timed out: {action}\n{diagnostic}")
-        require(rc == 0, f"proposed RPC process failed: {action}: rc={rc}\n{diagnostic}")
-        require(response_path.is_file(), f"proposed RPC produced no trusted response: {action}")
-        require(
-            response_path.stat().st_size <= _MAX_RPC_BYTES,
-            f"proposed RPC response exceeds {_MAX_RPC_BYTES} bytes",
-        )
-        try:
-            envelope = json.loads(response_path.read_text(encoding="utf-8"))
-            message = envelope["message"]
-            mac = envelope["mac"]
-        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise SupervisionFailure(f"proposed RPC response is malformed: {action}: {exc}") from exc
-
-    expected_mac = hashlib.sha256((secret + ":" + message).encode("utf-8")).hexdigest()
-    require(
-        isinstance(mac, str) and secrets.compare_digest(mac, expected_mac),
-        f"proposed RPC response authentication failed: {action}",
-    )
+def _kill_group(process: subprocess.Popen) -> None:
     try:
-        response = json.loads(message)
-    except json.JSONDecodeError as exc:
-        raise SupervisionFailure(f"proposed RPC signed response is invalid JSON: {action}") from exc
-
-    extra = response.get("extra") if isinstance(response.get("extra"), dict) else {}
-    if response.get("ok") is True:
-        return response.get("value"), extra
-
-    text = str(response.get("message", "proposed BLUE-FORGE call failed"))
-    kind = response.get("error_type")
-    if kind in {"ValidationError", "BlueForgeError"}:
-        error: Exception = ValidationError(text)
-    elif kind == "AssertionError":
-        error = AssertionError(text)
-    else:
-        error = BlueForgeError(text)
-    setattr(error, "_blue_forge_extra", extra)
-    raise error
-
-
-def _rpc_child(root: Path, action: str, request_path: Path, response_path: Path) -> None:
-    secret = sys.stdin.buffer.read(128).decode("ascii")
-    try:
-        sys.stdin.close()
-    except OSError:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
         pass
-    require(bool(secret), "trusted RPC secret was not supplied")
-    try:
-        request_text = request_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        raise SupervisionFailure(f"cannot read trusted RPC request: {exc}") from exc
+    if process.poll() is None:
+        process.kill()
+    process.wait(timeout=5)
 
-    script = (
-        _PROPOSED_RPC_RUNNER
-        .replace("__ROOT__", repr(str(root.resolve())))
-        .replace("__ACTION__", repr(action))
-        .replace("__REQUEST__", repr(request_text))
-        .replace("__RESPONSE_PATH__", repr(str(response_path)))
-        .replace("__SECRET__", repr(secret))
+
+def _run_process_bounded(command, *, cwd, env, timeout_seconds, input_bytes=None):
+    """Bound diagnostics and reap the complete worker group on every exit path."""
+    process = subprocess.Popen(
+        command, cwd=cwd, env=env, start_new_session=True,
+        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
-    namespace = {"__name__": "_blue_forge_proposed_rpc"}
-    exec(compile(script, "<blue-forge-proposed-rpc>", "exec"), namespace, namespace)
-
-
-@dataclass(frozen=True)
-class _EvidenceProxy:
-    evidence_id: str
-    kind: str
-    before: str
-    after: str
-    provenance: str
-    source_sha256: str
-    reference_engine_sha256: str
-    replay_engine_sha256: str
-    reference_result_sha256: str
-    replay_result_sha256: str
-
-
-@dataclass(frozen=True)
-class _ProposalProxy:
-    producer: str
-    mitigation_id: str
-    decision: str
-    pre_mitigation_authority: frozenset[str]
-    requested_authority: frozenset[str]
-    policy_authority: frozenset[str]
-
-
-@dataclass(frozen=True)
-class _VerificationProxy:
-    producer: str
-    decision: str
-    observed_authority: frozenset[str]
-    original: _EvidenceProxy
-    variants: tuple[_EvidenceProxy, ...]
-    benign_controls: tuple[_EvidenceProxy, ...]
-    reference_result_sha256: str
-    candidate_result_sha256: str
-
-
-@dataclass(frozen=True)
-class _HardeningCaseProxy:
-    case_id: str
-    invariant_id: str
-    attack_class: str
-    proposal: _ProposalProxy
-    verification: _VerificationProxy
-
-    @classmethod
-    def from_dict(cls, value: Any) -> "_HardeningCaseProxy":
-        material, _ = _rpc_proposed(_proxy_root(), "case_from_dict", {"value": value})
-        return _material_to_case(material)
-
-
-class _HardeningResultProxy:
-    __slots__ = ("_origin", "_constructed")
-
-    def __init__(self, payload: Any) -> None:
-        constructed, _ = _rpc_proposed(_proxy_root(), "construct_result", {"value": payload})
-        self._origin = None
-        self._constructed = constructed
-
-    @classmethod
-    def _from_case(cls, case: _HardeningCaseProxy) -> "_HardeningResultProxy":
-        obj = cls.__new__(cls)
-        obj._origin = copy.deepcopy(case)
-        obj._constructed = None
-        return obj
-
-    def _snapshot(self) -> dict[str, Any]:
-        if self._origin is not None:
-            payload, _ = _rpc_proposed(
-                _proxy_root(),
-                "evaluate",
-                {"case": _case_to_material(self._origin)},
-            )
-            require(isinstance(payload, dict), "proposed evaluator returned non-object payload")
-            return payload
-        require(
-            isinstance(self._constructed, dict) and isinstance(self._constructed.get("payload"), dict),
-            "proposed result constructor returned malformed payload",
-        )
-        return self._constructed["payload"]
-
-    @property
-    def payload(self) -> dict[str, Any]:
-        return copy.deepcopy(self._snapshot())
-
-    @property
-    def hardened(self) -> bool:
-        return self._snapshot().get("status") == "BLUE_HARDENED"
-
-    @property
-    def receipt_sha256(self) -> str:
-        return str(self._snapshot()["receipt_sha256"])
-
-
-_PROXY_ROOT: Path | None = None
-
-
-def _proxy_root() -> Path:
-    if _PROXY_ROOT is None:
-        raise SupervisionFailure("trusted BLUE-FORGE proxy is not installed")
-    return _PROXY_ROOT
-
-
-def _evidence_from_body(eid: str, body: dict[str, Any]) -> _EvidenceProxy:
-    return _EvidenceProxy(
-        evidence_id=eid,
-        kind=body["kind"],
-        before=body["before"],
-        after=body["after"],
-        provenance=body["provenance"],
-        source_sha256=body["source_sha256"],
-        reference_engine_sha256=body["reference_engine_sha256"],
-        replay_engine_sha256=body["replay_engine_sha256"],
-        reference_result_sha256=body["reference_result_sha256"],
-        replay_result_sha256=body["replay_result_sha256"],
-    )
-
-
-def _material_to_case(material: dict[str, Any]) -> _HardeningCaseProxy:
-    proposal = material["proposal"]
-    verification = material["verification"]
-    original_id, original_body = next(iter(verification["original"].items()))
-    return _HardeningCaseProxy(
-        case_id=material["case_id"],
-        invariant_id=material["invariant_id"],
-        attack_class=material["attack_class"],
-        proposal=_ProposalProxy(
-            producer=proposal["producer"],
-            mitigation_id=proposal["mitigation_id"],
-            decision=proposal["decision"],
-            pre_mitigation_authority=frozenset(proposal["pre_mitigation_authority"]),
-            requested_authority=frozenset(proposal["requested_authority"]),
-            policy_authority=frozenset(proposal["policy_authority"]),
-        ),
-        verification=_VerificationProxy(
-            producer=verification["producer"],
-            decision=verification["decision"],
-            observed_authority=frozenset(verification["observed_authority"]),
-            original=_evidence_from_body(original_id, original_body),
-            variants=tuple(
-                _evidence_from_body(eid, body)
-                for eid, body in verification["variants"].items()
-            ),
-            benign_controls=tuple(
-                _evidence_from_body(eid, body)
-                for eid, body in verification["benign_controls"].items()
-            ),
-            reference_result_sha256=verification["reference_result_sha256"],
-            candidate_result_sha256=verification["candidate_result_sha256"],
-        ),
-    )
-
-
-def _case_to_material(case: _HardeningCaseProxy) -> dict[str, Any]:
-    p = case.proposal
-    v = case.verification
-
-    def body(item: _EvidenceProxy) -> dict[str, Any]:
-        return {
-            "kind": item.kind,
-            "before": item.before,
-            "after": item.after,
-            "provenance": item.provenance,
-            "source_sha256": item.source_sha256,
-            "reference_engine_sha256": item.reference_engine_sha256,
-            "replay_engine_sha256": item.replay_engine_sha256,
-            "reference_result_sha256": item.reference_result_sha256,
-            "replay_result_sha256": item.replay_result_sha256,
-        }
-
-    return {
-        "schema": "blue-forge.hardening-case/v1",
-        "contract": "blue-forge.core-invariants/v1",
-        "case_id": case.case_id,
-        "invariant_id": case.invariant_id,
-        "attack_class": case.attack_class,
-        "proposal": {
-            "producer": p.producer,
-            "mitigation_id": p.mitigation_id,
-            "decision": p.decision,
-            "pre_mitigation_authority": sorted(p.pre_mitigation_authority),
-            "requested_authority": sorted(p.requested_authority),
-            "policy_authority": sorted(p.policy_authority),
-        },
-        "verification": {
-            "producer": v.producer,
-            "decision": v.decision,
-            "observed_authority": sorted(v.observed_authority),
-            "original": {v.original.evidence_id: body(v.original)},
-            "variants": {item.evidence_id: body(item) for item in v.variants},
-            "benign_controls": {item.evidence_id: body(item) for item in v.benign_controls},
-            "reference_result_sha256": v.reference_result_sha256,
-            "candidate_result_sha256": v.candidate_result_sha256,
-        },
-    }
-
-
-def _install_blue_forge_proxy(root: Path) -> None:
-    global _PROXY_ROOT
-    _PROXY_ROOT = root
-
-    package = types.ModuleType("blue_forge")
-    package.__path__ = []
-    package.BlueForgeError = BlueForgeError
-    package.ValidationError = ValidationError
-    package.HardeningCase = _HardeningCaseProxy
-    package.HardeningResult = _HardeningResultProxy
-
-    def loads_strict(text: str) -> Any:
-        return _rpc_proposed(root, "loads_strict", {"text": text})[0]
-
-    def canonical_text(value: Any) -> str:
-        return str(_rpc_proposed(root, "canonical_text", {"value": value})[0])
-
-    def canonical_bytes(value: Any) -> bytes:
-        result, _ = _rpc_proposed(root, "canonical_bytes", {"value": value})
-        require(
-            isinstance(result, dict) and isinstance(result.get("b64"), str),
-            "proposed canonical_bytes returned malformed response",
-        )
-        return base64.b64decode(result["b64"].encode("ascii"))
-
-    def digest(value: Any) -> str:
-        return str(_rpc_proposed(root, "digest", {"value": value})[0])
-
-    def evaluate(case: _HardeningCaseProxy) -> _HardeningResultProxy:
-        _rpc_proposed(root, "evaluate", {"case": _case_to_material(case)})
-        return _HardeningResultProxy._from_case(case)
-
-    def regression_record(
-        case: _HardeningCaseProxy,
-        result: _HardeningResultProxy,
-    ) -> dict[str, Any]:
-        if not isinstance(result, _HardeningResultProxy) or result._origin is None:
-            raise ValidationError("regression_record() requires evaluator-issued HardeningResult")
-        value, _ = _rpc_proposed(
-            root,
-            "regression_record",
-            {
-                "case": _case_to_material(case),
-                "result_origin": _case_to_material(result._origin),
-            },
-        )
-        require(isinstance(value, dict), "proposed regression_record returned non-object")
-        return value
-
-    package.loads_strict = loads_strict
-    package.canonical_text = canonical_text
-    package.canonical_bytes = canonical_bytes
-    package.digest = digest
-    package.evaluate = evaluate
-    package.regression_record = regression_record
-
-    cli = types.ModuleType("blue_forge.cli")
-    max_bytes = 1024 * 1024
-    cli.MAX_CASE_BYTES = max_bytes
-
-    def cli_load(path: Any) -> _HardeningCaseProxy:
-        payload = getattr(path, "payload", None)
-        if type(payload) is not bytes:
-            with path.open("rb") as handle:
-                payload = handle.read(max_bytes + 1)
-        try:
-            value, extra = _rpc_proposed(
-                root,
-                "cli_load",
-                {"payload_b64": base64.b64encode(payload).decode("ascii")},
-            )
-        except Exception as exc:
-            extra = getattr(exc, "_blue_forge_extra", {})
-            if hasattr(path, "requested") and isinstance(extra, dict):
-                path.requested = extra.get("requested")
-            raise
-        if hasattr(path, "requested"):
-            path.requested = extra.get("requested")
-        require(
-            isinstance(value, dict) and isinstance(value.get("case"), dict),
-            "proposed CLI loader returned malformed case",
-        )
-        return _material_to_case(value["case"])
-
-    cli._load = cli_load
-    package.cli = cli
-    sys.modules["blue_forge"] = package
-    sys.modules["blue_forge.cli"] = cli
-
-
-def _worker_run(root: Path, identity: tuple[str, str, str]) -> None:
-    module_name, class_name, method_name = identity
-    _install_blue_forge_proxy(root)
-    sys.path.insert(0, str(root / "tests"))
-    sys.path.insert(0, str(root))
-
-    test_path = root / "tests" / f"{module_name}.py"
-    spec = importlib.util.spec_from_file_location(
-        f"_blue_forge_frozen_{module_name}",
-        test_path,
-    )
-    require(
-        spec is not None and spec.loader is not None,
-        f"cannot load frozen test module: {module_name}",
-    )
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except BaseException as exc:
-        raise SupervisionFailure(
-            f"frozen test module failed to load in trusted worker: {module_name}: {exc}"
-        ) from exc
-
-    case_class = getattr(module, class_name, None)
-    require(
-        isinstance(case_class, type) and issubclass(case_class, unittest.TestCase),
-        f"frozen test class identity changed: {class_name}",
-    )
-    suite = unittest.TestSuite([case_class(method_name)])
-    result = unittest.TestResult()
-    suite.run(result)
-    if result.failures or result.errors:
-        details = [
-            f"{case.id()}\n{traceback_text}"
-            for case, traceback_text in [*result.failures, *result.errors]
-        ]
-        raise SupervisionFailure(
-            f"frozen test failed in trusted worker: {module_name}.{class_name}.{method_name}\n"
-            + "\n".join(details)
-        )
-    require(
-        result.testsRun == 1,
-        f"trusted worker did not run exactly one frozen test: {module_name}.{class_name}.{method_name}",
-    )
-
-
-MAX_DIAGNOSTIC_BYTES = 64 * 1024
-_DIAGNOSTIC_CHUNK = 8192
-
-
-def _run_process_bounded(
-    command: list[str],
-    *,
-    cwd: Path,
-    env: dict[str, str],
-    timeout_seconds: int,
-    input_bytes: bytes | None = None,
-) -> tuple[int, str, bool]:
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-    except OSError as exc:
-        raise SupervisionFailure(f"frozen test worker failed to start: {exc}") from exc
-
-    require(process.stdout is not None, "frozen test worker output pipe unavailable")
     tail = bytearray()
-    drain_errors: list[BaseException] = []
-    if input_bytes is not None:
-        require(process.stdin is not None, "proposed RPC input pipe unavailable")
-        process.stdin.write(input_bytes)
-        process.stdin.close()
+    errors = []
 
-    def drain() -> None:
+    def drain():
         try:
-            while True:
-                chunk = process.stdout.read(_DIAGNOSTIC_CHUNK)
-                if not chunk:
-                    return
-                if len(chunk) >= MAX_DIAGNOSTIC_BYTES:
-                    tail[:] = chunk[-MAX_DIAGNOSTIC_BYTES:]
-                else:
-                    tail.extend(chunk)
-                    overflow = len(tail) - MAX_DIAGNOSTIC_BYTES
-                    if overflow > 0:
-                        del tail[:overflow]
+            while chunk := process.stdout.read(8192):
+                tail.extend(chunk)
+                del tail[:-MAX_DIAGNOSTIC_BYTES]
         except (OSError, ValueError) as exc:
-            drain_errors.append(exc)
+            errors.append(exc)
 
-    reader = threading.Thread(
-        target=drain,
-        name="blue-forge-frozen-worker-output",
-        daemon=True,
-    )
+    reader = threading.Thread(target=drain, daemon=True)
     reader.start()
     timed_out = False
     try:
-        returncode = process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        process.kill()
-        returncode = process.wait()
-
-    reader.join(timeout=2)
-    require(not reader.is_alive(), "frozen test worker output drain did not terminate")
-    if drain_errors:
-        raise SupervisionFailure(f"frozen test worker output drain failed: {drain_errors[0]}")
-    try:
+        if input_bytes is not None:
+            process.stdin.write(input_bytes)
+            process.stdin.close()
+        try:
+            rc = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            rc = -signal.SIGKILL
+    finally:
+        # Completion is not permission for a worker to leave descendants behind.
+        _kill_group(process)
+        reader.join(timeout=5)
         process.stdout.close()
-    except OSError:
-        pass
-    return returncode, bytes(tail).decode("utf-8", errors="replace"), timed_out
+    require(not reader.is_alive() and not errors, "worker diagnostic drain failed")
+    return rc, bytes(tail).decode("utf-8", errors="replace"), timed_out
 
 
-def run_one(
-    root: Path,
-    python_bin: str,
-    identity: tuple[str, str, str],
-    timeout_seconds: int,
-) -> None:
+class _Remote:
+    """Opaque actor object. Every API access goes back to the real object."""
+    __slots__ = ("_bridge", "_handle", "_kind")
+
+    def __init__(self, bridge, handle, kind):
+        object.__setattr__(self, "_bridge", bridge)
+        object.__setattr__(self, "_handle", handle)
+        object.__setattr__(self, "_kind", kind)
+
+    def __getattr__(self, name):
+        return self._bridge.request("getattr", self, name)
+
+    def __setattr__(self, name, value):
+        self._bridge.request("setattr", self, name, value)
+
+    def __delattr__(self, name):
+        self._bridge.request("delattr", self, name)
+
+    def __call__(self, *args, **kwargs):
+        return self._bridge.request("call", self, args, kwargs)
+
+    def __getitem__(self, key):
+        return self._bridge.request("getitem", self, key)
+
+    def __setitem__(self, key, value):
+        self._bridge.request("setitem", self, key, value)
+
+    def __delitem__(self, key):
+        self._bridge.request("delitem", self, key)
+
+    def __len__(self):
+        return self._bridge.request("len", self)
+
+    def __bool__(self):
+        if self._kind in {"dict", "list", "tuple", "set", "frozenset", "dict_keys", "dict_values", "dict_items"}:
+            return bool(self._bridge.export(self))
+        return self._bridge.request("truth", self)
+
+    def __iter__(self):
+        return iter(self._bridge.request("iterate", self))
+
+    def __next__(self):
+        return self._bridge.request("next", self)
+
+    def __contains__(self, value):
+        return _local(value) in self._bridge.export(self)
+
+    def __eq__(self, other):
+        # Assertions compare reconstructed builtin data in the trusted worker,
+        # never an actor-provided "assertion passed" flag.
+        return self._bridge.export(self) == _local(other)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __repr__(self):
+        return f"<proposed {self._kind} #{self._handle}>"
+
+    def __deepcopy__(self, memo):
+        result = self._bridge.request("deepcopy", self)
+        memo[id(self)] = result
+        return result
+
+
+_ACTIVE_BRIDGE = None
+
+
+def _local(value):
+    if isinstance(value, _Remote):
+        return value._bridge.export(value)
+    if type(value) is dict:
+        return {_local(k): _local(v) for k, v in value.items()}
+    if type(value) is list:
+        return [_local(v) for v in value]
+    if type(value) is tuple:
+        return tuple(_local(v) for v in value)
+    return value
+
+
+def _remote_object_setattr(obj, name, value):
+    if isinstance(obj, _Remote):
+        return obj._bridge.request("object_setattr", obj, name, value)
+    return object.__setattr__(obj, name, value)
+
+
+def _remote_replace(obj, **changes):
+    if isinstance(obj, _Remote):
+        return obj._bridge.request("replace", obj, changes)
+    return dataclasses.replace(obj, **changes)
+
+
+class _TestTransform(ast.NodeTransformer):
+    """Route low-level mutation to the actor instead of testing proxy storage."""
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        if isinstance(node.value, ast.Name) and node.value.id == "object" and node.attr == "__setattr__":
+            return ast.copy_location(ast.Name(id="_remote_object_setattr", ctx=node.ctx), node)
+        return node
+
+
+def _class_recipe(cls):
+    path = inspect.getsourcefile(cls)
+    require(path is not None, "boundary class has no trusted source")
+    path = Path(path).resolve()
+    require(_ACTIVE_BRIDGE is not None and path.is_relative_to(_ACTIVE_BRIDGE.root / "tests"),
+            "boundary class source is outside frozen tests")
+    source = textwrap.dedent(inspect.getsource(cls))
+    tree = ast.parse(source)
+    require(len(tree.body) == 1 and isinstance(tree.body[0], ast.ClassDef),
+            "boundary class recipe is not a class definition")
+    require(len(source.encode("utf-8")) <= 65536, "boundary class recipe is too large")
+    return {"name": cls.__name__, "source": source}
+
+
+class _GraphEncoder:
+    """Preserve aliases, scalar types, and builtin-subclass boundary fixtures."""
+    def __init__(self):
+        self.nodes = []
+        self.memo = {}
+        self.sync = {}
+
+    def encode(self, value):
+        t = type(value)
+        if value is None or t is bool or t is str:
+            return ["scalar", value]
+        if t is int:
+            return ["int", str(value)]
+        if t is float:
+            return ["float", value.hex()]
+        if t is bytes:
+            return ["bytes", base64.b64encode(value).decode("ascii")]
+        if isinstance(value, _Remote):
+            return ["remote", value._handle]
+        oid = id(value)
+        if oid in self.memo:
+            return ["node", self.memo[oid]]
+        require(len(self.nodes) < MAX_GRAPH_NODES, "transport graph node budget exceeded")
+        index = len(self.nodes)
+        self.memo[oid] = index
+        self.nodes.append(None)
+        if isinstance(value, mock.Mock):
+            require(isinstance(value.side_effect, BaseException), "unsupported mock boundary recipe")
+            node = {"kind": "mock", "error": type(value.side_effect).__name__,
+                    "message": str(value.side_effect)}
+        elif isinstance(value, BaseException):
+            node = {"kind": "exception", "error": t.__name__, "message": str(value)}
+        elif isinstance(value, (dict, list, tuple, frozenset, set)):
+            base = next(c for c in (dict, list, tuple, frozenset, set) if isinstance(value, c))
+            node = {"kind": base.__name__, "class": None}
+            if t is not base:
+                node["class"] = _class_recipe(t)
+            # Explicit base descriptors never invoke a hostile __iter__/items/len.
+            if base is dict:
+                node["items"] = [[self.encode(k), self.encode(v)] for k, v in dict.items(value)]
+            else:
+                node["items"] = [self.encode(v) for v in base.__iter__(value)]
+            if t is not base:
+                try:
+                    state = object.__getattribute__(value, "__dict__")
+                except AttributeError:
+                    state = None
+                if state is not None:
+                    node["state"] = self.encode(state)
+                    self.sync[index] = value
+        else:
+            node = {"kind": "object", "class": _class_recipe(t),
+                    "state": self.encode(object.__getattribute__(value, "__dict__"))}
+            self.sync[index] = value
+        self.nodes[index] = node
+        return ["node", index]
+
+
+class _GraphDecoder:
+    """Actor-only reconstruction. Recipes originate in trusted frozen source."""
+    def __init__(self, nodes, handles):
+        self.nodes, self.handles, self.cache = nodes, handles, {}
+        self.classes = {}
+
+    def cls(self, recipe, base):
+        if recipe is None:
+            return base
+        key = recipe["source"]
+        if key not in self.classes:
+            namespace = {"io": io, "Any": Any, "Path": Path, "json": json,
+                         "unittest": unittest, "copy": copy}
+            code = compile("from __future__ import annotations\n" + key, "<frozen-boundary-class>", "exec")
+            exec(code, namespace)
+            self.classes[key] = namespace[recipe["name"]]
+        return self.classes[key]
+
+    def decode(self, value):
+        tag, data = value
+        if tag == "scalar":
+            return data
+        if tag == "int":
+            return int(data)
+        if tag == "float":
+            return float.fromhex(data)
+        if tag == "bytes":
+            return base64.b64decode(data, validate=True)
+        if tag == "remote":
+            return self.handles[data]
+        require(tag == "node" and type(data) is int and 0 <= data < len(self.nodes), "invalid transport reference")
+        if data in self.cache:
+            return self.cache[data]
+        node = self.nodes[data]
+        kind = node["kind"]
+        if kind in {"mock", "exception"}:
+            cls = getattr(builtins, node["error"], None)
+            require(isinstance(cls, type) and issubclass(cls, Exception), "unsupported fixture exception")
+            obj = cls(node["message"])
+            if kind == "mock":
+                obj = mock.MagicMock(side_effect=obj)
+            self.cache[data] = obj
+            return obj
+        base = {"dict": dict, "list": list, "tuple": tuple, "frozenset": frozenset,
+                "set": set, "object": object}[kind]
+        cls = self.cls(node.get("class"), base)
+        if kind in {"tuple", "frozenset"}:
+            obj = base.__new__(cls, [self.decode(v) for v in node["items"]])
+            self.cache[data] = obj
+        else:
+            obj = base.__new__(cls)
+            self.cache[data] = obj
+            if kind == "dict":
+                for k, v in node["items"]:
+                    dict.__setitem__(obj, self.decode(k), self.decode(v))
+            elif kind == "list":
+                list.extend(obj, [self.decode(v) for v in node["items"]])
+            elif kind == "set":
+                set.update(obj, [self.decode(v) for v in node["items"]])
+        if "state" in node:
+            object.__getattribute__(obj, "__dict__").update(self.decode(node["state"]))
+        return obj
+
+
+def _encode_data(value, *, budget=None, depth=0):
+    """Export only bounded builtin data, without executing object constructors."""
+    if budget is None:
+        budget = [MAX_GRAPH_NODES]
+    budget[0] -= 1
+    require(budget[0] >= 0 and depth <= 64, "actor data export exceeds budget")
+    t = type(value)
+    if value is None or t is bool or t is str:
+        return ["scalar", value]
+    if t is int:
+        return ["int", str(value)]
+    if t is bytes:
+        return ["bytes", base64.b64encode(value).decode("ascii")]
+    if t is float:
+        return ["float", value.hex()]
+    if t is dict:
+        return ["dict", [[_encode_data(k, budget=budget, depth=depth+1),
+                          _encode_data(v, budget=budget, depth=depth+1)] for k, v in value.items()]]
+    if t in (list, tuple, set, frozenset):
+        return [t.__name__, [_encode_data(v, budget=budget, depth=depth+1) for v in value]]
+    raise SupervisionFailure("actor export is not builtin data")
+
+
+def _decode_data(value, *, budget=None, depth=0):
+    if budget is None:
+        budget = [MAX_GRAPH_NODES]
+    budget[0] -= 1
+    require(budget[0] >= 0 and depth <= 64 and type(value) is list and len(value) == 2,
+            "invalid actor data envelope")
+    tag, data = value
+    if tag == "scalar":
+        require(data is None or type(data) in (bool, str), "invalid scalar response")
+        return data
+    if tag == "int":
+        require(type(data) is str and len(data) <= 5000, "invalid integer response")
+        return int(data)
+    if tag == "float":
+        return float.fromhex(data)
+    if tag == "bytes":
+        return base64.b64decode(data, validate=True)
+    require(type(data) is list, "invalid container response")
+    if tag == "dict":
+        out = {}
+        for pair in data:
+            require(type(pair) is list and len(pair) == 2, "invalid mapping entry")
+            key = _decode_data(pair[0], budget=budget, depth=depth+1)
+            require(type(key) in (str, int, bool, bytes, float, tuple), "invalid mapping key")
+            require(key not in out, "duplicate actor mapping key")
+            out[key] = _decode_data(pair[1], budget=budget, depth=depth+1)
+        return out
+    require(tag in {"list", "tuple", "set", "frozenset"}, "unknown actor data tag")
+    items = [_decode_data(v, budget=budget, depth=depth+1) for v in data]
+    return {"list": list, "tuple": tuple, "set": set, "frozenset": frozenset}[tag](items)
+
+
+
+def _run_cli_bounded(command, root, environment):
+    process = subprocess.Popen(command, cwd=root, env=environment, start_new_session=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    outputs = [bytearray(), bytearray()]
+    overflow = threading.Event()
+
+    def drain(stream, destination):
+        try:
+            while chunk := stream.read(8192):
+                if len(destination) + len(chunk) > MAX_FRAME_BYTES:
+                    overflow.set()
+                if not overflow.is_set():
+                    destination.extend(chunk)
+        finally:
+            stream.close()
+
+    readers = [threading.Thread(target=drain, args=pair, daemon=True)
+               for pair in zip((process.stdout, process.stderr), outputs)]
+    for reader in readers:
+        reader.start()
+    try:
+        rc = process.wait(timeout=10)
+    finally:
+        _kill_group(process)
+        for reader in readers:
+            reader.join(timeout=2)
+    require(not overflow.is_set() and not any(t.is_alive() for t in readers),
+            "CLI output budget exceeded or descendants retained output")
+    return rc, bytes(outputs[0]), bytes(outputs[1])
+
+
+def _actor(root):
+    """Untrusted actor: no signing keys, test oracle, or completion authority."""
+    root = root.resolve()
+    sys.path.insert(0, str(root))
+    os.chdir(root)
+    wire_in, wire_out = sys.stdin.buffer, sys.stdout.buffer
+    sys.stdout = sys.stderr
+    handles = {}
+    identities = {}
+
+    def result(value):
+        if value is None or type(value) in (str, bytes, int, float, bool):
+            return ["data", _encode_data(value)]
+        if type(value) is tuple:
+            return ["tuple", [result(v) for v in value]]
+        oid = id(value)
+        if oid not in identities:
+            require(len(handles) < MAX_GRAPH_NODES, "actor handle budget exceeded")
+            handle = len(handles)
+            identities[oid] = handle
+            handles[handle] = value
+        return ["handle", [identities[oid], type(value).__name__]]
+
+    for number in range(MAX_OPERATIONS):
+        raw = wire_in.readline(MAX_FRAME_BYTES + 2)
+        if not raw:
+            return
+        require(len(raw) <= MAX_FRAME_BYTES + 1 and raw.endswith(b"\n"), "oversized actor request")
+        request = _wire_load(raw[:-1])
+        decoder = _GraphDecoder(request["nodes"], handles)
+        arguments = [decoder.decode(v) for v in request["arguments"]]
+        action = request["action"]
+        try:
+            if action == "module":
+                value = importlib.import_module(arguments[0])
+            elif action == "getattr":
+                value = getattr(*arguments)
+            elif action == "setattr":
+                value = setattr(*arguments)
+            elif action == "delattr":
+                value = delattr(*arguments)
+            elif action == "call":
+                function, args, kwargs = arguments
+                value = function(*args, **kwargs)
+            elif action == "getitem":
+                value = arguments[0][arguments[1]]
+            elif action == "setitem":
+                arguments[0][arguments[1]] = arguments[2]
+                value = None
+            elif action == "delitem":
+                del arguments[0][arguments[1]]
+                value = None
+            elif action == "truth":
+                value = bool(arguments[0])
+            elif action == "len":
+                value = len(arguments[0])
+            elif action == "iterate":
+                items = tuple(itertools.islice(iter(arguments[0]), MAX_GRAPH_NODES + 1))
+                require(len(items) <= MAX_GRAPH_NODES, "actor iteration budget exceeded")
+                value = items
+            elif action == "next":
+                value = next(arguments[0])
+            elif action == "deepcopy":
+                value = copy.deepcopy(arguments[0])
+            elif action == "replace":
+                value = dataclasses.replace(arguments[0], **arguments[1])
+            elif action == "object_setattr":
+                value = object.__setattr__(*arguments)
+            elif action == "export":
+                value = _encode_data(arguments[0])
+            elif action == "cli":
+                cli_args, case_bytes, environment = arguments
+                with tempfile.TemporaryDirectory() as temp:
+                    path = Path(temp) / "case.json"
+                    path.write_bytes(case_bytes)
+                    command = [sys.executable, "-m", "blue_forge", cli_args[0], str(path)]
+                    value = _run_cli_bounded(command, root, environment)
+            else:
+                raise SupervisionFailure("unknown actor operation")
+            response = {"sequence": request["sequence"], "ok": True,
+                        "value": ["data", _encode_data(value)] if action == "export" else result(value)}
+        except BaseException as exc:
+            response = {"sequence": request["sequence"], "ok": False,
+                        "error": type(exc).__name__, "message": str(exc)}
+        states = {}
+        for key in request.get("sync", []):
+            if key in decoder.cache:
+                states[str(key)] = _encode_data(object.__getattribute__(decoder.cache[key], "__dict__"))
+        response["states"] = states
+        wire_out.write(_wire_dump(response) + b"\n")
+        wire_out.flush()
+    raise SupervisionFailure("actor operation budget exceeded")
+
+
+class _Bridge:
+    def __init__(self, root, *, local_test=False):
+        self.root = root.resolve()
+        helper = os.environ.get("BLUE_FORGE_RPC_HELPER")
+        require(helper is not None or local_test, "isolated RPC launcher is required")
+        if helper:
+            launcher = Path(helper)
+            info = launcher.lstat()
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
+                    "isolated RPC launcher must be a root-owned, non-writable regular file")
+        self.control_dir = tempfile.TemporaryDirectory(prefix="blue-forge-worker-lifeline-")
+        self.control_fd = None
+        control_path = Path(self.control_dir.name) / "control"
+        if helper:
+            os.mkfifo(control_path, 0o600)
+            self.control_fd = os.open(control_path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+        command = (["sudo", "-n", helper, sys.executable, str(Path(__file__).resolve()), str(self.root), str(control_path)] if helper else
+                   [sys.executable, "-I", str(Path(__file__).resolve()), "--actor-root", str(self.root)])
+        self.process = subprocess.Popen(command, cwd=root, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        start_new_session=True, bufsize=0)
+        self.tail = bytearray()
+        self.sequence = 0
+        self.fatal = None
+        self.refs = {}
+        self.signing_key = secrets.token_bytes(32)  # This key never leaves the trusted process.
+        self.last_receipt = None
+        self.reader = threading.Thread(target=self._drain, daemon=True)
+        self.reader.start()
+
+    def _drain(self):
+        while chunk := self.process.stderr.read(8192):
+            self.tail.extend(chunk)
+            del self.tail[:-MAX_DIAGNOSTIC_BYTES]
+
+    def _result(self, item):
+        require(type(item) is list and len(item) == 2, "invalid actor result")
+        tag, value = item
+        if tag == "data":
+            return _decode_data(value)
+        if tag == "tuple":
+            require(type(value) is list and len(value) <= MAX_GRAPH_NODES, "invalid actor tuple")
+            return tuple(self._result(v) for v in value)
+        require(tag == "handle" and type(value) is list and len(value) == 2,
+                "unknown actor result type")
+        handle, kind = value
+        require(type(handle) is int and 0 <= handle < MAX_GRAPH_NODES and type(kind) is str,
+                "invalid actor handle")
+        if handle not in self.refs:
+            self.refs[handle] = _Remote(self, handle, kind)
+        return self.refs[handle]
+
+    def _exchange(self, data):
+        deadline = time.monotonic() + ACTOR_TIMEOUT
+        selector = selectors.DefaultSelector()
+        output = bytearray()
+        pending = memoryview(data + b"\n")
+        selector.register(self.process.stdin, selectors.EVENT_WRITE)
+        selector.register(self.process.stdout, selectors.EVENT_READ)
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "proposed RPC timeout")
+                events = selector.select(remaining)
+                require(bool(events), "proposed RPC timeout")
+                for key, mask in events:
+                    if mask & selectors.EVENT_WRITE:
+                        count = os.write(key.fd, pending[:65536])
+                        pending = pending[count:]
+                        if not pending:
+                            selector.unregister(self.process.stdin)
+                    if mask & selectors.EVENT_READ:
+                        chunk = os.read(key.fd, 65536)
+                        require(bool(chunk), "proposed RPC exited without a response")
+                        output.extend(chunk)
+                        require(len(output) <= MAX_FRAME_BYTES + 1, "proposed RPC response byte budget exceeded")
+                        if b"\n" in output:
+                            line, remainder = bytes(output).split(b"\n", 1)
+                            require(not remainder and not pending, "unexpected actor protocol output")
+                            return _wire_load(line)
+        finally:
+            selector.close()
+
+    def request(self, action, *arguments):
+        require(self.fatal is None, "RPC bridge previously failed")
+        self.sequence += 1
+        encoder = _GraphEncoder()
+        try:
+            encoded = [encoder.encode(v) for v in arguments]
+            request = {"sequence": self.sequence, "action": action,
+                       "arguments": encoded, "nodes": encoder.nodes, "sync": list(encoder.sync)}
+            response = self._exchange(_wire_dump(request))
+            require(type(response) is dict and response.get("sequence") == self.sequence,
+                    "actor response sequence mismatch")
+            require(type(response.get("ok")) is bool and type(response.get("states")) is dict,
+                    "malformed actor response")
+            # Authentication records transport observations only. It is generated
+            # here, never accepted from the actor, and is not a test-pass predicate.
+            observation = _wire_dump({"request": request, "response": response})
+            self.last_receipt = hmac.new(self.signing_key, observation, hashlib.sha256).hexdigest()
+            for key, state in response["states"].items():
+                require(key.isdecimal() and int(key) in encoder.sync, "unexpected fixture-state response")
+                target = object.__getattribute__(encoder.sync[int(key)], "__dict__")
+                decoded = _decode_data(state)
+                require(type(decoded) is dict, "invalid fixture-state response")
+                target.clear()
+                target.update(decoded)
+            if response["ok"]:
+                return self._result(response["value"])
+        except (SupervisionFailure, OSError, ValueError, KeyError, TypeError) as exc:
+            self.fatal = str(exc)
+            diagnostic = bytes(self.tail).decode("utf-8", errors="replace")
+            raise SupervisionFailure(f"RPC failed closed: {exc}\n{diagnostic}") from exc
+        name = response.get("error")
+        message = response.get("message")
+        require(type(message) is str, "invalid actor exception message")
+        known = {"ValidationError": ValidationError, "BlueForgeError": BlueForgeError,
+                 "AssertionError": AssertionError, "AttributeError": AttributeError,
+                 "TypeError": TypeError, "ValueError": ValueError, "KeyError": KeyError,
+                 "StopIteration": StopIteration, "RuntimeError": RuntimeError}
+        if name not in known:
+            self.fatal = f"unexpected actor failure: {name}"
+            raise SupervisionFailure(self.fatal)
+        raise known[name](message)
+
+    def export(self, value):
+        return _decode_data(self.request("export", value))
+
+    def close(self):
+        self.process.stdin.close()
+        if self.control_fd is not None:
+            os.close(self.control_fd)
+            self.control_fd = None
+        try:
+            self.process.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            raise SupervisionFailure("isolated actor launcher did not confirm namespace teardown")
+        finally:
+            if self.process.poll() is not None:
+                _kill_group(self.process)
+            self.control_dir.cleanup()
+            self.reader.join(timeout=3)
+            self.process.stdout.close()
+            self.process.stderr.close()
+        require(self.process.returncode == 0, "isolated actor launcher failed during cleanup")
+        require(not self.reader.is_alive(), "actor stderr descendants survived namespace teardown")
+
+
+class _ProxyLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def __init__(self, bridge):
+        self.bridge = bridge
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "blue_forge" or fullname.startswith("blue_forge."):
+            return importlib.util.spec_from_loader(fullname, self, is_package=fullname == "blue_forge")
+        return None
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        remote = self.bridge.request("module", module.__name__)
+        module.BlueForgeError = BlueForgeError
+        module.ValidationError = ValidationError
+
+        def get(name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            return getattr(remote, name)
+
+        module.__getattr__ = get
+
+
+def _test_importer(bridge):
+    real_import = builtins.__import__
+    json_proxy = types.ModuleType("json")
+    json_proxy.__dict__.update(vars(json))
+    json_proxy.dumps = lambda value, *a, **k: json.dumps(_local(value), *a, **k)
+    dc_proxy = types.ModuleType("dataclasses")
+    dc_proxy.__dict__.update(vars(dataclasses))
+    dc_proxy.replace = _remote_replace
+    process_proxy = types.ModuleType("subprocess")
+    process_proxy.__dict__.update(vars(subprocess))
+
+    def run(command, *args, **kwargs):
+        if isinstance(command, (list, tuple)) and len(command) >= 5 and list(command[1:3]) == ["-m", "blue_forge"]:
+            path = Path(command[4])
+            with path.open("rb") as handle:
+                payload = handle.read(2 * 1024 * 1024)
+            env = dict(kwargs.get("env") or os.environ)
+            # Do not propagate worker/supervisor configuration into proposed CLI.
+            env = {k: v for k, v in env.items() if not k.startswith("BLUE_FORGE_")}
+            rc, stdout, stderr = bridge.request("cli", list(command[3:]), payload, env)
+            if kwargs.get("text") or kwargs.get("universal_newlines"):
+                encoding = kwargs.get("encoding") or "utf-8"
+                stdout, stderr = stdout.decode(encoding), stderr.decode(encoding)
+            completed = subprocess.CompletedProcess(command, rc, stdout, stderr)
+            if kwargs.get("check"):
+                completed.check_returncode()
+            return completed
+        return subprocess.run(command, *args, **kwargs)
+
+    process_proxy.run = run
+    facades = {"json": json_proxy, "dataclasses": dc_proxy, "subprocess": process_proxy}
+
+    def trusted_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 0 and name in facades:
+            return facades[name]
+        return real_import(name, globals, locals, fromlist, level)
+
+    return trusted_import
+
+
+def expected_tests(root):
+    tests = []
+    for path in sorted((root / "tests").glob("test*.py")):
+        require(path.is_file() and not path.is_symlink(), "invalid frozen test file")
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and any(
+                (isinstance(b, ast.Name) and b.id == "TestCase") or
+                (isinstance(b, ast.Attribute) and b.attr == "TestCase") for b in node.bases
+            ):
+                for method in node.body:
+                    if isinstance(method, ast.AsyncFunctionDef) and method.name.startswith("test"):
+                        raise SupervisionFailure("async frozen tests require an explicit trusted runner")
+                    if isinstance(method, ast.FunctionDef) and method.name.startswith("test"):
+                        tests.append((path.stem, node.name, method.name))
+    require(tests and len(tests) == len(set(tests)), "empty or duplicate frozen test floor")
+    return tests
+
+
+def _worker_run(root, identity, *, local_test=False):
+    global _ACTIVE_BRIDGE
     module_name, class_name, method_name = identity
-    test_id = f"{module_name}.{class_name}.{method_name}"
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
-    supervisor = Path(__file__).resolve()
-    command = [
-        python_bin,
-        "-I",
-        str(supervisor),
-        "--worker-root", str(root),
-        "--worker-module", module_name,
-        "--worker-class", class_name,
-        "--worker-method", method_name,
-    ]
-    rc, diagnostic, timed_out = _run_process_bounded(
-        command,
-        cwd=root,
-        env=env,
-        timeout_seconds=timeout_seconds,
-    )
-    require(not timed_out, f"frozen test worker timed out: {test_id}\n{diagnostic}")
-    require(
-        rc == 0,
-        f"frozen test did not complete in trusted worker: {test_id}: rc={rc}\n{diagnostic}",
-    )
+    bridge = _Bridge(root, local_test=local_test)
+    _ACTIVE_BRIDGE = bridge
+    finder = _ProxyLoader(bridge)
+    sys.meta_path.insert(0, finder)
+    sys.path.insert(0, str(root / "tests"))
+    try:
+        path = root / "tests" / (module_name + ".py")
+        source = path.read_text(encoding="utf-8")
+        tree = _TestTransform().visit(ast.parse(source, filename=str(path)))
+        ast.fix_missing_locations(tree)
+        module = types.ModuleType(module_name)
+        module.__file__ = str(path)
+        module.__dict__["__builtins__"] = {**vars(builtins), "__import__": _test_importer(bridge)}
+        module.__dict__["_remote_object_setattr"] = _remote_object_setattr
+        sys.modules[module_name] = module
+        exec(compile(tree, str(path), "exec", dont_inherit=True), module.__dict__)
+        case_class = getattr(module, class_name)
+        require(isinstance(case_class, type) and issubclass(case_class, unittest.TestCase), "invalid frozen TestCase")
+        result = unittest.TestResult()
+        unittest.TestSuite([case_class(method_name)]).run(result)
+        require(bridge.fatal is None, f"RPC failure was caught by a test: {bridge.fatal}")
+        require(result.testsRun == 1 and not (result.failures or result.errors or result.skipped or result.expectedFailures or result.unexpectedSuccesses),
+                "frozen test failed: " + ".".join(identity) + "\n" + "\n".join(x[1] for x in result.failures + result.errors))
+    finally:
+        bridge.close()
+        sys.meta_path.remove(finder)
+        _ACTIVE_BRIDGE = None
 
 
-def _write_minimal_proxy_package(root: Path, body: str) -> None:
-    (root / "tests").mkdir()
-    (root / "blue_forge").mkdir()
-    (root / "blue_forge" / "__init__.py").write_text(body, encoding="utf-8")
-    (root / "blue_forge" / "core.py").write_text(
-        "CASE_SCHEMA='x'\nCONTRACT='x'\n",
-        encoding="utf-8",
-    )
+def run_one(root, python_bin, identity, timeout_seconds, *, local_test=False):
+    secret = secrets.token_bytes(32)
+    command = [python_bin, "-I", str(Path(__file__).resolve()), "--worker-root", str(root),
+               "--worker-module", identity[0], "--worker-class", identity[1], "--worker-method", identity[2]]
+    if local_test:
+        command.append("--local-test")
+    rc, diagnostic, timeout = _run_process_bounded(command, cwd=root, env=dict(os.environ),
+                                                   timeout_seconds=timeout_seconds, input_bytes=secret.hex().encode())
+    require(not timeout and rc == 0, f"trusted worker failed for {'.'.join(identity)}: rc={rc}\n{diagnostic}")
+    expected = hmac.new(secret, ("PASS:" + ".".join(identity)).encode(), hashlib.sha256).hexdigest()
+    lines = diagnostic.splitlines()
+    require(lines and lines[-1] == "trusted_completion=" + expected, "missing authenticated trusted test completion")
 
 
-def _self_test_import_path(python_bin: str, timeout_seconds: int) -> None:
-    with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-import-selftest-") as temp:
+def _self_test(python_bin, timeout_seconds, *, local_test=False):
+    attacks = {
+        "subclasses": "import unittest\nfor c in object.__subclasses__():\n if c.__name__ == 'TestCase': c.fail=lambda *a,**k: None\n",
+        "builtins": "import builtins\n_real=builtins.getattr\ndef forged(o,n,*d):\n if isinstance(n,str) and n.startswith('test'): return lambda: None\n return _real(o,n,*d)\nbuiltins.getattr=forged\n",
+        "encoder": "import json\nclass BadEncoder:\n def __init__(self,*a,**k): pass\n def encode(self,*a,**k): return 'FORGED'\njson.JSONEncoder=BadEncoder\n",
+    }
+    for name, attack in attacks.items():
+        with tempfile.TemporaryDirectory(prefix="blue-forge-oracle-selftest-") as temp:
+            root = Path(temp)
+            root.chmod(0o755)
+            (root / "tests").mkdir()
+            (root / "blue_forge").mkdir()
+            (root / "blue_forge/__init__.py").write_text(attack + "\ndef probe(): return 'real'\n", encoding="utf-8")
+            (root / "tests/test_fake.py").write_text(
+                "import unittest\nfrom blue_forge import probe\nclass Fake(unittest.TestCase):\n"
+                " def test_pass(self): self.assertEqual(probe(), 'real')\n"
+                " def test_fail(self):\n  probe()\n  self.fail('oracle is external')\n", encoding="utf-8")
+            # A failure-only self-test could pass simply because the bridge broke.
+            run_one(root, python_bin, ("test_fake", "Fake", "test_pass"), timeout_seconds, local_test=local_test)
+            try:
+                run_one(root, python_bin, ("test_fake", "Fake", "test_fail"), timeout_seconds, local_test=local_test)
+            except SupervisionFailure:
+                pass
+            else:
+                raise SupervisionFailure("oracle accepted attack " + name)
+
+
+
+def _self_test_boundary_transport(python_bin, timeout_seconds, *, local_test=False):
+    with tempfile.TemporaryDirectory(prefix="blue-forge-boundary-selftest-") as temp:
         root = Path(temp)
-        _write_minimal_proxy_package(
-            root,
-            "SENTINEL='sterile-proposed-root'\n"
-            "class BlueForgeError(Exception): pass\n"
-            "class ValidationError(BlueForgeError): pass\n"
-            "def loads_strict(text): return {'sentinel':SENTINEL}\n",
-        )
-        (root / "tests" / "test_importable.py").write_text(
-            "import unittest\n"
-            "from blue_forge import loads_strict\n"
-            "class ImportTests(unittest.TestCase):\n"
-            "    def test_imports_sterile_root(self):\n"
-            "        self.assertEqual(loads_strict('{}')['sentinel'],'sterile-proposed-root')\n",
-            encoding="utf-8",
-        )
-        run_one(
-            root,
-            python_bin,
-            ("test_importable", "ImportTests", "test_imports_sterile_root"),
-            timeout_seconds,
-        )
+        root.chmod(0o755)
+        (root / "tests").mkdir()
+        (root / "blue_forge").mkdir()
+        (root / "blue_forge/__init__.py").write_text(
+            "class ValidationError(Exception): pass\n"
+            "def boundary(value):\n"
+            " if type(value) is not list: raise ValidationError('exact list required')\n"
+            " return value\n"
+            "def shared(value): return value[0] is value[1]\n", encoding="utf-8")
+        (root / "tests/test_boundary.py").write_text(
+            "import unittest\nfrom blue_forge import boundary, shared, ValidationError\n"
+            "class Boundary(unittest.TestCase):\n"
+            " def test_preserved(self):\n"
+            "  class ExplodingList(list):\n"
+            "   def __iter__(self): raise AssertionError('transport ran a hostile iterator')\n"
+            "  self.assertEqual(boundary(['retained']), ['retained'])\n"
+            "  with self.assertRaisesRegex(ValidationError, 'exact list'):\n"
+            "   boundary(ExplodingList(['retained']))\n"
+            "  child=['leaf']; self.assertTrue(shared([child,child]))\n", encoding="utf-8")
+        run_one(root, python_bin, ("test_boundary", "Boundary", "test_preserved"),
+                timeout_seconds, local_test=local_test)
 
 
-def _self_test_assertion_isolation(python_bin: str, timeout_seconds: int) -> None:
-    with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-assert-selftest-") as temp:
+def _self_test_encoder_failure(python_bin, timeout_seconds, *, local_test=False):
+    with tempfile.TemporaryDirectory(prefix="blue-forge-encoder-selftest-") as temp:
         root = Path(temp)
-        _write_minimal_proxy_package(
-            root,
-            "import unittest\n"
-            "for cls in list(object.__subclasses__()):\n"
-            "    try:\n"
-            "        if cls.__name__=='TestCase' or cls.__module__.startswith('_blueforge_trusted_unittest'):\n"
-            "            cls.fail=lambda self,*a,**k:None\n"
-            "            cls.assertEqual=lambda self,*a,**k:None\n"
-            "    except Exception: pass\n"
-            "unittest.TestCase.fail=lambda self,*a,**k:None\n"
-            "class BlueForgeError(Exception): pass\n"
-            "class ValidationError(BlueForgeError): pass\n"
-            "def loads_strict(text): return {}\n",
-        )
-        (root / "tests" / "test_fake.py").write_text(
-            "import unittest\n"
-            "from blue_forge import loads_strict\n"
-            "class FakeTests(unittest.TestCase):\n"
-            "    def test_must_fail(self):\n"
-            "        loads_strict('{}')\n"
-            "        self.fail('trusted assertion must execute outside proposed process')\n",
-            encoding="utf-8",
-        )
+        root.chmod(0o755)
+        (root / "tests").mkdir()
+        (root / "blue_forge").mkdir()
+        (root / "blue_forge/__init__.py").write_text(
+            "import json\n"
+            "class Stealer:\n"
+            " def __radd__(self, secret_prefix):\n"
+            "  raise AssertionError('signing material entered proposed interpreter')\n"
+            "class Encoder:\n"
+            " def __init__(self,*a,**k): pass\n"
+            " def encode(self,*a,**k): return Stealer()\n"
+            "json.JSONEncoder=Encoder\n"
+            "raise RuntimeError('genuine import failure')\n", encoding="utf-8")
+        (root / "tests/test_encoder.py").write_text(
+            "import unittest\nclass EncoderTests(unittest.TestCase):\n"
+            " def test_error_survives(self):\n"
+            "  with self.assertRaisesRegex(RuntimeError, 'genuine import failure'):\n"
+            "   import blue_forge\n"
+            " def test_cannot_pass(self):\n"
+            "  with self.assertRaisesRegex(RuntimeError, 'genuine import failure'):\n"
+            "   import blue_forge\n"
+            "  self.fail('no proposed encoder can sign this test as passed')\n", encoding="utf-8")
+        run_one(root, python_bin, ("test_encoder", "EncoderTests", "test_error_survives"),
+                timeout_seconds, local_test=local_test)
         try:
-            run_one(root, python_bin, ("test_fake", "FakeTests", "test_must_fail"), timeout_seconds)
+            run_one(root, python_bin, ("test_encoder", "EncoderTests", "test_cannot_pass"),
+                    timeout_seconds, local_test=local_test)
         except SupervisionFailure:
             return
-        raise SupervisionFailure("supervisor self-test accepted proposed mutation of trusted assertions")
+        raise SupervisionFailure("proposed encoder forged trusted completion")
 
 
-def _self_test_method_resolution_isolation(python_bin: str, timeout_seconds: int) -> None:
-    with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-method-selftest-") as temp:
-        root = Path(temp)
-        _write_minimal_proxy_package(
-            root,
-            "import builtins\n"
-            "real_getattr=builtins.getattr\n"
-            "def forged_getattr(obj,name,*default):\n"
-            "    if isinstance(name,str) and name.startswith('test'): return lambda:None\n"
-            "    return real_getattr(obj,name,*default) if default else real_getattr(obj,name)\n"
-            "builtins.getattr=forged_getattr\n"
-            "class BlueForgeError(Exception): pass\n"
-            "class ValidationError(BlueForgeError): pass\n"
-            "def loads_strict(text): return {}\n",
-        )
-        (root / "tests" / "test_fake.py").write_text(
-            "import unittest\n"
-            "from blue_forge import loads_strict\n"
-            "class FakeTests(unittest.TestCase):\n"
-            "    def test_must_fail(self):\n"
-            "        loads_strict('{}')\n"
-            "        self.fail('trusted method must execute')\n",
-            encoding="utf-8",
-        )
+def _live_marker(marker):
+    encoded = marker.encode("ascii")
+    for path in Path("/proc").glob("[0-9]*/cmdline"):
         try:
-            run_one(root, python_bin, ("test_fake", "FakeTests", "test_must_fail"), timeout_seconds)
-        except SupervisionFailure:
-            return
-        raise SupervisionFailure("supervisor self-test accepted proposed mutation of test-method resolution")
+            if encoded in path.read_bytes().split(b"\x00"):
+                return True
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+    return False
 
 
-def _self_test_accounting_isolation(python_bin: str, timeout_seconds: int) -> None:
-    with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-accounting-selftest-") as temp:
-        root = Path(temp)
-        _write_minimal_proxy_package(
-            root,
-            "import sys\n"
-            "main=sys.modules.get('__main__')\n"
-            "if main is not None: main.result=type('ForgedResult',(),{'testsRun':1,'failures':[],'errors':[]})()\n"
-            "class BlueForgeError(Exception): pass\n"
-            "class ValidationError(BlueForgeError): pass\n"
-            "def loads_strict(text): return {}\n",
-        )
-        (root / "tests" / "test_fake.py").write_text(
-            "import unittest\n"
-            "from blue_forge import loads_strict\n"
-            "class FakeTests(unittest.TestCase):\n"
-            "    def test_must_fail(self):\n"
-            "        loads_strict('{}')\n"
-            "        self.fail('trusted accounting must observe this failure')\n",
-            encoding="utf-8",
-        )
-        try:
-            run_one(root, python_bin, ("test_fake", "FakeTests", "test_must_fail"), timeout_seconds)
-        except SupervisionFailure:
-            return
-        raise SupervisionFailure("supervisor self-test accepted proposed-code mutation of trusted accounting")
+def _self_test_descendants(python_bin, timeout_seconds):
+    """A detached native-spawn child must die on success and worker SIGKILL."""
+    require(os.environ.get("BLUE_FORGE_RPC_HELPER"), "kernel lifetime self-test requires isolated launcher")
+    for timeout in (False, True):
+        marker = "blue-forge-child-" + secrets.token_hex(16)
+        with tempfile.TemporaryDirectory(prefix="blue-forge-lifetime-selftest-") as temp:
+            root = Path(temp)
+            root.chmod(0o755)
+            (root / "tests").mkdir()
+            (root / "blue_forge").mkdir()
+            (root / "blue_forge/__init__.py").write_text(
+                "import subprocess,sys,time\n"
+                "def spawn():\n"
+                f" subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)',{marker!r}],"
+                "start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+                + (" time.sleep(60)\n" if timeout else " return 'spawned'\n"), encoding="utf-8")
+            (root / "tests/test_lifetime.py").write_text(
+                "import unittest\nfrom blue_forge import spawn\n"
+                "class Lifetime(unittest.TestCase):\n"
+                " def test_spawn(self): self.assertEqual(spawn(), 'spawned')\n", encoding="utf-8")
+            rejected = False
+            try:
+                run_one(root, python_bin, ("test_lifetime", "Lifetime", "test_spawn"),
+                        3 if timeout else timeout_seconds)
+            except SupervisionFailure:
+                rejected = True
+            require(rejected == timeout, "namespace lifetime self-test returned the wrong test outcome")
+            deadline = time.monotonic() + 5
+            while _live_marker(marker) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            require(not _live_marker(marker), "detached proposed descendant survived namespace teardown")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path)
-    parser.add_argument("--python")
+    parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--timeout-seconds", type=int, default=30)
+    parser.add_argument("--actor-root", type=Path)
     parser.add_argument("--worker-root", type=Path)
     parser.add_argument("--worker-module")
     parser.add_argument("--worker-class")
     parser.add_argument("--worker-method")
-    parser.add_argument("--rpc-root", type=Path)
-    parser.add_argument("--rpc-action")
-    parser.add_argument("--rpc-request", type=Path)
-    parser.add_argument("--rpc-response", type=Path)
+    parser.add_argument("--local-test", action="store_true", help="development-only transport checks; never CI proof")
     args = parser.parse_args(argv)
-
-    rpc_values = (args.rpc_root, args.rpc_action, args.rpc_request, args.rpc_response)
-    if any(value is not None for value in rpc_values):
-        if not all(value is not None for value in rpc_values):
-            print("frozen_test_rpc=FAIL reason=incomplete trusted RPC arguments", file=sys.stderr)
-            return 1
-        try:
-            _rpc_child(args.rpc_root, args.rpc_action, args.rpc_request, args.rpc_response)
-        except BaseException as exc:
-            print(f"frozen_test_rpc=FAIL reason={exc}", file=sys.stderr)
-            return 1
-        return 0
-
-    worker_values = (
-        args.worker_root,
-        args.worker_module,
-        args.worker_class,
-        args.worker_method,
-    )
-    if any(value is not None for value in worker_values):
-        if not all(value is not None for value in worker_values):
-            print("frozen_test_supervisor=FAIL reason=incomplete trusted worker arguments", file=sys.stderr)
-            return 1
-        try:
-            _worker_run(
-                args.worker_root.resolve(),
-                (args.worker_module, args.worker_class, args.worker_method),
-            )
-        except (SupervisionFailure, BlueForgeError, AssertionError) as exc:
-            print(f"frozen_test_worker=FAIL reason={exc}", file=sys.stderr)
-            return 1
-        return 0
-
-    if args.root is None or args.python is None:
-        parser.error("--root and --python are required for supervisor mode")
-
-    root = args.root.resolve()
     try:
-        _self_test_import_path(args.python, args.timeout_seconds)
-        _self_test_assertion_isolation(args.python, args.timeout_seconds)
-        _self_test_method_resolution_isolation(args.python, args.timeout_seconds)
-        _self_test_accounting_isolation(args.python, args.timeout_seconds)
-        tests = expected_tests(root)
-        for identity in tests:
-            run_one(root, args.python, identity, args.timeout_seconds)
-    except SupervisionFailure as exc:
-        print(f"frozen_test_supervisor=FAIL reason={exc}", file=sys.stderr)
+        if args.actor_root:
+            _actor(args.actor_root)
+        elif args.worker_root:
+            require(all((args.worker_module, args.worker_class, args.worker_method)), "incomplete worker identity")
+            secret = bytes.fromhex(sys.stdin.buffer.read(64).decode("ascii"))
+            sys.stdin.close()
+            require(len(secret) == 32, "missing trusted completion key")
+            identity = (args.worker_module, args.worker_class, args.worker_method)
+            _worker_run(args.worker_root.resolve(), identity, local_test=args.local_test)
+            mac = hmac.new(secret, ("PASS:" + ".".join(identity)).encode(), hashlib.sha256).hexdigest()
+            print("trusted_completion=" + mac)
+        else:
+            require(args.root is not None, "missing frozen root")
+            require(not args.local_test or os.environ.get("GITHUB_ACTIONS") != "true", "local-test mode cannot authorize CI")
+            _self_test(args.python, args.timeout_seconds, local_test=args.local_test)
+            _self_test_boundary_transport(args.python, args.timeout_seconds, local_test=args.local_test)
+            _self_test_encoder_failure(args.python, args.timeout_seconds, local_test=args.local_test)
+            if not args.local_test:
+                _self_test_descendants(args.python, args.timeout_seconds)
+            tests = expected_tests(args.root.resolve())
+            for identity in tests:
+                run_one(args.root.resolve(), args.python, identity, args.timeout_seconds, local_test=args.local_test)
+            label = "LOCAL_TEST_ONLY" if args.local_test else "PASS"
+            print(f"frozen_test_supervisor={label} tests={len(tests)}")
+    except BaseException as exc:
+        print(f"frozen_test_supervisor=FAIL reason={str(exc)!r}", file=sys.stderr)
         return 1
-
-    print(f"frozen_test_supervisor=PASS tests={len(tests)} root={root}")
     return 0
 
 
