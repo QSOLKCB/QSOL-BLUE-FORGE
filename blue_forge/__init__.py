@@ -1,5 +1,10 @@
 """QSOL-BLUE-FORGE deterministic defensive reference core."""
 
+from . import core as _core
+from ._validation_patch import install as _install_validation
+
+_install_validation(_core)
+
 from .core import (
     BlueForgeError,
     HardeningCase,
