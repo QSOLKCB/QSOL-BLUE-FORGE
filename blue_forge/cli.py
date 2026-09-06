@@ -16,6 +16,7 @@ from .core import (
     loads_strict,
     regression_record,
 )
+from .schema_vocabulary import validate_case_schema_vocabulary
 
 
 def parser() -> argparse.ArgumentParser:
@@ -42,7 +43,9 @@ def _load(path: Path) -> HardeningCase:
         text = raw.decode("utf-8")
     except UnicodeError as exc:
         raise BlueForgeError(f"case is not UTF-8: {exc}") from exc
-    return HardeningCase.from_dict(loads_strict(text))
+    value = loads_strict(text)
+    validate_case_schema_vocabulary(value)
+    return HardeningCase.from_dict(value)
 
 
 def main(argv: list[str] | None = None) -> int:
