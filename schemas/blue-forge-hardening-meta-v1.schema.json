@@ -18,6 +18,9 @@
     }
   ],
   "properties": {
+    "blueForgeCanonicalByteBudget": {
+      "type": "boolean"
+    },
     "blueForgeUniqueSourceSha256": {
       "type": "boolean"
     },
