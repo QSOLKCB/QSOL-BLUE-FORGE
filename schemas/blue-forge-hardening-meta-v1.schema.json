@@ -20,6 +20,12 @@
   "properties": {
     "blueForgeUniqueSourceSha256": {
       "type": "boolean"
+    },
+    "blueForgeDistinctProducers": {
+      "type": "boolean"
+    },
+    "blueForgeDecisionMonotonic": {
+      "type": "boolean"
     }
   }
 }
