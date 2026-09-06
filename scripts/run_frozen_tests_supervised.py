@@ -18,6 +18,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 
 
 class SupervisionFailure(RuntimeError):
@@ -96,11 +97,12 @@ for _name in (
         setattr(posix, _name, _blocked)
 
 # Remove straightforward Python-level routes to trusted runner frames or C process
-# termination. The frozen BLUE-FORGE tests do not require these modules.
+# termination. Keep ordinary stdlib modules importable; frame entry points themselves
+# are blocked, so libraries such as dataclasses may still import inspect normally.
 for _name in ("_getframe", "_current_frames", "settrace", "setprofile"):
     if hasattr(sys, _name):
         setattr(sys, _name, _blocked)
-for _module_name in ("ctypes", "_ctypes", "gc", "inspect"):
+for _module_name in ("ctypes", "_ctypes", "gc"):
     sys.modules[_module_name] = None
 
 # -I deliberately omits the caller working directory and PYTHONPATH. Add only the
@@ -215,6 +217,76 @@ def _worker_run(root: Path, identity: tuple[str, str, str]) -> None:
             pass
 
 
+MAX_DIAGNOSTIC_BYTES = 64 * 1024
+_DIAGNOSTIC_CHUNK = 8192
+
+
+def _run_worker_bounded(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: int,
+) -> tuple[int, str, bool]:
+    """Drain untrusted worker output while retaining only a fixed diagnostic tail."""
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError as exc:
+        raise SupervisionFailure(f"frozen test worker failed to start: {exc}") from exc
+
+    require(process.stdout is not None, "frozen test worker output pipe unavailable")
+    tail = bytearray()
+    drain_error: list[BaseException] = []
+
+    def drain() -> None:
+        try:
+            while True:
+                chunk = process.stdout.read(_DIAGNOSTIC_CHUNK)
+                if not chunk:
+                    return
+                if len(chunk) >= MAX_DIAGNOSTIC_BYTES:
+                    tail[:] = chunk[-MAX_DIAGNOSTIC_BYTES:]
+                else:
+                    tail.extend(chunk)
+                    overflow = len(tail) - MAX_DIAGNOSTIC_BYTES
+                    if overflow > 0:
+                        del tail[:overflow]
+        except (OSError, ValueError) as exc:
+            drain_error.append(exc)
+
+    reader = threading.Thread(
+        target=drain,
+        name="blue-forge-frozen-worker-output",
+        daemon=True,
+    )
+    reader.start()
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        returncode = process.wait()
+
+    reader.join(timeout=2)
+    require(not reader.is_alive(), "frozen test worker output drain did not terminate")
+    if drain_error:
+        raise SupervisionFailure(f"frozen test worker output drain failed: {drain_error[0]}")
+    try:
+        process.stdout.close()
+    except OSError:
+        pass
+    diagnostic = bytes(tail).decode("utf-8", errors="replace")
+    return returncode, diagnostic, timed_out
+
+
 def run_one(
     root: Path,
     python_bin: str,
@@ -226,40 +298,33 @@ def run_one(
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
     supervisor = Path(__file__).resolve()
-
-    try:
-        completed = subprocess.run(
-            [
-                python_bin,
-                "-I",
-                str(supervisor),
-                "--worker-root",
-                str(root),
-                "--worker-module",
-                module,
-                "--worker-class",
-                class_name,
-                "--worker-method",
-                method,
-            ],
-            cwd=root,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            # Proposed output is untrusted and is not an authority signal. Drop it
-            # instead of buffering an attacker-controlled stream in trusted memory.
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise SupervisionFailure(f"frozen test worker timed out: {test_id}") from exc
-    except OSError as exc:
-        raise SupervisionFailure(f"frozen test worker failed to execute: {test_id}: {exc}") from exc
-
+    command = [
+        python_bin,
+        "-I",
+        str(supervisor),
+        "--worker-root",
+        str(root),
+        "--worker-module",
+        module,
+        "--worker-class",
+        class_name,
+        "--worker-method",
+        method,
+    ]
+    returncode, diagnostic, timed_out = _run_worker_bounded(
+        command,
+        cwd=root,
+        env=env,
+        timeout_seconds=timeout_seconds,
+    )
     require(
-        completed.returncode == 0,
-        f"frozen test did not complete in trusted worker: {test_id}: rc={completed.returncode}",
+        not timed_out,
+        f"frozen test worker timed out: {test_id}\n{diagnostic}",
+    )
+    require(
+        returncode == 0,
+        f"frozen test did not complete in trusted worker: {test_id}: "
+        f"rc={returncode}\n{diagnostic}",
     )
 
 
