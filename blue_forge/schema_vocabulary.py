@@ -1,7 +1,7 @@
 """Executable BLUE-FORGE JSON Schema vocabulary semantics.
 
 This module implements the required cross-field keywords declared by
-``schemas/blue-forge-hardening-meta-v1.schema.json``.  It deliberately stays
+``schemas/blue-forge-hardening-meta-v1.schema.json``. It deliberately stays
 stdlib-only and can be used alongside any Draft 2020-12 structural validator.
 """
 
@@ -10,7 +10,9 @@ from __future__ import annotations
 from types import MappingProxyType
 from typing import Any, Callable
 
-from .core import ValidationError
+from . import core
+
+ValidationError = core.ValidationError
 
 VOCABULARY_URI = (
     "https://github.com/QSOLKCB/QSOL-BLUE-FORGE/"
@@ -24,6 +26,22 @@ def _require_object(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValidationError(f"{label} must be an object for BLUE-FORGE vocabulary validation")
     return value
+
+
+def _canonical_byte_budget(case_value: Any) -> None:
+    case = _require_object(case_value, "case")
+    try:
+        encoded = core.canonical_bytes(case)
+    except ValidationError as exc:
+        if "canonical JSON exceeds" in str(exc):
+            raise ValidationError(
+                f"case canonical JSON exceeds {core.MAX_JSON_BYTES} byte budget"
+            ) from exc
+        raise
+    if len(encoded) > core.MAX_JSON_BYTES:
+        raise ValidationError(
+            f"case canonical JSON exceeds {core.MAX_JSON_BYTES} byte budget"
+        )
 
 
 def _unique_source_sha256(verification_value: Any) -> None:
@@ -81,6 +99,7 @@ def _decision_monotonic(case_value: Any) -> None:
 
 
 BLUE_FORGE_VOCABULARY = MappingProxyType({
+    "blueForgeCanonicalByteBudget": _canonical_byte_budget,
     "blueForgeUniqueSourceSha256": _unique_source_sha256,
     "blueForgeDistinctProducers": _distinct_producers,
     "blueForgeDecisionMonotonic": _decision_monotonic,
@@ -90,6 +109,7 @@ BLUE_FORGE_VOCABULARY = MappingProxyType({
 def validate_case_schema_vocabulary(value: Any) -> None:
     """Apply every required BLUE-FORGE cross-field keyword to a case instance."""
     case = _require_object(value, "case")
+    BLUE_FORGE_VOCABULARY["blueForgeCanonicalByteBudget"](case)
     BLUE_FORGE_VOCABULARY["blueForgeDistinctProducers"](case)
     BLUE_FORGE_VOCABULARY["blueForgeDecisionMonotonic"](case)
     BLUE_FORGE_VOCABULARY["blueForgeUniqueSourceSha256"](
