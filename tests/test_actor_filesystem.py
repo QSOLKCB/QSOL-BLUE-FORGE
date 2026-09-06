@@ -111,11 +111,11 @@ class ActorFilesystemTests(unittest.TestCase):
             self.assertLess(result["created"], STORAGE_INODES)
             self.assertFalse(Path(result["home"]).exists(), "actor home survived teardown")
             for directory in ("/var/tmp", "/tmp", "/dev/shm"):
-                self.assertFalse((Path(directory) / root.name).exists(), "probe escaped onto host storage")
+                self.assertFalse((Path(directory) / (root.name + "-write-probe")).exists(), "probe escaped onto host storage")
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--actor-root":
-        filesystem_probe(Path(sys.argv[2]).name)
+        filesystem_probe(Path(sys.argv[2]).name + "-write-probe")
     else:
         unittest.main()
