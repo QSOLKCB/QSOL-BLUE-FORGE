@@ -72,6 +72,7 @@ import os
 import posix
 from pathlib import Path
 import sys
+import types
 
 root = Path(__ROOT__).resolve()
 module_name = __MODULE__
@@ -109,6 +110,12 @@ for _module_name in ("ctypes", "_ctypes", "gc"):
 # sterile proposed root and its frozen tests explicitly, never the GitHub checkout.
 sys.path.insert(0, str(root / "tests"))
 sys.path.insert(0, str(root))
+
+# Proposed code must never be able to import the run-string namespace that owns the
+# trusted assertion package. Replace the import-visible __main__ module with an inert
+# shell before loading any proposed package. The runner continues executing in its
+# private globals, which are not registered in sys.modules.
+sys.modules["__main__"] = types.ModuleType("__main__")
 
 
 def _load_private_unittest():
@@ -355,7 +362,7 @@ def _self_test_import_path(python_bin: str, timeout_seconds: int) -> None:
 
 
 def _self_test_assertion_isolation(python_bin: str, timeout_seconds: int) -> None:
-    """Prove proposed real-unittest monkeypatches cannot neutralize frozen assertions."""
+    """Prove proposed code cannot reach or neutralize frozen assertion objects."""
     with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-assert-selftest-") as temp:
         root = Path(temp)
         (root / "tests").mkdir()
@@ -363,7 +370,12 @@ def _self_test_assertion_isolation(python_bin: str, timeout_seconds: int) -> Non
         (root / "blue_forge" / "__init__.py").write_text(
             "import unittest\n"
             "unittest.TestCase.fail = lambda self, *args, **kwargs: None\n"
-            "unittest.TestCase.assertEqual = lambda self, *args, **kwargs: None\n",
+            "unittest.TestCase.assertEqual = lambda self, *args, **kwargs: None\n"
+            "import __main__\n"
+            "trusted = getattr(__main__, '_trusted_unittest', None)\n"
+            "if trusted is not None:\n"
+            "    trusted.TestCase.fail = lambda self, *args, **kwargs: None\n"
+            "    trusted.TestCase.assertEqual = lambda self, *args, **kwargs: None\n",
             encoding="utf-8",
         )
         (root / "tests" / "test_fake.py").write_text(
