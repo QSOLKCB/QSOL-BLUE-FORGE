@@ -8,6 +8,7 @@ from typing import Any
 MAX_OBJECT_ITEMS = 512
 MAX_EXPANDED_JSON_NODES = 16384
 MAX_CANONICAL_BYTES = 4 * 1024 * 1024
+MAX_JSON_TEXT_BYTES = 1024 * 1024
 
 
 def _member_path(path: str, key: str) -> str:
@@ -26,6 +27,7 @@ def install(core: Any) -> None:
     core.MAX_OBJECT_ITEMS = MAX_OBJECT_ITEMS
     core.MAX_EXPANDED_JSON_NODES = MAX_EXPANDED_JSON_NODES
     core.MAX_CANONICAL_BYTES = MAX_CANONICAL_BYTES
+    core.MAX_JSON_TEXT_BYTES = MAX_JSON_TEXT_BYTES
 
     def pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         if len(pairs) > MAX_OBJECT_ITEMS:
@@ -119,6 +121,46 @@ def install(core: Any) -> None:
         raise core.ValidationError(
             f"unsupported JSON value at {path}: {type(value).__name__}"
         )
+
+    def loads_strict(text: str) -> Any:
+        if type(text) is not str:
+            raise core.ValidationError("JSON input must be text")
+        if len(text) > MAX_JSON_TEXT_BYTES:
+            raise core.ValidationError(
+                f"JSON text exceeds {MAX_JSON_TEXT_BYTES} characters before parsing"
+            )
+        try:
+            encoded = text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise core.ValidationError("JSON text contains an unpaired Unicode surrogate") from exc
+        if len(encoded) > MAX_JSON_TEXT_BYTES:
+            raise core.ValidationError(
+                f"JSON text exceeds {MAX_JSON_TEXT_BYTES} UTF-8 bytes before parsing"
+            )
+        try:
+            value = json.loads(
+                text,
+                object_pairs_hook=pairs_no_duplicates,
+                parse_float=core._reject_float,
+                parse_int=core._parse_int,
+                parse_constant=core._reject_constant,
+            )
+        except core.ValidationError:
+            raise
+        except (json.JSONDecodeError, RecursionError, ValueError) as exc:
+            raise core.ValidationError(f"invalid or over-deep JSON: {exc}") from exc
+        validate_json_value(value)
+        return value
+
+    def exact_keys(value: dict[Any, Any], expected: set[str], label: str) -> None:
+        if any(type(key) is not str for key in value):
+            raise core.ValidationError(f"{label} object keys must be strings")
+        actual = set(value)
+        if actual != expected:
+            raise core.ValidationError(
+                f"{label} fields changed: "
+                f"missing={sorted(expected - actual)} extra={sorted(actual - expected)}"
+            )
 
     def bounded_string(value: Any, label: str) -> str:
         if type(value) is not str or not value.strip() or value != value.strip():
@@ -225,6 +267,8 @@ def install(core: Any) -> None:
 
     core._pairs_no_duplicates = pairs_no_duplicates
     core._validate_json_value = validate_json_value
+    core.loads_strict = loads_strict
+    core._exact_keys = exact_keys
     core._string = bounded_string
     core._validate_result_payload = validate_result_payload
     core.HardeningResult.__init__ = hardening_result_init
