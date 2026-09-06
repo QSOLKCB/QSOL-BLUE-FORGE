@@ -66,12 +66,11 @@ def expected_tests(root: Path) -> list[tuple[str, str, str]]:
 
 _SUBINTERPRETER_RUNNER = r'''
 import builtins
+import importlib.util
 import os
 import posix
 from pathlib import Path
 import sys
-import types
-import unittest as _trusted_unittest
 
 root = Path(__ROOT__).resolve()
 module_name = __MODULE__
@@ -96,26 +95,56 @@ for _name in (
     if hasattr(posix, _name):
         setattr(posix, _name, _blocked)
 
-# Remove the straightforward Python-level routes to trusted runner frames or C
-# process termination. The frozen BLUE-FORGE tests do not require these modules.
+# Remove straightforward Python-level routes to trusted runner frames or C process
+# termination. The frozen BLUE-FORGE tests do not require these modules.
 for _name in ("_getframe", "_current_frames", "settrace", "setprofile"):
     if hasattr(sys, _name):
         setattr(sys, _name, _blocked)
 for _module_name in ("ctypes", "_ctypes", "gc", "inspect"):
     sys.modules[_module_name] = None
 
-# Give trusted test source a private copy of the unittest module namespace. Proposed
-# code importing the real unittest module cannot replace the TestCase reference
-# used by subsequent frozen class definitions.
-_unittest_proxy = types.ModuleType("unittest")
-_unittest_proxy.__dict__.update(dict(_trusted_unittest.__dict__))
+# -I deliberately omits the caller working directory and PYTHONPATH. Add only the
+# sterile proposed root and its frozen tests explicitly, never the GitHub checkout.
+sys.path.insert(0, str(root / "tests"))
+sys.path.insert(0, str(root))
+
+
+def _load_private_unittest():
+    """Load a distinct stdlib unittest package object for frozen assertions."""
+    spec = importlib.util.find_spec("unittest")
+    if spec is None or spec.origin is None:
+        raise RuntimeError("stdlib unittest package is unavailable")
+    package_dir = Path(spec.origin).resolve().parent
+    private_name = "_blueforge_trusted_unittest"
+    private_spec = importlib.util.spec_from_file_location(
+        private_name,
+        spec.origin,
+        submodule_search_locations=[str(package_dir)],
+    )
+    if private_spec is None or private_spec.loader is None:
+        raise RuntimeError("cannot construct private unittest package")
+    private = importlib.util.module_from_spec(private_spec)
+    sys.modules[private_name] = private
+    try:
+        private_spec.loader.exec_module(private)
+    finally:
+        # Keep the private module graph reachable only from this runner. Proposed
+        # code importing real unittest cannot discover or mutate it through the
+        # module registry.
+        for name in tuple(sys.modules):
+            if name == private_name or name.startswith(private_name + "."):
+                sys.modules.pop(name, None)
+    return private
+
+
+_trusted_unittest = _load_private_unittest()
 _real_import = builtins.__import__
 _test_builtins = dict(vars(builtins))
 
 
 def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
     if level == 0 and name == "unittest":
-        return _unittest_proxy
+        return _trusted_unittest
     return _real_import(name, globals, locals, fromlist, level)
 
 
@@ -216,27 +245,87 @@ def run_one(
             cwd=root,
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            # Proposed output is untrusted and is not an authority signal. Drop it
+            # instead of buffering an attacker-controlled stream in trusted memory.
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=timeout_seconds,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except subprocess.TimeoutExpired as exc:
+        raise SupervisionFailure(f"frozen test worker timed out: {test_id}") from exc
+    except OSError as exc:
         raise SupervisionFailure(f"frozen test worker failed to execute: {test_id}: {exc}") from exc
 
     require(
         completed.returncode == 0,
-        f"frozen test did not complete in trusted worker: {test_id}: "
-        f"rc={completed.returncode}\n{completed.stdout}",
+        f"frozen test did not complete in trusted worker: {test_id}: rc={completed.returncode}",
     )
 
 
-def _self_test(python_bin: str, timeout_seconds: int) -> None:
+def _self_test_import_path(python_bin: str, timeout_seconds: int) -> None:
+    """Prove isolated workers import proposed source from the sterile root."""
+    with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-import-selftest-") as temp:
+        root = Path(temp)
+        (root / "tests").mkdir()
+        (root / "blue_forge").mkdir()
+        (root / "blue_forge" / "__init__.py").write_text(
+            "SENTINEL = 'sterile-proposed-root'\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_importable.py").write_text(
+            "import unittest\n"
+            "import blue_forge\n\n"
+            "class ImportTests(unittest.TestCase):\n"
+            "    def test_imports_sterile_root(self):\n"
+            "        self.assertEqual(blue_forge.SENTINEL, 'sterile-proposed-root')\n",
+            encoding="utf-8",
+        )
+        run_one(
+            root,
+            python_bin,
+            ("test_importable", "ImportTests", "test_imports_sterile_root"),
+            timeout_seconds,
+        )
+
+
+def _self_test_assertion_isolation(python_bin: str, timeout_seconds: int) -> None:
+    """Prove proposed real-unittest monkeypatches cannot neutralize frozen assertions."""
+    with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-assert-selftest-") as temp:
+        root = Path(temp)
+        (root / "tests").mkdir()
+        (root / "blue_forge").mkdir()
+        (root / "blue_forge" / "__init__.py").write_text(
+            "import unittest\n"
+            "unittest.TestCase.fail = lambda self, *args, **kwargs: None\n"
+            "unittest.TestCase.assertEqual = lambda self, *args, **kwargs: None\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_fake.py").write_text(
+            "import unittest\n"
+            "import blue_forge\n\n"
+            "class FakeTests(unittest.TestCase):\n"
+            "    def test_must_fail(self):\n"
+            "        self.fail('trusted assertion must execute')\n",
+            encoding="utf-8",
+        )
+        try:
+            run_one(
+                root,
+                python_bin,
+                ("test_fake", "FakeTests", "test_must_fail"),
+                timeout_seconds,
+            )
+        except SupervisionFailure:
+            return
+        raise SupervisionFailure(
+            "supervisor self-test accepted proposed mutation of trusted assertions"
+        )
+
+
+def _self_test_accounting_isolation(python_bin: str, timeout_seconds: int) -> None:
     """Prove proposed code cannot replace trusted accounting through __main__."""
-    with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-selftest-") as temp:
+    with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-accounting-selftest-") as temp:
         root = Path(temp)
         (root / "tests").mkdir()
         (root / "blue_forge").mkdir()
@@ -244,7 +333,7 @@ def _self_test(python_bin: str, timeout_seconds: int) -> None:
             "import sys\n"
             "main = sys.modules.get('__main__')\n"
             "if main is not None:\n"
-            "    main._testcase_run = lambda case, result: setattr(result, 'testsRun', 1)\n"
+            "    main._testcase_run = lambda *args, **kwargs: None\n"
             "    main.result = type('ForgedResult', (), {'testsRun': 1, 'failures': [], 'errors': []})()\n",
             encoding="utf-8",
         )
@@ -306,7 +395,9 @@ def main(argv: list[str] | None = None) -> int:
 
     root = args.root.resolve()
     try:
-        _self_test(args.python, args.timeout_seconds)
+        _self_test_import_path(args.python, args.timeout_seconds)
+        _self_test_assertion_isolation(args.python, args.timeout_seconds)
+        _self_test_accounting_isolation(args.python, args.timeout_seconds)
         tests = expected_tests(root)
         for identity in tests:
             run_one(root, args.python, identity, args.timeout_seconds)
