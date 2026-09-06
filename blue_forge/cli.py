@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import stat
 import sys
 
 from .core import (
@@ -33,9 +35,26 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _load(path: Path) -> HardeningCase:
+    if not hasattr(os, "O_NONBLOCK"):
+        raise BlueForgeError("nonblocking case-file validation is unavailable")
     try:
-        with path.open("rb") as stream:
-            raw = stream.read(MAX_CASE_BYTES + 1)
+        # Open first without waiting for a FIFO peer, then inspect that exact
+        # descriptor. A path stat followed by a blocking open would race a swap.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise BlueForgeError("case must be a regular file")
+            chunks = []
+            remaining = MAX_CASE_BYTES + 1
+            while remaining:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+        finally:
+            os.close(fd)
     except OSError as exc:
         raise BlueForgeError(f"cannot read case: {exc}") from exc
     if len(raw) > MAX_CASE_BYTES:

@@ -21,6 +21,57 @@ import tempfile
 import time
 
 ACTOR_SECONDS = 35
+ACTOR_STORAGE_BYTES = 32 * 1024 * 1024
+ACTOR_STORAGE_INODES = 1024
+
+# This fixed code runs with the system interpreter (-I -S) only after unshare
+# creates private mount/PID/network namespaces, and before proposed imports.
+# mount_setattr changes per-mount attributes, not the host superblock's flags.
+# There is deliberately no fallback to a writable host tree.
+FILESYSTEM_SETUP = r'''
+import ctypes
+import os
+import sys
+
+if os.geteuid() != 0 or os.getpid() != 1:
+    raise RuntimeError("filesystem setup requires the private namespace init")
+home, uid, gid, size, inodes = sys.argv[1:6]
+command = sys.argv[6:]
+if not command or command[0] != "/usr/bin/prlimit":
+    raise RuntimeError("invalid fixed actor command")
+libc = ctypes.CDLL(None, use_errno=True)
+
+class MountAttr(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in
+                ("attr_set", "attr_clr", "propagation", "userns_fd")]
+
+mount_setattr = libc.mount_setattr
+mount_setattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+                         ctypes.POINTER(MountAttr), ctypes.c_size_t]
+mount_setattr.restype = ctypes.c_int
+mount = libc.mount
+mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                  ctypes.c_ulong, ctypes.c_void_p]
+mount.restype = ctypes.c_int
+
+def checked(rc, operation):
+    if rc != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, operation + ": " + os.strerror(error))
+
+os.chdir("/")
+# MS_REC | MS_PRIVATE prevents propagation back into the runner namespace.
+checked(mount(None, b"/", None, (1 << 14) | (1 << 18), None), "private mount tree")
+# AT_FDCWD, AT_RECURSIVE; MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID.
+attributes = MountAttr(1 | 2, 0, 0, 0)
+checked(mount_setattr(-100, b"/", 0x8000, ctypes.byref(attributes),
+                     ctypes.sizeof(attributes)), "recursive read-only mount tree")
+# One aggregate byte/inode budget for every actor and detached descendant.
+# MS_NOSUID | MS_NODEV | MS_NOEXEC. The underlying host directory stays empty.
+options = f"size={size},nr_inodes={inodes},mode=0700,uid={uid},gid={gid}".encode("ascii")
+checked(mount(b"tmpfs", os.fsencode(home), b"tmpfs", 2 | 4 | 8, options), "private actor tmpfs")
+os.execv(command[0], command)
+'''
 
 
 def check(condition: bool, message: str) -> None:
@@ -73,17 +124,23 @@ def main() -> int:
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signum, interrupted_by)
     try:
-        os.chown(home, rpc.pw_uid, rpc.pw_gid)
+        # The host mountpoint remains root-owned. Only the namespace-local tmpfs
+        # is owned by the actor, preventing hidden writes below its mount.
         home.chmod(0o700)
-        command = [
-            "/usr/bin/setpriv", "--pdeathsig=KILL", "--",
-            "/usr/bin/unshare", "--mount", "--pid", "--fork", "--kill-child=KILL", "--mount-proc", "--net", "--",
+        actor_command = [
             "/usr/bin/prlimit", "--as=536870912", "--cpu=20", "--nproc=64", "--fsize=16777216", "--nofile=128", "--core=0", "--",
             "/usr/bin/setpriv", f"--reuid={rpc.pw_uid}", f"--regid={rpc.pw_gid}", "--clear-groups",
             "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs", "--pdeathsig=KILL", "--",
             "/usr/bin/env", "-i", f"HOME={home}", f"TMPDIR={home}", "PATH=/usr/bin:/bin",
             f"LD_LIBRARY_PATH={python_bin.parent.parent / 'lib'}",
             str(python_bin), "-I", str(supervisor), "--actor-root", str(source_root),
+        ]
+        command = [
+            "/usr/bin/setpriv", "--pdeathsig=KILL", "--",
+            "/usr/bin/unshare", "--mount", "--propagation", "private", "--pid", "--fork", "--kill-child=KILL", "--mount-proc", "--net", "--",
+            "/usr/bin/python3", "-I", "-S", "-c", FILESYSTEM_SETUP,
+            str(home), str(rpc.pw_uid), str(rpc.pw_gid),
+            str(ACTOR_STORAGE_BYTES), str(ACTOR_STORAGE_INODES), *actor_command,
         ]
         process = subprocess.Popen(command, cwd=source_root, start_new_session=True,
                                    env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
@@ -107,7 +164,7 @@ def main() -> int:
             stop(process)
         selector.close()
         os.close(control)
-        # PID namespace teardown has already killed even setsid() descendants.
+        # PID namespace teardown destroys its tmpfs and even setsid() descendants.
         shutil.rmtree(home)
 
 

@@ -48,6 +48,17 @@ def install(core: Any) -> None:
                 f"verification.benign_controls must contain 1..{core.MAX_ARRAY_ITEMS} evidence entries"
             )
 
+        # The serializer hashes these IDs for duplicate detection and uses them
+        # as mapping keys. Validate the exact bounded string domain first, so a
+        # programmatically replaced ID cannot execute __hash__ or __eq__ there.
+        core._evidence_id(
+            verification.original.evidence_id, "original", "verification.original evidence id"
+        )
+        for item in variants:
+            core._evidence_id(item.evidence_id, "variant", "verification.variants evidence id")
+        for item in benign:
+            core._evidence_id(item.evidence_id, "benign", "verification.benign_controls evidence id")
+
         return original_case_input_material(case)
 
     original_from_dict = core.HardeningCase.from_dict
