@@ -56,6 +56,7 @@ class CodexRoundNineTests(unittest.TestCase):
         self.assertEqual(
             set(BLUE_FORGE_VOCABULARY),
             {
+                "blueForgeCanonicalByteBudget",
                 "blueForgeUniqueSourceSha256",
                 "blueForgeDistinctProducers",
                 "blueForgeDecisionMonotonic",
@@ -86,6 +87,7 @@ class CodexRoundNineTests(unittest.TestCase):
         meta = json.loads(META_SCHEMA.read_text(encoding="utf-8"))
         for keyword in BLUE_FORGE_VOCABULARY:
             self.assertIn(keyword, meta["properties"])
+        self.assertIs(schema["blueForgeCanonicalByteBudget"], True)
         self.assertIs(schema["blueForgeDistinctProducers"], True)
         self.assertIs(schema["blueForgeDecisionMonotonic"], True)
         self.assertIs(
