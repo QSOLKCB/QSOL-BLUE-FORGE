@@ -4,9 +4,10 @@
   "title": "BLUE-FORGE Hardening Case v1",
   "type": "object",
   "additionalProperties": false,
+  "blueForgeCanonicalByteBudget": true,
   "blueForgeDistinctProducers": true,
   "blueForgeDecisionMonotonic": true,
-  "$comment": "Required BLUE-FORGE vocabulary rules are implemented by blue_forge.schema_vocabulary and executed by the reference CLI before case construction.",
+  "$comment": "Required BLUE-FORGE vocabulary rules are implemented by blue_forge.schema_vocabulary and executed by the reference CLI before case construction. The canonical byte-budget rule guarantees a schema-valid semantic case has a canonical UTF-8 representation within the shared 1 MiB parser/CLI budget; validators that do not implement the required vocabulary must refuse this schema rather than silently ignore these rules.",
   "required": [
     "schema",
     "contract",
