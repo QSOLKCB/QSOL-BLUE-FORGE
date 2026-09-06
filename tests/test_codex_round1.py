@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from blue_forge import HardeningCase, ValidationError, evaluate, loads_strict, regression_record
 import blue_forge.cli as cli
@@ -24,22 +25,13 @@ def fixture() -> dict:
     return loads_strict(FIXTURE.read_text(encoding="utf-8"))
 
 
-class _FakePath:
-    def __init__(self, payload: bytes) -> None:
-        self.payload = payload
+class _ReadSpy:
+    def __init__(self) -> None:
         self.requested: int | None = None
 
-    def open(self, mode: str):
-        if mode != "rb":
-            raise AssertionError(mode)
-        outer = self
-
-        class _Stream(io.BytesIO):
-            def read(self, size: int = -1) -> bytes:
-                outer.requested = size
-                return super().read(size)
-
-        return _Stream(self.payload)
+    def __call__(self, fd: int, size: int) -> bytes:
+        self.requested = size
+        return b"x" * size
 
 
 class CodexRoundOneTests(unittest.TestCase):
@@ -54,19 +46,21 @@ class CodexRoundOneTests(unittest.TestCase):
             regression_record(case_b, result_a)
 
     def test_cli_stream_budget_is_applied_to_read(self) -> None:
-        fake = _FakePath(b"x" * (cli.MAX_CASE_BYTES + 1))
-        with self.assertRaisesRegex(Exception, "input budget"):
-            cli._load(fake)  # type: ignore[arg-type]
-        self.assertEqual(fake.requested, cli.MAX_CASE_BYTES + 1)
+        # Use a real regular descriptor so the test cannot bypass file-type
+        # preflight. Inspect the actor-owned spy when running through the bridge.
+        with mock.patch.object(cli.os, "read", _ReadSpy()):
+            with self.assertRaisesRegex(Exception, "input budget"):
+                cli._load(cli.Path(str(FIXTURE)))
+            self.assertEqual(cli.os.read.requested, cli.MAX_CASE_BYTES + 1)
 
     def test_oversized_json_integer_is_validation_error(self) -> None:
         with self.assertRaisesRegex(ValidationError, "integer exceeds"):
-            loads_strict('{"value":' + ("9" * 129) + "}")
+            loads_strict('{"value":' + ("9" * 129) + '}')
 
     def test_cli_oversized_integer_returns_malformed_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "huge-int.json"
-            path.write_text('{"value":' + ("9" * 5000) + "}", encoding="utf-8")
+            path.write_text('{"value":' + ("9" * 5000) + '}', encoding="utf-8")
             result = subprocess.run(
                 [sys.executable, "-m", "blue_forge", "verify", str(path)],
                 cwd=ROOT,
