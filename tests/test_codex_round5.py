@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -17,6 +18,10 @@ SCHEMA = ROOT / "schemas/hardening-case-v1.schema.json"
 
 def fixture() -> dict:
     return loads_strict(FIXTURE.read_text(encoding="utf-8"))
+
+
+def evidence_source(evidence_id: str) -> str:
+    return hashlib.sha256(("blue-forge-test-source:" + evidence_id).encode("utf-8")).hexdigest()
 
 
 class CodexRoundFiveTests(unittest.TestCase):
@@ -72,6 +77,10 @@ class CodexRoundFiveTests(unittest.TestCase):
             f"benign:B{index:03d}": copy.deepcopy(benign_template)
             for index in range(128)
         }
+        for evidence_id, item in value["verification"]["variants"].items():
+            item["source_sha256"] = evidence_source(evidence_id)
+        for evidence_id, item in value["verification"]["benign_controls"].items():
+            item["source_sha256"] = evidence_source(evidence_id)
 
         case = HardeningCase.from_dict(value)
         result = evaluate(case)
