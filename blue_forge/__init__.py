@@ -3,10 +3,12 @@
 from . import core as _core
 from ._validation_patch import install as _install_validation
 from ._json_snapshot_patch import install as _install_json_snapshot
+from ._authority_preflight_patch import install as _install_authority_preflight
 from ._result_provenance_patch import install as _install_result_provenance
 
 _install_validation(_core)
 _install_json_snapshot(_core)
+_install_authority_preflight(_core)
 _install_result_provenance(_core)
 
 from .core import (
