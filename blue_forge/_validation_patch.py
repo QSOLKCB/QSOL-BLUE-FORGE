@@ -247,25 +247,63 @@ def install(core: Any) -> None:
             raise core.ValidationError("hardening result receipt does not match payload")
         return payload
 
-    def hardening_result_init(
-        self: Any,
-        originating_case: Any,
-        *,
-        _token: object | None = None,
-    ) -> None:
-        if _token is not core._EVALUATION_TOKEN:
-            raise core.ValidationError("HardeningResult must be created by evaluate()")
-        if not isinstance(originating_case, core.HardeningCase):
-            raise core.ValidationError(
-                "HardeningResult construction requires an originating HardeningCase"
-            )
-        payload_builder = getattr(core, "_payload_for_validated_case", None)
-        if not callable(payload_builder):
-            raise core.ValidationError("hardening evaluator payload builder is unavailable")
-        validated_case = core._validated_case(originating_case)
-        payload = payload_builder(validated_case)
-        validate_result_payload(payload)
-        object.__setattr__(self, "_payload_bytes", core.canonical_bytes(payload))
+    class SlotHardeningResult:
+        """Slot-only evaluator result recomputed from immutable canonical case bytes."""
+
+        __slots__ = ("_case_bytes",)
+
+        def __init__(
+            self,
+            originating_case: Any,
+            *,
+            _token: object | None = None,
+        ) -> None:
+            if _token is not core._EVALUATION_TOKEN:
+                raise core.ValidationError("HardeningResult must be created by evaluate()")
+            if not isinstance(originating_case, core.HardeningCase):
+                raise core.ValidationError(
+                    "HardeningResult construction requires an originating HardeningCase"
+                )
+            validated_case = core._validated_case(originating_case)
+            case_material = core._case_input_material(validated_case)
+            object.__setattr__(self, "_case_bytes", core.canonical_bytes(case_material))
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            raise AttributeError("HardeningResult is immutable")
+
+        @classmethod
+        def _from_evaluation(cls, case: Any) -> Any:
+            return cls(case, _token=core._EVALUATION_TOKEN)
+
+        def _recomputed_payload(self) -> dict[str, Any]:
+            try:
+                case_value = core.loads_strict(self._case_bytes.decode("utf-8"))
+            except (AttributeError, UnicodeDecodeError) as exc:
+                raise core.ValidationError("hardening result case provenance is invalid") from exc
+            case = core.HardeningCase.from_dict(case_value)
+            validated_case = core._validated_case(case)
+            payload_builder = getattr(core, "_payload_for_validated_case", None)
+            if not callable(payload_builder):
+                raise core.ValidationError("hardening evaluator payload builder is unavailable")
+            payload = payload_builder(validated_case)
+            validate_result_payload(payload)
+            return payload
+
+        @property
+        def payload(self) -> dict[str, Any]:
+            return self._recomputed_payload()
+
+        @property
+        def hardened(self) -> bool:
+            return self._recomputed_payload()["status"] == "BLUE_HARDENED"
+
+        @property
+        def receipt_sha256(self) -> str:
+            return self._recomputed_payload()["receipt_sha256"]
+
+    SlotHardeningResult.__name__ = "HardeningResult"
+    SlotHardeningResult.__qualname__ = "HardeningResult"
+    SlotHardeningResult.__module__ = core.__name__
 
     core._pairs_no_duplicates = pairs_no_duplicates
     core._validate_json_value = validate_json_value
@@ -273,4 +311,4 @@ def install(core: Any) -> None:
     core._exact_keys = exact_keys
     core._string = bounded_string
     core._validate_result_payload = validate_result_payload
-    core.HardeningResult.__init__ = hardening_result_init
+    core.HardeningResult = SlotHardeningResult
