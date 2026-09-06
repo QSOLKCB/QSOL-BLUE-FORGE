@@ -67,26 +67,27 @@ jobs:
           BLUE_FORGE_AUDIT_ROOT="$GITHUB_WORKSPACE" \
             python3 "$BLUE_FORGE_TRUSTED_AUDITOR"
 
-      - name: Prepare isolated regression workspaces
+      - name: Prepare isolated frozen regression workspaces
         shell: bash
         run: |
           set -euo pipefail
           trusted_root="/tmp/blue-forge-trusted-regression-${GITHUB_RUN_ID}"
           proposed_frozen_root="/tmp/blue-forge-proposed-frozen-regression-${GITHUB_RUN_ID}"
           current_root="/tmp/blue-forge-current-regression-${GITHUB_RUN_ID}"
-          test_home="/tmp/blue-forge-regression-home-${GITHUB_RUN_ID}"
-          sudo rm -rf "$trusted_root" "$proposed_frozen_root" "$current_root" "$test_home"
+          frozen_home="/tmp/blue-forge-frozen-home-${GITHUB_RUN_ID}"
+          current_home="/tmp/blue-forge-current-home-${GITHUB_RUN_ID}"
+          sudo rm -rf "$trusted_root" "$proposed_frozen_root" \
+            "$current_root" "$frozen_home" "$current_home"
           sudo mkdir -p "$trusted_root/scripts" "$trusted_root/tests" \
             "$proposed_frozen_root/scripts" "$proposed_frozen_root/tests" \
-            "$current_root/scripts" "$current_root/tests" "$test_home"
+            "$frozen_home"
 
           # Frozen-test processes receive only trusted support scripts. The proposed
-          # auditor remains confined to the separate full current suite.
+          # auditor and PR-added tests are deliberately not materialized yet.
           for root in "$trusted_root" "$proposed_frozen_root"; do
             sudo install -m 0444 -- "$BLUE_FORGE_TRUSTED_AUDITOR" \
               "$root/scripts/audit_constitution.py"
           done
-          sudo cp -- scripts/audit_constitution.py "$current_root/scripts/"
 
           # Materialize frozen baseline tests into both frozen-test workspaces.
           # The proposed-frozen workspace never receives PR-added tests.
@@ -117,57 +118,39 @@ jobs:
             esac
           done < <(git ls-tree -r -z --name-only "$BLUE_FORGE_TRUSTED_REF" -- blue_forge fixtures schemas)
 
-          # Materialize current tests from committed Git blobs, never by following
-          # working-tree links.
-          while IFS= read -r -d '' test_path; do
-            case "$test_path" in
-              tests/test*.py)
-                mode="$(git ls-tree HEAD -- "$test_path" | awk '{print $1}')"
-                test "$mode" = "100644"
-                destination="$current_root/$test_path"
-                sudo mkdir -p "$(dirname "$destination")"
-                git show "HEAD:$test_path" | sudo tee "$destination" >/dev/null
-                ;;
-            esac
-          done < <(git ls-tree -r -z --name-only HEAD -- tests)
-
-          # Materialize proposed reference-core source, schemas and inert fixtures
-          # into both the frozen-test/proposed-source workspace and the full
-          # current workspace. Non-regular modes fail before any import.
+          # Materialize proposed source only into the read-only frozen workspace.
+          # The full current-suite tree does not exist until frozen supervision is over.
           while IFS= read -r -d '' source_path; do
             case "$source_path" in
               blue_forge/*.py|fixtures/*.json|fixtures/*/*.json|fixtures/*/README.md|schemas/*.json)
                 mode="$(git ls-tree HEAD -- "$source_path" | awk '{print $1}')"
                 test "$mode" = "100644"
-                for root in "$proposed_frozen_root" "$current_root"; do
-                  destination="$root/$source_path"
-                  sudo mkdir -p "$(dirname "$destination")"
-                  git show "HEAD:$source_path" | sudo tee "$destination" >/dev/null
-                done
+                destination="$proposed_frozen_root/$source_path"
+                sudo mkdir -p "$(dirname "$destination")"
+                git show "HEAD:$source_path" | sudo tee "$destination" >/dev/null
                 ;;
             esac
           done < <(git ls-tree -r -z --name-only HEAD -- blue_forge fixtures schemas)
 
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin blueforge-test
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin blueforge-current
 
-          # Trusted/current suites retain their previous unprivileged ownership.
-          sudo chown -R blueforge-test:blueforge-test \
-            "$trusted_root" "$current_root" "$test_home"
+          # Trusted tests execute unprivileged. The frozen proposed workspace remains
+          # root-owned/read-only. No current-suite path or HOME exists yet.
+          sudo chown -R blueforge-test:blueforge-test "$trusted_root" "$frozen_home"
           sudo chmod 0755 /tmp \
-            "$trusted_root" "$trusted_root/scripts" "$trusted_root/tests" \
-            "$current_root" "$current_root/scripts" "$current_root/tests" "$test_home"
-
-          # Proposed code must be able to read the frozen workspace but must never
-          # own or modify the trusted tests, their directories, schemas, fixtures,
-          # or proposed source between supervised child processes.
+            "$trusted_root" "$trusted_root/scripts" "$trusted_root/tests" "$frozen_home"
           sudo chown -R root:root "$proposed_frozen_root"
           sudo find "$proposed_frozen_root" -type d -exec chmod 0555 {} +
           sudo find "$proposed_frozen_root" -type f -exec chmod 0444 {} +
+          test ! -e "$current_root"
+          test ! -e "$current_home"
 
           printf 'BLUE_FORGE_TRUSTED_TEST_ROOT=%s\n' "$trusted_root" >> "$GITHUB_ENV"
           printf 'BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT=%s\n' "$proposed_frozen_root" >> "$GITHUB_ENV"
           printf 'BLUE_FORGE_CURRENT_TEST_ROOT=%s\n' "$current_root" >> "$GITHUB_ENV"
-          printf 'BLUE_FORGE_TEST_HOME=%s\n' "$test_home" >> "$GITHUB_ENV"
+          printf 'BLUE_FORGE_FROZEN_TEST_HOME=%s\n' "$frozen_home" >> "$GITHUB_ENV"
+          printf 'BLUE_FORGE_CURRENT_TEST_HOME=%s\n' "$current_home" >> "$GITHUB_ENV"
 
       - name: Run trusted baseline regressions in sterile sandbox
         shell: bash
@@ -191,7 +174,7 @@ jobs:
           cd "$BLUE_FORGE_TRUSTED_TEST_ROOT"
           sudo unshare --net -- \
             runuser -u blueforge-test -- \
-            env HOME="$BLUE_FORGE_TEST_HOME" PATH="$PATH" \
+            env HOME="$BLUE_FORGE_FROZEN_TEST_HOME" PATH="$PATH" \
             "$python_bin" -m unittest discover -s tests -v
 
       - name: Run supervised frozen regressions against proposed core
@@ -210,6 +193,8 @@ jobs:
 
           test ! -e "${BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT}/archive"
           test ! -e "${BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT}/.git"
+          test ! -e "$BLUE_FORGE_CURRENT_TEST_ROOT"
+          test ! -e "$BLUE_FORGE_CURRENT_TEST_HOME"
           test "$(stat -c '%U:%G %a' "${BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT}/tests")" = "root:root 555"
           test -z "$(find "${BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT}/tests" -type f ! -perm 0444 -print -quit)"
           sudo chown root:root "$GITHUB_WORKSPACE"
@@ -217,12 +202,12 @@ jobs:
 
           sudo unshare --net -- \
             runuser -u blueforge-test -- \
-            env HOME="$BLUE_FORGE_TEST_HOME" PATH="$PATH" \
+            env HOME="$BLUE_FORGE_FROZEN_TEST_HOME" PATH="$PATH" \
             "$python_bin" "$BLUE_FORGE_TRUSTED_TEST_SUPERVISOR" \
               --root "$BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT" \
               --python "$python_bin"
 
-      - name: Run current regression suite in separate sterile sandbox
+      - name: Materialize and run current regression suite in separate sterile sandbox
         shell: bash
         run: |
           set -euo pipefail
@@ -235,17 +220,66 @@ jobs:
             sudo chown "$runner_uid:$runner_gid" "$GITHUB_WORKSPACE" || true
             sudo rm -rf "$BLUE_FORGE_TRUSTED_TEST_ROOT" \
               "$BLUE_FORGE_PROPOSED_FROZEN_TEST_ROOT" \
-              "$BLUE_FORGE_CURRENT_TEST_ROOT" "$BLUE_FORGE_TEST_HOME" || true
+              "$BLUE_FORGE_CURRENT_TEST_ROOT" \
+              "$BLUE_FORGE_FROZEN_TEST_HOME" "$BLUE_FORGE_CURRENT_TEST_HOME" || true
           }
           trap cleanup EXIT
 
+          # Remove anything a frozen worker may have pre-planted in world-writable
+          # /tmp, then rematerialize the current suite exclusively from committed HEAD.
+          sudo rm -rf "$BLUE_FORGE_CURRENT_TEST_ROOT" "$BLUE_FORGE_CURRENT_TEST_HOME"
+          sudo install -d -m 0755 -o root -g root \
+            "$BLUE_FORGE_CURRENT_TEST_ROOT" \
+            "$BLUE_FORGE_CURRENT_TEST_ROOT/scripts" \
+            "$BLUE_FORGE_CURRENT_TEST_ROOT/tests" \
+            "$BLUE_FORGE_CURRENT_TEST_HOME"
+
+          mode="$(git ls-tree HEAD -- scripts/audit_constitution.py | awk '{print $1}')"
+          test "$mode" = "100644"
+          git show HEAD:scripts/audit_constitution.py | \
+            sudo tee "$BLUE_FORGE_CURRENT_TEST_ROOT/scripts/audit_constitution.py" >/dev/null
+
+          while IFS= read -r -d '' test_path; do
+            case "$test_path" in
+              tests/test*.py)
+                mode="$(git ls-tree HEAD -- "$test_path" | awk '{print $1}')"
+                test "$mode" = "100644"
+                destination="$BLUE_FORGE_CURRENT_TEST_ROOT/$test_path"
+                sudo mkdir -p "$(dirname "$destination")"
+                git show "HEAD:$test_path" | sudo tee "$destination" >/dev/null
+                ;;
+            esac
+          done < <(git ls-tree -r -z --name-only HEAD -- tests)
+
+          while IFS= read -r -d '' source_path; do
+            case "$source_path" in
+              blue_forge/*.py|fixtures/*.json|fixtures/*/*.json|fixtures/*/README.md|schemas/*.json)
+                mode="$(git ls-tree HEAD -- "$source_path" | awk '{print $1}')"
+                test "$mode" = "100644"
+                destination="$BLUE_FORGE_CURRENT_TEST_ROOT/$source_path"
+                sudo mkdir -p "$(dirname "$destination")"
+                git show "HEAD:$source_path" | sudo tee "$destination" >/dev/null
+                ;;
+            esac
+          done < <(git ls-tree -r -z --name-only HEAD -- blue_forge fixtures schemas)
+
+          # Only the distinct current-suite UID receives write access. A lingering
+          # frozen worker running as blueforge-test cannot alter this tree or HOME.
+          sudo chown -R blueforge-current:blueforge-current \
+            "$BLUE_FORGE_CURRENT_TEST_ROOT" "$BLUE_FORGE_CURRENT_TEST_HOME"
+          sudo chmod 0755 \
+            "$BLUE_FORGE_CURRENT_TEST_ROOT" \
+            "$BLUE_FORGE_CURRENT_TEST_ROOT/scripts" \
+            "$BLUE_FORGE_CURRENT_TEST_ROOT/tests" \
+            "$BLUE_FORGE_CURRENT_TEST_HOME"
           test ! -e "${BLUE_FORGE_CURRENT_TEST_ROOT}/archive"
           test ! -e "${BLUE_FORGE_CURRENT_TEST_ROOT}/.git"
+
           sudo chown root:root "$GITHUB_WORKSPACE"
           sudo chmod 000 "$GITHUB_WORKSPACE"
 
           cd "$BLUE_FORGE_CURRENT_TEST_ROOT"
           sudo unshare --net -- \
-            runuser -u blueforge-test -- \
-            env HOME="$BLUE_FORGE_TEST_HOME" PATH="$PATH" \
+            runuser -u blueforge-current -- \
+            env HOME="$BLUE_FORGE_CURRENT_TEST_HOME" PATH="$PATH" \
             "$python_bin" -m unittest discover -s tests -v
