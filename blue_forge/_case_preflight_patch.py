@@ -11,6 +11,13 @@ def install(core: Any) -> None:
     def exact_object(value: Any, label: str) -> dict[str, Any]:
         if type(value) is not dict:
             raise core.ValidationError(f"{label} must be an exact object")
+        # Exact built-in dict cardinality is safe to inspect in O(1). Enforce the
+        # shared object ceiling before _exact_keys() or any downstream scan can
+        # traverse attacker-controlled programmatic mappings.
+        if len(value) > core.MAX_OBJECT_ITEMS:
+            raise core.ValidationError(
+                f"{label} exceeds {core.MAX_OBJECT_ITEMS} members"
+            )
         return value
 
     original_case_input_material = core._case_input_material
