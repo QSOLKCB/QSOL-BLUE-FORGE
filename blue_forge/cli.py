@@ -6,17 +6,18 @@ import argparse
 from pathlib import Path
 import sys
 
-MAX_CASE_BYTES = 1_048_576
-
 from .core import (
     BlueForgeError,
     HardeningCase,
+    MAX_JSON_BYTES,
     canonical_bytes,
     evaluate,
     loads_strict,
     regression_record,
 )
 from .schema_vocabulary import validate_case_schema_vocabulary
+
+MAX_CASE_BYTES = MAX_JSON_BYTES
 
 
 def parser() -> argparse.ArgumentParser:
