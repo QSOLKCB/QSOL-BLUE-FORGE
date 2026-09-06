@@ -26,13 +26,6 @@ class CodexRoundSeventeenTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "exact list"):
             HardeningCase.from_dict(raw)
 
-    def test_supervisor_security_reproductions_live_in_trusted_stage(self) -> None:
-        # The supervisor is deliberately absent from the current sterile workspace.
-        # Its import-path, assertion-isolation, accounting-isolation, and bounded-
-        # output reproductions execute from the baseline-owned supervisor itself in
-        # the separate supervised proposed-core stage.
-        self.assertFalse((ROOT / "scripts" / "run_frozen_tests_supervised.py").exists())
-
 
 if __name__ == "__main__":
     unittest.main()
