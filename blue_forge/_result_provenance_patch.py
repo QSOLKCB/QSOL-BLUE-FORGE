@@ -94,13 +94,16 @@ def _payload_for_validated_case(core: Any, case: Any) -> dict[str, Any]:
 def install(core: Any) -> None:
     """Make all result construction equivalent to evaluation of an originating case."""
 
+    def payload_for_validated_case(case: Any) -> dict[str, Any]:
+        return _payload_for_validated_case(core, case)
+
     def from_evaluation(cls: type[Any], case: Any) -> Any:
         validated_case = core._validated_case(case)
-        payload = _payload_for_validated_case(core, validated_case)
-        return cls(payload, _token=core._EVALUATION_TOKEN)
+        return cls(validated_case, _token=core._EVALUATION_TOKEN)
 
     def evaluate(case: Any) -> Any:
         return core.HardeningResult._from_evaluation(case)
 
+    core._payload_for_validated_case = payload_for_validated_case
     core.HardeningResult._from_evaluation = classmethod(from_evaluation)
     core.evaluate = evaluate
