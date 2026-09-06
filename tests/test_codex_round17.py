@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
-import subprocess
 import sys
 import unittest
 
@@ -47,31 +46,13 @@ class CodexRoundSeventeenTests(unittest.TestCase):
         supervisor = _load_supervisor()
         supervisor._self_test_assertion_isolation(sys.executable, 10)
 
-    def test_worker_output_is_not_buffered_in_trusted_memory(self) -> None:
-        supervisor = _load_supervisor()
-        captured: dict[str, object] = {}
-
-        class Completed:
-            returncode = 0
-
-        def fake_run(*args, **kwargs):
-            captured.update(kwargs)
-            return Completed()
-
-        original = supervisor.subprocess.run
-        supervisor.subprocess.run = fake_run
-        try:
-            supervisor.run_one(
-                ROOT,
-                sys.executable,
-                ("test_fake", "FakeTests", "test_fake"),
-                1,
-            )
-        finally:
-            supervisor.subprocess.run = original
-
-        self.assertEqual(captured["stdout"], subprocess.DEVNULL)
-        self.assertEqual(captured["stderr"], subprocess.DEVNULL)
+    def test_worker_output_retains_only_a_bounded_diagnostic_tail(self) -> None:
+        source = SUPERVISOR.read_text(encoding="utf-8")
+        self.assertIn("MAX_DIAGNOSTIC_BYTES = 64 * 1024", source)
+        self.assertIn("tail = bytearray()", source)
+        self.assertIn("overflow = len(tail) - MAX_DIAGNOSTIC_BYTES", source)
+        self.assertIn("stdout=subprocess.PIPE", source)
+        self.assertNotIn("stdout=subprocess.PIPE,\n            stderr=subprocess.STDOUT,\n            text=True", source)
 
 
 if __name__ == "__main__":
