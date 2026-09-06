@@ -68,6 +68,10 @@ def _decision_monotonic(case_value: Any) -> None:
     order = {"ALLOW": 0, "REVIEW": 1, "DENY": 2}
     proposal_decision = proposal.get("decision")
     verification_decision = verification.get("decision")
+    if not isinstance(proposal_decision, str) or not isinstance(verification_decision, str):
+        raise ValidationError(
+            "proposal.decision and verification.decision must be strings"
+        )
     if proposal_decision not in order or verification_decision not in order:
         raise ValidationError("proposal.decision and verification.decision must be valid decisions")
     if order[verification_decision] < order[proposal_decision]:
