@@ -4,6 +4,9 @@
   "title": "BLUE-FORGE Hardening Case v1",
   "type": "object",
   "additionalProperties": false,
+  "blueForgeDistinctProducers": true,
+  "blueForgeDecisionMonotonic": true,
+  "$comment": "Required BLUE-FORGE vocabulary rules are implemented by blue_forge.schema_vocabulary and executed by the reference CLI before case construction.",
   "required": [
     "schema",
     "contract",
@@ -217,7 +220,7 @@
       "type": "object",
       "additionalProperties": false,
       "blueForgeUniqueSourceSha256": true,
-      "$comment": "Required BLUE-FORGE vocabulary rule: source_sha256 values across original, variants, and benign_controls are case-wide unique. Validators that do not implement the required source-uniqueness vocabulary must refuse this schema rather than silently ignore the rule.",
+      "$comment": "Required BLUE-FORGE vocabulary rule implemented by blue_forge.schema_vocabulary: source_sha256 values across original, variants, and benign_controls are case-wide unique.",
       "required": [
         "producer",
         "decision",
