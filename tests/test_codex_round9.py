@@ -31,11 +31,11 @@ def fixture() -> dict:
 
 
 class CodexRoundNineTests(unittest.TestCase):
-    def test_hardening_result_private_paths_still_validate_complete_payload(self) -> None:
+    def test_hardening_result_private_paths_still_require_originating_case(self) -> None:
         with self.assertRaisesRegex(ValidationError, "HardeningCase"):
             core.HardeningResult._from_evaluation({"status": "BLUE_HARDENED"})
 
-        with self.assertRaisesRegex(ValidationError, "hardening result fields changed"):
+        with self.assertRaisesRegex(ValidationError, "originating HardeningCase"):
             core.HardeningResult(
                 {"status": "BLUE_HARDENED"},
                 _token=core._EVALUATION_TOKEN,
@@ -44,7 +44,7 @@ class CodexRoundNineTests(unittest.TestCase):
         result = evaluate(HardeningCase.from_dict(fixture()))
         forged = result.payload
         forged["receipt_sha256"] = "0" * 64
-        with self.assertRaisesRegex(ValidationError, "receipt does not match payload"):
+        with self.assertRaisesRegex(ValidationError, "originating HardeningCase"):
             core.HardeningResult(
                 forged,
                 _token=core._EVALUATION_TOKEN,
