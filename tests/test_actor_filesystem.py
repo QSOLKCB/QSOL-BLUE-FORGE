@@ -40,7 +40,7 @@ def filesystem_probe(marker):
     link = home / "outside-link"
     link.symlink_to(Path("/var/tmp") / marker)
     try:
-        with link.open("xb") as stream:
+        with link.open("wb") as stream:
             stream.write(b"must not escape")
     except OSError as exc:
         results["symlink_errno"] = exc.errno
