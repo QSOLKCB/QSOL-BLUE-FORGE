@@ -165,12 +165,15 @@ def install(core: Any) -> None:
             )
 
     def bounded_string(value: Any, label: str) -> str:
-        if type(value) is not str or not value.strip() or value != value.strip():
+        if type(value) is not str:
             raise core.ValidationError(f"{label} must be a non-empty trimmed string")
         if len(value) > core.MAX_STRING_CHARS:
             raise core.ValidationError(
                 f"{label} exceeds {core.MAX_STRING_CHARS} characters"
             )
+        trimmed = value.strip()
+        if not trimmed or value != trimmed:
+            raise core.ValidationError(f"{label} must be a non-empty trimmed string")
         if _has_unpaired_surrogate(value):
             raise core.ValidationError(f"{label} contains an unpaired Unicode surrogate")
         return value

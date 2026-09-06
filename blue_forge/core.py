@@ -410,10 +410,12 @@ class HardeningCase:
             "schema", "contract", "case_id", "invariant_id",
             "attack_class", "proposal", "verification",
         }, "case")
-        if obj["schema"] != CASE_SCHEMA:
-            raise ValidationError(f"unsupported case schema: {obj['schema']!r}")
-        if obj["contract"] != CONTRACT:
-            raise ValidationError(f"unsupported contract: {obj['contract']!r}")
+        schema = _string(obj["schema"], "case.schema")
+        if schema != CASE_SCHEMA:
+            raise ValidationError(f"unsupported case schema: {schema!r}")
+        contract = _string(obj["contract"], "case.contract")
+        if contract != CONTRACT:
+            raise ValidationError(f"unsupported contract: {contract!r}")
         invariant = _string(obj["invariant_id"], "case.invariant_id")
         if not INVARIANT.fullmatch(invariant):
             raise ValidationError(f"invalid invariant id: {invariant!r}")
