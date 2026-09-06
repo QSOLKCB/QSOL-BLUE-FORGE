@@ -79,6 +79,15 @@ module_name = __MODULE__
 class_name = __CLASS__
 method_name = __METHOD__
 
+# Capture the runner primitives before any proposed module can mutate the real
+# builtins namespace. These direct object references stay in the unregistered
+# run-string globals and are never resolved through mutable builtins afterwards.
+_trusted_object_getattribute = object.__getattribute__
+_trusted_isinstance = isinstance
+_trusted_type = type
+_trusted_issubclass = issubclass
+_trusted_assertion_error = AssertionError
+
 
 def _blocked(*args, **kwargs):
     raise RuntimeError("supervised frozen test attempted to cross the trusted runner boundary")
@@ -175,13 +184,15 @@ def _entry():
     # proposed imports cannot reach its globals through a module registry lookup.
     exec(code, namespace, namespace)
     case_class = namespace.get(class_name)
-    if not isinstance(case_class, type) or not issubclass(case_class, _trusted_unittest.TestCase):
-        raise AssertionError(f"frozen test class identity changed: {class_name}")
+    if not _trusted_isinstance(case_class, _trusted_type) or not _trusted_issubclass(
+        case_class, _trusted_unittest.TestCase
+    ):
+        raise _trusted_assertion_error(f"frozen test class identity changed: {class_name}")
 
     case = case_class(method_name)
-    setup = case.setUp
-    method = getattr(case, method_name)
-    teardown = case.tearDown
+    setup = _trusted_object_getattribute(case, "setUp")
+    method = _trusted_object_getattribute(case, method_name)
+    teardown = _trusted_object_getattribute(case, "tearDown")
 
     setup()
     try:
@@ -400,6 +411,46 @@ def _self_test_assertion_isolation(python_bin: str, timeout_seconds: int) -> Non
         )
 
 
+def _self_test_method_resolution_isolation(python_bin: str, timeout_seconds: int) -> None:
+    """Prove proposed mutation of real builtins cannot replace frozen methods."""
+    with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-method-selftest-") as temp:
+        root = Path(temp)
+        (root / "tests").mkdir()
+        (root / "blue_forge").mkdir()
+        (root / "blue_forge" / "__init__.py").write_text(
+            "import builtins\n"
+            "real_getattr = builtins.getattr\n"
+            "def forged_getattr(obj, name, *default):\n"
+            "    if isinstance(name, str) and name.startswith('test'):\n"
+            "        return lambda: None\n"
+            "    if default:\n"
+            "        return real_getattr(obj, name, *default)\n"
+            "    return real_getattr(obj, name)\n"
+            "builtins.getattr = forged_getattr\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_fake.py").write_text(
+            "import unittest\n"
+            "import blue_forge\n\n"
+            "class FakeTests(unittest.TestCase):\n"
+            "    def test_must_fail(self):\n"
+            "        self.fail('trusted method must execute')\n",
+            encoding="utf-8",
+        )
+        try:
+            run_one(
+                root,
+                python_bin,
+                ("test_fake", "FakeTests", "test_must_fail"),
+                timeout_seconds,
+            )
+        except SupervisionFailure:
+            return
+        raise SupervisionFailure(
+            "supervisor self-test accepted proposed mutation of test-method resolution"
+        )
+
+
 def _self_test_accounting_isolation(python_bin: str, timeout_seconds: int) -> None:
     """Prove proposed code cannot replace trusted accounting through __main__."""
     with tempfile.TemporaryDirectory(prefix="blue-forge-supervisor-accounting-selftest-") as temp:
@@ -474,6 +525,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _self_test_import_path(args.python, args.timeout_seconds)
         _self_test_assertion_isolation(args.python, args.timeout_seconds)
+        _self_test_method_resolution_isolation(args.python, args.timeout_seconds)
         _self_test_accounting_isolation(args.python, args.timeout_seconds)
         tests = expected_tests(root)
         for identity in tests:
