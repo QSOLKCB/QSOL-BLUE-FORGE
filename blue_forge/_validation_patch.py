@@ -6,6 +6,8 @@ import json
 from typing import Any
 
 MAX_OBJECT_ITEMS = 512
+MAX_EXPANDED_JSON_NODES = 16384
+MAX_CANONICAL_BYTES = 4 * 1024 * 1024
 
 
 def _member_path(path: str, key: str) -> str:
@@ -19,9 +21,11 @@ def _has_unpaired_surrogate(value: str) -> bool:
 
 
 def install(core: Any) -> None:
-    """Install bounded validation and self-validating results into the loaded core."""
+    """Install bounded validation and case-bound results into the loaded core."""
 
     core.MAX_OBJECT_ITEMS = MAX_OBJECT_ITEMS
+    core.MAX_EXPANDED_JSON_NODES = MAX_EXPANDED_JSON_NODES
+    core.MAX_CANONICAL_BYTES = MAX_CANONICAL_BYTES
 
     def pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         if len(pairs) > MAX_OBJECT_ITEMS:
@@ -33,18 +37,44 @@ def install(core: Any) -> None:
             result[key] = value
         return result
 
-    def validate_json_value(value: Any, path: str = "$", depth: int = 0) -> None:
+    def validate_json_value(
+        value: Any,
+        path: str = "$",
+        depth: int = 0,
+        _budget: dict[str, int] | None = None,
+    ) -> None:
+        if _budget is None:
+            _budget = {"nodes": 0, "bytes": 0}
+
+        _budget["nodes"] += 1
+        if _budget["nodes"] > MAX_EXPANDED_JSON_NODES:
+            raise core.ValidationError(
+                f"expanded JSON exceeds {MAX_EXPANDED_JSON_NODES} nodes at {path}"
+            )
+
+        def charge_bytes(amount: int) -> None:
+            _budget["bytes"] += amount
+            if _budget["bytes"] > MAX_CANONICAL_BYTES:
+                raise core.ValidationError(
+                    f"canonical JSON exceeds {MAX_CANONICAL_BYTES} bytes at {path}"
+                )
+
         if depth > core.MAX_JSON_DEPTH:
             raise core.ValidationError(
                 f"JSON nesting exceeds {core.MAX_JSON_DEPTH} at {path}"
             )
-        if value is None or type(value) is bool:
+        if value is None:
+            charge_bytes(4)
+            return
+        if type(value) is bool:
+            charge_bytes(4 if value else 5)
             return
         if type(value) is int:
             if abs(value) > core.MAX_INTEGER_ABS:
                 raise core.ValidationError(
                     f"integer exceeds {core.MAX_INTEGER_DIGITS} decimal digits at {path}"
                 )
+            charge_bytes(len(str(value).encode("ascii")))
             return
         if type(value) is str:
             if len(value) > core.MAX_STRING_CHARS:
@@ -53,6 +83,7 @@ def install(core: Any) -> None:
                 )
             if _has_unpaired_surrogate(value):
                 raise core.ValidationError(f"unpaired Unicode surrogate is not allowed at {path}")
+            charge_bytes(len(json.dumps(value, ensure_ascii=False).encode("utf-8")))
             return
         if isinstance(value, float):
             raise core.ValidationError(f"floating-point values are not allowed at {path}")
@@ -61,14 +92,16 @@ def install(core: Any) -> None:
                 raise core.ValidationError(
                     f"array exceeds {core.MAX_ARRAY_ITEMS} items at {path}"
                 )
+            charge_bytes(2 + max(0, len(value) - 1))
             for index, item in enumerate(value):
-                validate_json_value(item, f"{path}[{index}]", depth + 1)
+                validate_json_value(item, f"{path}[{index}]", depth + 1, _budget)
             return
         if isinstance(value, dict):
             if len(value) > MAX_OBJECT_ITEMS:
                 raise core.ValidationError(
                     f"object exceeds {MAX_OBJECT_ITEMS} members at {path}"
                 )
+            charge_bytes(2 + max(0, len(value) - 1) + len(value))
             for key, item in value.items():
                 if type(key) is not str:
                     raise core.ValidationError(f"object key is not a string at {path}")
@@ -80,11 +113,23 @@ def install(core: Any) -> None:
                     raise core.ValidationError(
                         f"unpaired Unicode surrogate is not allowed in object key at {path}"
                     )
-                validate_json_value(item, _member_path(path, key), depth + 1)
+                charge_bytes(len(json.dumps(key, ensure_ascii=False).encode("utf-8")))
+                validate_json_value(item, _member_path(path, key), depth + 1, _budget)
             return
         raise core.ValidationError(
             f"unsupported JSON value at {path}: {type(value).__name__}"
         )
+
+    def bounded_string(value: Any, label: str) -> str:
+        if type(value) is not str or not value.strip() or value != value.strip():
+            raise core.ValidationError(f"{label} must be a non-empty trimmed string")
+        if len(value) > core.MAX_STRING_CHARS:
+            raise core.ValidationError(
+                f"{label} exceeds {core.MAX_STRING_CHARS} characters"
+            )
+        if _has_unpaired_surrogate(value):
+            raise core.ValidationError(f"{label} contains an unpaired Unicode surrogate")
+        return value
 
     def validate_result_payload(payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
@@ -160,16 +205,26 @@ def install(core: Any) -> None:
 
     def hardening_result_init(
         self: Any,
-        payload: dict[str, Any],
+        originating_case: Any,
         *,
         _token: object | None = None,
     ) -> None:
         if _token is not core._EVALUATION_TOKEN:
             raise core.ValidationError("HardeningResult must be created by evaluate()")
+        if not isinstance(originating_case, core.HardeningCase):
+            raise core.ValidationError(
+                "HardeningResult construction requires an originating HardeningCase"
+            )
+        payload_builder = getattr(core, "_payload_for_validated_case", None)
+        if not callable(payload_builder):
+            raise core.ValidationError("hardening evaluator payload builder is unavailable")
+        validated_case = core._validated_case(originating_case)
+        payload = payload_builder(validated_case)
         validate_result_payload(payload)
         object.__setattr__(self, "_payload_bytes", core.canonical_bytes(payload))
 
     core._pairs_no_duplicates = pairs_no_duplicates
     core._validate_json_value = validate_json_value
+    core._string = bounded_string
     core._validate_result_payload = validate_result_payload
     core.HardeningResult.__init__ = hardening_result_init
