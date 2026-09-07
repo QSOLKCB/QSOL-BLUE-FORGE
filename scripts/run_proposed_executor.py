@@ -775,11 +775,15 @@ def main() -> int:
     if not support_path.is_file() or support_info.st_mode & 0o022:
         raise RuntimeError("trusted executor support is unavailable or writable")
     loads, dumps = marshal.loads, marshal.dumps
-    wire_in, wire_out = sys.stdin.buffer, sys.stdout.buffer
+    wire_in = sys.stdin.buffer
+    # Own the broker-facing output independently. Rebinding both stdout objects
+    # otherwise releases their TextIOWrapper and closes sys.stdout.buffer.
+    wire_out = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
     sys.stdout = sys.stderr
     sys.__stdout__ = sys.stderr
-    application = _Application(root, support_path)
+    application = None
     try:
+        application = _Application(root, support_path)
         for generation in range(1, MAX_OPERATIONS + 1):
             try:
                 request = _validate_request(_read_frame(wire_in, loads))
@@ -792,7 +796,9 @@ def main() -> int:
             _write_frame(wire_out, response, dumps)
         raise RuntimeError("executor operation budget exceeded")
     finally:
-        application.close()
+        if application is not None:
+            application.close()
+        wire_out.close()
 
 
 if __name__ == "__main__":
