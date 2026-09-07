@@ -155,10 +155,13 @@ def install(core: Any) -> None:
             return cls(case, _token=core._EVALUATION_TOKEN)
 
         def _recomputed_payload(self) -> dict[str, Any]:
-            try:
-                case_value = core.loads_strict(
-                    self._bound_case_bytes().decode("utf-8")
+            case_bytes = self._bound_case_bytes()
+            if len(case_bytes) > core.MAX_JSON_BYTES:
+                raise core.ValidationError(
+                    f"hardening result case binding exceeds {core.MAX_JSON_BYTES} bytes"
                 )
+            try:
+                case_value = core.loads_strict(case_bytes.decode("utf-8"))
             except (AttributeError, UnicodeDecodeError, IndexError, TypeError) as exc:
                 raise core.ValidationError("hardening result case binding is invalid") from exc
             case = core.HardeningCase.from_dict(case_value)
