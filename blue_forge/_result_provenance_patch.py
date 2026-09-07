@@ -189,6 +189,19 @@ def install(core: Any) -> None:
     def evaluate(case: Any) -> Any:
         return HardeningResult._from_evaluation(case)
 
+    original_regression_record = core.regression_record
+
+    def regression_record(case: Any, result: Any) -> dict[str, Any]:
+        # Exact type is still part of the public value contract, but the object
+        # construction route is not trusted as provenance. The original routine
+        # independently re-evaluates `case` and compares the complete payload.
+        if type(result) is not HardeningResult:
+            raise core.ValidationError(
+                "regression_record() requires an exact HardeningResult"
+            )
+        return original_regression_record(case, result)
+
     core._payload_for_validated_case = payload_for_validated_case
     core.HardeningResult = HardeningResult
     core.evaluate = evaluate
+    core.regression_record = regression_record
