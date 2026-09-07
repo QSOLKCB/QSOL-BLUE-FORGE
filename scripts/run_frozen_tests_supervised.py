@@ -135,8 +135,8 @@ def _broker_actor(root):
                     "executor failure omitted identity",
                 )
 
-            # This is the only worker-facing response serialization path.  The
-            # proposed interpreter is a different process and cannot replace the
+            # This is the only worker-facing response serialization path. The
+            # proposed interpreter is outside this broker and cannot replace the
             # broker's codec, response object, handles, or call-frame globals.
             wire_out.write(base._wire_dump(response) + b"\n")
             wire_out.flush()
@@ -233,9 +233,6 @@ def _hardened_close(self):
     try:
         self.process.wait(timeout=6)
     except subprocess.TimeoutExpired:
-        # Normal EOF should let the broker finish first. If it does not, close
-        # the private lifeline to ask the fixed root launcher for bounded forced
-        # namespace/cgroup teardown, then wait once more for that confirmation.
         if self.control_fd is not None:
             os.close(self.control_fd)
             self.control_fd = None
@@ -288,12 +285,37 @@ def _base_ref(expr, unittest_aliases, symbols, classes):
     return ("unknown", ast.unparse(expr))
 
 
+def _current_suite_only(tree, path):
+    """Recognize only an exact literal current-floor classification marker."""
+    markers = []
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "CURRENT_SUITE_ONLY"
+        ):
+            markers.append(node.value)
+    if not markers:
+        return False
+    base.require(
+        len(markers) == 1
+        and isinstance(markers[0], ast.Constant)
+        and markers[0].value is True,
+        f"invalid CURRENT_SUITE_ONLY marker in {path.name}",
+    )
+    return True
+
+
 def _hardened_expected_tests(root):
-    """Enumerate the same static TestCase floor without silently losing aliases."""
+    """Enumerate the static TestCase floor without silently losing aliases."""
     tests = []
+    supervised_current = bool(os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"))
     for path in sorted((root / "tests").glob("test*.py")):
         base.require(path.is_file() and not path.is_symlink(), "invalid frozen test file")
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if _current_suite_only(tree, path) and not supervised_current:
+            continue
         unittest_aliases = {"unittest"}
         symbols = {}
         classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
@@ -407,13 +429,38 @@ def _self_test_enumeration():
             " def test_child(self): pass\n",
             encoding="utf-8",
         )
-        actual = set(_hardened_expected_tests(root))
-        expected = {
-            ("test_alias", "Parent", "test_inherited"),
-            ("test_alias", "Child", "test_inherited"),
-            ("test_alias", "Child", "test_child"),
-        }
-        base.require(actual == expected, "aliased/inherited TestCase enumeration self-test failed")
+        (root / "tests/test_current_only.py").write_text(
+            "import unittest\n"
+            "CURRENT_SUITE_ONLY = True\n"
+            "class CurrentOnly(unittest.TestCase):\n"
+            " def test_kernel_only(self): pass\n",
+            encoding="utf-8",
+        )
+        previous = os.environ.pop("BLUE_FORGE_SUPERVISED_MARKER", None)
+        try:
+            frozen_actual = set(_hardened_expected_tests(root))
+            frozen_expected = {
+                ("test_alias", "Parent", "test_inherited"),
+                ("test_alias", "Child", "test_inherited"),
+                ("test_alias", "Child", "test_child"),
+            }
+            base.require(
+                frozen_actual == frozen_expected,
+                "current-only module entered frozen TestCase enumeration",
+            )
+            os.environ["BLUE_FORGE_SUPERVISED_MARKER"] = "enumeration-selftest"
+            current_actual = set(_hardened_expected_tests(root))
+            current_expected = set(frozen_expected)
+            current_expected.add(("test_current_only", "CurrentOnly", "test_kernel_only"))
+            base.require(
+                current_actual == current_expected,
+                "current-only module was omitted from supervised current enumeration",
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("BLUE_FORGE_SUPERVISED_MARKER", None)
+            else:
+                os.environ["BLUE_FORGE_SUPERVISED_MARKER"] = previous
 
 
 def _self_test_exception_identity(python_bin, timeout_seconds, *, local_test=False):
@@ -462,7 +509,7 @@ def _self_test_exception_identity(python_bin, timeout_seconds, *, local_test=Fal
 
 
 def _self_test_transport_process_boundary(python_bin, timeout_seconds, *, local_test=False):
-    """Proposed frame walking must not reach worker-facing broker serialization."""
+    """Proposed code must not reach broker or executor response framing."""
     with tempfile.TemporaryDirectory(prefix="blue-forge-transport-selftest-") as temp:
         root = Path(temp)
         root.chmod(0o755)
@@ -470,6 +517,13 @@ def _self_test_transport_process_boundary(python_bin, timeout_seconds, *, local_
         (root / "blue_forge").mkdir()
         (root / "blue_forge/__init__.py").write_text(
             "import inspect\n"
+            "import __main__\n"
+            "def _forged(*args, **kwargs):\n"
+            " return None\n"
+            "try:\n"
+            " __main__._write_frame=_forged\n"
+            "except BaseException:\n"
+            " pass\n"
             "def probe():\n"
             " frame=inspect.currentframe().f_back\n"
             " while frame is not None:\n"
@@ -477,6 +531,8 @@ def _self_test_transport_process_boundary(python_bin, timeout_seconds, *, local_
             "  candidate=namespace.get('base')\n"
             "  if candidate is not None and hasattr(candidate,'_wire_dump'):\n"
             "   candidate._wire_dump=lambda value: b'{\\\"sequence\\\":1,\\\"ok\\\":true,\\\"value\\\":[\\\"data\\\",[\\\"scalar\\\",\\\"real\\\"]],\\\"states\\\":{}}'\n"
+            "  if '_write_frame' in namespace:\n"
+            "   namespace['_write_frame']=_forged\n"
             "  frame=frame.f_back\n"
             " return 'wrong'\n",
             encoding="utf-8",
@@ -507,7 +563,7 @@ def _self_test_transport_process_boundary(python_bin, timeout_seconds, *, local_
         except base.SupervisionFailure:
             return
         raise base.SupervisionFailure(
-            "proposed frame walk rewrote trusted broker observation"
+            "proposed code rewrote trusted broker/executor observation framing"
         )
 
 
