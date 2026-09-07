@@ -775,7 +775,12 @@ def main() -> int:
     if not support_path.is_file() or support_info.st_mode & 0o022:
         raise RuntimeError("trusted executor support is unavailable or writable")
     loads, dumps = marshal.loads, marshal.dumps
-    wire_in, wire_out = sys.stdin.buffer, sys.stdout.buffer
+    # TextIOWrapper owns and closes its binary buffer on finalization. Keep the
+    # owning streams alive for the whole transport loop, not just their buffers,
+    # while both public stdout names are redirected to diagnostics. The child
+    # still replaces the actual descriptors before importing proposed code.
+    transport_stdin, transport_stdout = sys.stdin, sys.stdout
+    wire_in, wire_out = transport_stdin.buffer, transport_stdout.buffer
     sys.stdout = sys.stderr
     sys.__stdout__ = sys.stderr
     application = _Application(root, support_path)
