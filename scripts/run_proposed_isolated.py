@@ -41,11 +41,11 @@ ACTOR_GRACEFUL_TEARDOWN_SECONDS = 3
 SUPERVISED_SECONDS = 180
 SUPERVISED_STORAGE_BYTES = 64 * 1024 * 1024
 SUPERVISED_STORAGE_INODES = 4096
-# The entire PR-controlled worker tree is no less constrained than one actor.
-# Nested actors reuse this verified aggregate cgroup, preserving the reviewed
-# 512 MiB / 64-task / 50%-CPU actor-wide ceilings.
+# The whole PR-controlled test tree retains the actor-strength memory and CPU
+# ceilings. Its task budget includes trusted supervisor/worker/helper machinery,
+# so it has bounded headroom beyond the standalone actor's 64-task cgroup.
 SUPERVISED_MEMORY_BYTES = ACTOR_MEMORY_BYTES
-SUPERVISED_TASKS = ACTOR_TASKS
+SUPERVISED_TASKS = 96
 SUPERVISED_CPU_QUOTA = ACTOR_CPU_QUOTA
 
 OUTPUT_BYTES = 1024 * 1024
@@ -224,9 +224,9 @@ def _bounded_parent_scope() -> bool:
     check(cpu and cpu[0] != "max" and int(cpu[0]) > 0,
           "parent aggregate CPU limit is not bounded")
     # For a 50% CPUQuota systemd writes quota/period <= 1/2. Verify that nested
-    # actors cannot inherit a looser aggregate CPU rate than their actor contract.
+    # actors cannot inherit a looser aggregate CPU rate than the supervised cap.
     check(len(cpu) == 2 and int(cpu[0]) * 2 <= int(cpu[1]),
-          "parent aggregate CPU quota exceeds actor ceiling")
+          "parent aggregate CPU quota exceeds supervised ceiling")
     return True
 
 
