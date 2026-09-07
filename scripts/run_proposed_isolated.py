@@ -406,12 +406,13 @@ def main() -> int:
             ]
 
         if mode == "supervised":
-            # Keep the capability bounding set available only so the single
-            # fixed sudo bind mount can invoke the constrained root helper.
-            # The unprivileged worker receives no effective/ambient capabilities.
+            # The cgroup is the aggregate task authority for the whole proposed
+            # worker tree. Do not duplicate that ceiling with RLIMIT_NPROC: that
+            # per-real-UID limit can reject a legitimate subprocess before the
+            # cgroup's descendant-wide TasksMax is reached.
             actor_command = [
                 "/usr/bin/prlimit",
-                "--as=536870912", "--cpu=120", "--nproc=64",
+                "--as=536870912", "--cpu=120",
                 "--fsize=16777216", "--nofile=256", "--core=0", "--",
                 "/usr/bin/setpriv",
                 f"--reuid={target.pw_uid}", f"--regid={target.pw_gid}", "--clear-groups",
