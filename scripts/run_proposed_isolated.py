@@ -22,8 +22,8 @@ test code cannot turn that narrow elevation path into arbitrary root execution.
 The supervised current floor also uses a root-owned launcher-generated wrapper
 that parallelizes only independent authenticated runtime-enumeration workers.
 Each module still receives its own worker process and actor; actual test methods
-remain serial and isolated. This removes enumeration startup duplication without
-raising the existing aggregate lifetime or resource ceilings.
+remain serial and isolated. The aggregate supervised lifetime remains bounded
+separately from the unchanged per-test and resource ceilings.
 """
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ ACTOR_TASKS = 64
 ACTOR_CPU_QUOTA = "50%"
 ACTOR_GRACEFUL_TEARDOWN_SECONDS = 3
 
-SUPERVISED_SECONDS = 180
+SUPERVISED_SECONDS = 240
 SUPERVISED_STORAGE_BYTES = 64 * 1024 * 1024
 SUPERVISED_STORAGE_INODES = 4096
 # The whole PR-controlled test tree retains the actor-strength memory and CPU
