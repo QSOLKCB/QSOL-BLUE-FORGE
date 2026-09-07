@@ -38,7 +38,7 @@ class CodexRoundSevenTests(unittest.TestCase):
         result = evaluate(case)
         fake = FakeHardeningResult(result.payload)
 
-        with self.assertRaisesRegex(ValidationError, "evaluator-issued HardeningResult"):
+        with self.assertRaisesRegex(ValidationError, "exact HardeningResult"):
             regression_record(case, fake)  # type: ignore[arg-type]
 
         record = regression_record(case, result)
