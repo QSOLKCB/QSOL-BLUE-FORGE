@@ -329,7 +329,15 @@ def _bf_process_one(raw):
     decoder = _bf_graph_decoder(request["nodes"], _bf_handles)
     arguments = [decoder.decode(value) for value in request["arguments"]]
     action = request["action"]
-    ok, observed, message = _bf_detached_execute(action, arguments)
+
+    # CLI orchestration is trusted code in this interpreter; the proposed CLI
+    # itself runs in a separate child process. Running the helper here avoids
+    # Python 3.12 DummyThread semantics without exposing response transport to
+    # proposed in-process Python frames.
+    if action == "cli":
+        ok, observed, message = _bf_execute_action(action, arguments)
+    else:
+        ok, observed, message = _bf_detached_execute(action, arguments)
 
     if ok:
         if action == "module":
@@ -360,8 +368,8 @@ def _bf_process_one(raw):
     _bf_require(_bf_len(payload) <= _BF_MAX_FRAME_BYTES,
                 "executor subinterpreter response exceeds byte budget")
 
-    # Raised only after the proposed frame has unwound and __main__ has been
-    # restored. Proposed exceptions were already converted to observation data.
+    # Raised only after any proposed in-process frame has unwound and __main__
+    # has been restored. Proposed exceptions were already converted to data.
     raise _bf_SystemExit(_BF_RESPONSE_PREFIX + payload.hex())
 
 
