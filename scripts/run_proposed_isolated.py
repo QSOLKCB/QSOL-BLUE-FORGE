@@ -41,9 +41,12 @@ ACTOR_GRACEFUL_TEARDOWN_SECONDS = 3
 SUPERVISED_SECONDS = 180
 SUPERVISED_STORAGE_BYTES = 64 * 1024 * 1024
 SUPERVISED_STORAGE_INODES = 4096
-SUPERVISED_MEMORY_BYTES = 768 * 1024 * 1024
-SUPERVISED_TASKS = 96
-SUPERVISED_CPU_QUOTA = "100%"
+# The entire PR-controlled worker tree is no less constrained than one actor.
+# Nested actors reuse this verified aggregate cgroup, preserving the reviewed
+# 512 MiB / 64-task / 50%-CPU actor-wide ceilings.
+SUPERVISED_MEMORY_BYTES = ACTOR_MEMORY_BYTES
+SUPERVISED_TASKS = ACTOR_TASKS
+SUPERVISED_CPU_QUOTA = ACTOR_CPU_QUOTA
 
 OUTPUT_BYTES = 1024 * 1024
 SYSTEMD_RUN = Path("/usr/bin/systemd-run")
@@ -220,6 +223,10 @@ def _bounded_parent_scope() -> bool:
           "parent aggregate task limit is not bounded")
     check(cpu and cpu[0] != "max" and int(cpu[0]) > 0,
           "parent aggregate CPU limit is not bounded")
+    # For a 50% CPUQuota systemd writes quota/period <= 1/2. Verify that nested
+    # actors cannot inherit a looser aggregate CPU rate than their actor contract.
+    check(len(cpu) == 2 and int(cpu[0]) * 2 <= int(cpu[1]),
+          "parent aggregate CPU quota exceeds actor ceiling")
     return True
 
 
@@ -404,7 +411,7 @@ def main() -> int:
             # The unprivileged worker receives no effective/ambient capabilities.
             actor_command = [
                 "/usr/bin/prlimit",
-                "--as=805306368", "--cpu=120", "--nproc=96",
+                "--as=536870912", "--cpu=120", "--nproc=64",
                 "--fsize=16777216", "--nofile=256", "--core=0", "--",
                 "/usr/bin/setpriv",
                 f"--reuid={target.pw_uid}", f"--regid={target.pw_gid}", "--clear-groups",
