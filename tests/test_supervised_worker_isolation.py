@@ -6,9 +6,11 @@ probes at import time, before unittest invokes the test method. That exercises
 the exact boundary identified in review: module-level code must already be in
 the aggregate cgroup/read-only filesystem/PID namespace.
 
-Ordinary local discovery and the independent direct-suite diagnostic skip this
-integration assertion because BLUE_FORGE_SUPERVISED_MARKER is intentionally
-present only in the supervised current-floor sandbox.
+This module is explicitly CURRENT_SUITE_ONLY. The baseline-owned supervisor
+includes it only when the governed supervised current-floor marker is present;
+it is never promoted into the frozen proposed-core oracle. Ordinary local
+discovery and the independent direct-suite diagnostic still discover the module
+but skip its kernel assertion because the marker is intentionally absent there.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ import sys
 import unittest
 
 
+CURRENT_SUITE_ONLY = True
 MARKER = os.environ.get("BLUE_FORGE_SUPERVISED_MARKER")
 WRITE_ERRNO = None
 CHILD_PID = None
