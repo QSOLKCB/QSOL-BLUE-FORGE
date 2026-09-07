@@ -5,17 +5,17 @@ The process main interpreter never imports proposed application code. It owns th
 broker-facing request/response framing and marshal codec. Proposed modules,
 objects, and object handles live in a persistent CPython subinterpreter.
 
-The Python 3.12 internal subinterpreter API supports immutable values passed into
-``run_string(..., shared=...)`` but does not expose the newer channel helpers on
-the hosted runner. Requests therefore enter the proposed interpreter as shared
-bytes. After a proposed operation has fully unwound, the private runner encodes a
-bounded observation and raises a reserved built-in ``SystemExit`` envelope. The
-main interpreter receives that envelope as ``RunFailedError``, validates its
-exact prefix/hex payload, reconstructs the final response, and performs the only
-broker-facing framing.
+Python 3.12 supplies immutable values to ``run_string(..., shared=...)``. Each
+request therefore enters the proposed subinterpreter as bounded marshal bytes.
+The proposed call itself runs on a detached native thread whose nearest Python
+ancestor uses transport-free globals. During that call, ``import __main__`` is
+bound to an inert module. The real run-string module is restored only after the
+proposed frame has unwound, and proposed thread creation is unavailable, so code
+under test cannot wait for that trusted module to reappear.
 
-Proposed imports cannot reach this module's ``__main__``, ``_write_frame``,
-request objects, captured ``marshal.dumps``, or broker-facing stdout framing.
+The private runner then emits a bounded observation through a reserved
+``SystemExit`` envelope. The main interpreter validates that envelope,
+constructs the final response, and performs the only broker-facing framing.
 """
 from __future__ import annotations
 
@@ -53,9 +53,9 @@ _BF_MAX_FRAME_BYTES = __MAX_FRAME_BYTES__
 _BF_MAX_OPERATIONS = __MAX_OPERATIONS__
 _BF_RESPONSE_PREFIX = __RESPONSE_PREFIX__
 
-# Capture immutable/built-in authorities before any proposed import.  The
-# operation function resolves these names from its own transport-free globals
-# rather than consulting a subsequently modified builtins module.
+# Capture trusted primitives before any proposed import. The detached operation
+# function resolves only these captured objects from its own transport-free
+# globals mapping.
 _bf_BaseException = BaseException
 _bf_RuntimeError = RuntimeError
 _bf_SystemExit = SystemExit
@@ -74,6 +74,19 @@ _bf_bytes = bytes
 _bf_dict = dict
 _bf_list = list
 _bf_any = any
+_bf_id = id
+_bf_hasattr = hasattr
+_bf_map = map
+_bf_deque = collections.deque
+_bf_partial = functools.partial
+_bf_methodcaller = operator.methodcaller
+_bf_start_new_thread = _thread.start_new_thread
+_bf_sleep = time.sleep
+_bf_marshal_loads = marshal.loads
+_bf_marshal_dumps = marshal.dumps
+_bf_modules = sys.modules
+_bf_actual_main = _bf_modules["__main__"]
+_bf_inert_main = types.ModuleType("__main__")
 
 _spec = importlib.util.spec_from_file_location(
     "_blue_forge_executor_support", _BF_SUPPORT_PATH
@@ -92,13 +105,19 @@ _bf_islice = _support.itertools.islice
 _bf_deepcopy = _support.copy.deepcopy
 _bf_replace = _support.dataclasses.replace
 _bf_import_module = _support.importlib.import_module
+_bf_temporary_directory = _support.tempfile.TemporaryDirectory
 
-# Do not leave runner-support or interpreter-control modules importable by the
-# code under test.  The actual run-string namespace is also hidden behind an
-# inert importable __main__ below.
-sys.modules.pop("_blue_forge_executor_support", None)
-sys.modules["_xxsubinterpreters"] = None
-sys.modules["gc"] = None
+# The support module retains any stdlib objects it needs. Remove straightforward
+# interpreter/thread/frame escape modules from the proposed import surface.
+_bf_modules.pop("_blue_forge_executor_support", None)
+_bf_modules["_xxsubinterpreters"] = None
+_bf_modules["gc"] = None
+_bf_modules["_thread"] = None
+_bf_modules.pop("threading", None)
+_bf_modules["ctypes"] = None
+_bf_modules["_ctypes"] = None
+if _bf_hasattr(sys, "_current_frames"):
+    sys._current_frames = None
 
 _BF_OPERATION_SOURCE = r'''
 def execute_action(action, arguments):
@@ -159,9 +178,6 @@ def execute_action(action, arguments):
         return (False, exc, message)
 '''
 
-# The proposed call's nearest Python ancestor is defined with this deliberately
-# transport-free globals mapping.  It contains no request/response serializer,
-# run-string envelope, broker stream, or interpreter-control object.
 _operation_globals = {
     "__builtins__": {},
     "BaseExceptionType": _bf_BaseException,
@@ -184,17 +200,11 @@ _operation_globals = {
     "root": _BF_ROOT,
     "python_executable": sys.executable,
     "run_cli_bounded": _bf_run_cli_bounded,
-    "TemporaryDirectory": tempfile.TemporaryDirectory,
+    "TemporaryDirectory": _bf_temporary_directory,
     "PathType": Path,
 }
 exec(compile(_BF_OPERATION_SOURCE, "<blue-forge-proposed-operation>", "exec"), _operation_globals)
 _bf_execute_action = _operation_globals["execute_action"]
-
-# Proposed ``import __main__`` receives only this inert module, never the actual
-# run-string namespace where observation encoding is retained.
-sys.modules["__main__"] = types.ModuleType("__main__")
-if hasattr(sys, "_current_frames"):
-    sys._current_frames = None
 
 sys.path.insert(0, _bf_str(_BF_ROOT))
 os.chdir(_BF_ROOT)
@@ -209,13 +219,22 @@ _bf_operations = 0
 
 
 def _bf_detached_execute(action, arguments):
-    outcomes = collections.deque()
-    invocation = functools.partial(_bf_execute_action, action, arguments)
-    calls = map(operator.methodcaller("__call__"), (invocation,))
-    target = operator.methodcaller("extend", calls)
-    _thread.start_new_thread(target, (outcomes,))
-    while not outcomes:
-        time.sleep(0.001)
+    outcomes = _bf_deque()
+    invocation = _bf_partial(_bf_execute_action, action, arguments)
+    calls = _bf_map(_bf_methodcaller("__call__"), (invocation,))
+    target = _bf_methodcaller("extend", calls)
+
+    # The importable __main__ is inert for the entire lifetime of proposed
+    # Python execution. The real run-string module returns only after the
+    # detached frame has fully unwound.
+    _bf_modules["__main__"] = _bf_inert_main
+    try:
+        _bf_start_new_thread(target, (outcomes,))
+        while not outcomes:
+            _bf_sleep(0.001)
+    finally:
+        _bf_modules["__main__"] = _bf_actual_main
+
     if _bf_len(outcomes) != 1:
         raise _bf_RuntimeError("detached executor produced an invalid outcome count")
     outcome = outcomes.popleft()
@@ -233,7 +252,7 @@ def _bf_result(value):
         return ["data", _bf_encode_data(value)]
     if _bf_type(value) is _bf_tuple:
         return ["tuple", [_bf_result(item) for item in value]]
-    oid = id(value)
+    oid = _bf_id(value)
     if oid not in _bf_identities:
         _bf_require(_bf_len(_bf_handles) < _bf_max_nodes, "executor handle budget exceeded")
         handle = _bf_len(_bf_handles)
@@ -245,7 +264,7 @@ def _bf_result(value):
 
 def _bf_capture_exports():
     global _bf_exported_validation, _bf_exported_blue
-    package = sys.modules.get("blue_forge")
+    package = _bf_modules.get("blue_forge")
     if package is None:
         return
     namespace = _bf_object.__getattribute__(package, "__dict__")
@@ -285,7 +304,7 @@ def _bf_process_one(raw):
     _bf_require(_bf_type(raw) is _bf_bytes and _bf_len(raw) <= _BF_MAX_FRAME_BYTES,
                 "invalid executor subinterpreter request")
     try:
-        request = marshal.loads(raw)
+        request = _bf_marshal_loads(raw)
     except (EOFError, TypeError, ValueError) as exc:
         raise _bf_RuntimeError("malformed executor subinterpreter request") from exc
 
@@ -325,17 +344,18 @@ def _bf_process_one(raw):
                 _bf_object.__getattribute__(decoder.cache[key], "__dict__")
             )
     observation["states"] = states
-    payload = marshal.dumps(observation, 4)
+    payload = _bf_marshal_dumps(observation, 4)
     _bf_require(_bf_len(payload) <= _BF_MAX_FRAME_BYTES,
                 "executor subinterpreter response exceeds byte budget")
 
-    # This reserved exception is raised only after the proposed frame has fully
-    # unwound.  Proposed exceptions are data in `observation` and cannot escape
-    # this function to impersonate the return envelope.
+    # Raised only after the proposed frame has unwound and __main__ has been
+    # restored. Proposed exceptions were already converted to observation data.
     raise _bf_SystemExit(_BF_RESPONSE_PREFIX + payload.hex())
 
 
-if hasattr(sys.modules["__main__"], "_write_frame"):
+if _bf_modules.get("__main__") is not _bf_actual_main:
+    raise _bf_RuntimeError("executor subinterpreter main module was not preserved")
+if _bf_hasattr(_bf_inert_main, "_write_frame"):
     raise _bf_RuntimeError("proposed subinterpreter exposes executor transport module")
 """
 
@@ -488,8 +508,8 @@ def main() -> int:
             else:
                 raise RuntimeError("proposed subinterpreter omitted response envelope")
 
-            # The final response and the only broker-facing binary frame are
-            # constructed in the interpreter that never imported proposed code.
+            # Final response construction and broker-facing framing occur only
+            # in this interpreter, which never imported proposed application code.
             response = _response_from_observation(request["sequence"], observation)
             _write_frame(wire_out, response, dumps)
         raise RuntimeError("executor operation budget exceeded")
