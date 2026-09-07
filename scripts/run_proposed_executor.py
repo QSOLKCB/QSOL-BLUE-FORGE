@@ -302,7 +302,7 @@ def main() -> int:
             response = {
                 "sequence": request["sequence"],
                 "ok": True,
-                "value": ["data", encode_data(observed)] if action == "export" else result(observed),
+                "value": ["data", encode_data(encode_data(observed))] if action == "export" else result(observed),
             }
         else:
             response = {
