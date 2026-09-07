@@ -107,6 +107,18 @@ _bf_replace = _support.dataclasses.replace
 _bf_import_module = _support.importlib.import_module
 _bf_temporary_directory = _support.tempfile.TemporaryDirectory
 
+# Python 3.12 isolated subinterpreters reject daemon threads. The trusted CLI
+# output-drain helper only needs joinable reader threads and already joins them
+# before returning, so adapt that helper without exposing thread creation to
+# proposed imports.
+_bf_thread_type = _support.threading.Thread
+
+def _bf_joinable_thread(*args, **kwargs):
+    kwargs["daemon"] = False
+    return _bf_thread_type(*args, **kwargs)
+
+_support.threading.Thread = _bf_joinable_thread
+
 # The support module retains any stdlib objects it needs. Remove straightforward
 # interpreter/thread/frame escape modules from the proposed import surface.
 _bf_modules.pop("_blue_forge_executor_support", None)
