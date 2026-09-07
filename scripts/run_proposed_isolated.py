@@ -210,24 +210,31 @@ def _cgroup_path() -> Path:
 
 
 def _bounded_parent_scope() -> bool:
-    """Honor parent-scope reuse only after independently verifying its limits."""
-    if os.environ.get("BLUE_FORGE_PARENT_AGGREGATE") != "1":
-        return False
+    """Reuse an already-bounded parent based only on trusted kernel state."""
     group = _cgroup_path()
     memory = (group / "memory.max").read_text(encoding="ascii").strip()
     pids = (group / "pids.max").read_text(encoding="ascii").strip()
     cpu = (group / "cpu.max").read_text(encoding="ascii").split()
-    check(memory != "max" and int(memory) <= SUPERVISED_MEMORY_BYTES,
-          "parent aggregate memory limit is not bounded")
-    check(pids != "max" and int(pids) <= SUPERVISED_TASKS,
-          "parent aggregate task limit is not bounded")
-    check(cpu and cpu[0] != "max" and int(cpu[0]) > 0,
-          "parent aggregate CPU limit is not bounded")
-    # For a 50% CPUQuota systemd writes quota/period <= 1/2. Verify that nested
-    # actors cannot inherit a looser aggregate CPU rate than the supervised cap.
-    check(len(cpu) == 2 and int(cpu[0]) * 2 <= int(cpu[1]),
-          "parent aggregate CPU quota exceeds supervised ceiling")
-    return True
+
+    # An ordinary hosted-runner/service cgroup is normally looser or unbounded.
+    # In that case create our own fixed scope below. A nested helper launched
+    # from the supervised suite, however, is already in the verified aggregate
+    # and must remain there regardless of caller-controlled environment changes.
+    if memory == "max" or pids == "max" or not cpu or cpu[0] == "max":
+        return False
+    try:
+        memory_limit = int(memory)
+        pids_limit = int(pids)
+        quota, period = (int(value) for value in cpu)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("malformed cgroup v2 resource limits") from exc
+    check(memory_limit > 0 and pids_limit > 0 and quota > 0 and period > 0,
+          "invalid cgroup v2 resource limits")
+    return (
+        memory_limit <= SUPERVISED_MEMORY_BYTES
+        and pids_limit <= SUPERVISED_TASKS
+        and quota * 2 <= period
+    )
 
 
 def scoped(
@@ -239,8 +246,9 @@ def scoped(
     cpu_quota: str,
 ) -> list[str]:
     # Nested actor helpers launched by a sandboxed current-test worker remain in
-    # the already-verified parent aggregate cgroup. They still create their own
-    # PID/mount/network namespace and keep per-process prlimits.
+    # the already-verified parent aggregate cgroup. Containment is derived from
+    # live cgroup state, never an environment variable the test can unset. They
+    # still create their own PID/mount/network namespace and keep prlimits.
     if _bounded_parent_scope():
         return command
     check(SYSTEMD_RUN.is_file() and SYSTEMCTL.is_file(),
@@ -423,7 +431,6 @@ def main() -> int:
                 f"LD_LIBRARY_PATH={python_bin.parent.parent / 'lib'}",
                 f"BLUE_FORGE_RPC_HELPER={FIXED_HELPER}",
                 f"BLUE_FORGE_ISOLATED_TMPDIR={home}",
-                "BLUE_FORGE_PARENT_AGGREGATE=1",
                 "BLUE_FORGE_SUPERVISED_SANDBOX=1",
                 f"BLUE_FORGE_SUPERVISED_MARKER={marker}",
                 *proposed_command,
