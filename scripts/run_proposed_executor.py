@@ -476,14 +476,22 @@ def _bf_capture_exports():
     namespace = _bf_object.__getattribute__(package, "__dict__")
     validation = namespace.get("ValidationError")
     blue = namespace.get("BlueForgeError")
-    _bf_require(
-        _bf_named_exception(blue, "BlueForgeError"),
-        "proposed BlueForgeError export has an invalid exception hierarchy",
-    )
-    _bf_require(
-        _bf_named_exception(validation, "ValidationError", blue),
-        "proposed ValidationError export has an invalid exception hierarchy",
-    )
+
+    # A minimal proposed package may export neither exception. In that case it
+    # gains no exception-classification authority. Partial surfaces are allowed
+    # only for compatibility with trusted boundary fixtures and each present
+    # class must independently prove the expected BLUE-FORGE identity.
+    if blue is not None:
+        _bf_require(
+            _bf_named_exception(blue, "BlueForgeError"),
+            "proposed BlueForgeError export has an invalid exception hierarchy",
+        )
+    if validation is not None:
+        _bf_require(
+            _bf_named_exception(validation, "ValidationError", blue),
+            "proposed ValidationError export has an invalid exception hierarchy",
+        )
+
     _bf_exported_blue = blue
     _bf_exported_validation = validation
 
