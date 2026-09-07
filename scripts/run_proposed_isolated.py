@@ -1,18 +1,19 @@
 #!/usr/bin/python3 -I
 """Root-owned fixed launcher for bounded proposed-code execution.
 
-The launcher creates an aggregate systemd cgroup plus private mount/PID/network
-namespaces before proposed Python starts.  The cgroup bounds memory, task count,
-and aggregate CPU rate across the complete descendant tree.  The namespace
-provides a read-only host view, one bounded disposable writable tmpfs, and
-lifecycle teardown that also catches detached descendants.
+The launcher creates aggregate cgroup and private mount/PID/network boundaries
+before proposed Python starts. Three fixed modes are supported:
 
-Two fixed modes are supported:
+* actor mode: isolated application actor for the trusted RPC supervisor;
+* direct-suite mode: ordinary unittest discovery under bounded diagnostics;
+* supervised-suite mode: the complete PR-controlled test-worker tree, including
+  test-module import/top-level code, inside an aggregate resource/filesystem
+  boundary while retaining access only to the fixed nested actor helper.
 
-* actor mode, used by the trusted RPC supervisor and tied to its private FIFO;
-* direct-suite mode, used for the mandated ordinary unittest discovery pass.
-
-No proposed Python runs with elevated authority.
+No proposed Python runs with elevated authority. In supervised-suite mode the
+filesystem is recursively read-only and nosuid except for an isolated bind mount
+of /usr/bin/sudo. Sudo policy permits only this fixed launcher, so PR-controlled
+test code cannot turn that narrow elevation path into arbitrary root execution.
 """
 from __future__ import annotations
 
@@ -34,17 +35,22 @@ ACTOR_STORAGE_BYTES = 32 * 1024 * 1024
 ACTOR_STORAGE_INODES = 1024
 ACTOR_MEMORY_BYTES = 512 * 1024 * 1024
 ACTOR_TASKS = 64
-# Fifty percent of one CPU for at most 35 wall-clock seconds bounds aggregate
-# descendant CPU below the existing 20 CPU-second per-process ceiling.
 ACTOR_CPU_QUOTA = "50%"
-DIRECT_OUTPUT_BYTES = 1024 * 1024
+
+SUPERVISED_SECONDS = 180
+SUPERVISED_STORAGE_BYTES = 64 * 1024 * 1024
+SUPERVISED_STORAGE_INODES = 4096
+SUPERVISED_MEMORY_BYTES = 768 * 1024 * 1024
+SUPERVISED_TASKS = 96
+SUPERVISED_CPU_QUOTA = "100%"
+
+OUTPUT_BYTES = 1024 * 1024
 SYSTEMD_RUN = Path("/usr/bin/systemd-run")
 SYSTEMCTL = Path("/usr/bin/systemctl")
+FIXED_HELPER = Path("/usr/local/libexec/blue-forge-rpc")
 
-# This fixed code runs with the system interpreter (-I -S) only after unshare
-# creates private mount/PID/network namespaces, and before proposed imports.
-# mount_setattr changes per-mount attributes, not the host superblock's flags.
-# There is deliberately no fallback to a writable host tree.
+# Actor/direct setup: all host mounts become read-only+nosuid, followed by one
+# private writable tmpfs owned by the unprivileged target.
 FILESYSTEM_SETUP = r'''
 import ctypes
 import os
@@ -79,19 +85,78 @@ def checked(rc, operation):
         raise OSError(error, operation + ": " + os.strerror(error))
 
 os.chdir("/")
-# MS_REC | MS_PRIVATE prevents propagation back into the runner namespace.
 checked(mount(None, b"/", None, (1 << 14) | (1 << 18), None), "private mount tree")
-# AT_FDCWD, AT_RECURSIVE; MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID.
-attributes = MountAttr(1 | 2, 0, 0, 0)
+attributes = MountAttr(1 | 2, 0, 0, 0)  # RDONLY | NOSUID
 checked(mount_setattr(-100, b"/", 0x8000, ctypes.byref(attributes),
                      ctypes.sizeof(attributes)), "recursive read-only mount tree")
-# One aggregate byte/inode budget for every actor and detached descendant.
-# MS_NOSUID | MS_NODEV | MS_NOEXEC. The underlying host directory stays empty.
 options = f"size={size},nr_inodes={inodes},mode=0700,uid={uid},gid={gid}".encode("ascii")
 checked(mount(b"tmpfs", os.fsencode(home), b"tmpfs", 2 | 4 | 8, options), "private actor tmpfs")
-# Restore the validated materialized source root after mount setup.  unittest
-# discovery and repository tests intentionally resolve fixtures relative to it.
 os.chdir(workdir)
+os.execv(command[0], command)
+'''
+
+# Current-suite worker setup. The source/test trees and all host temporary paths
+# are read-only. One root-owned sticky tmpfs is writable. A worker-owned HOME is
+# created beneath it. /usr/bin/sudo alone is isolated as its own mount before the
+# recursive NOSUID operation and then has only NOSUID cleared, leaving it read-
+# only. No other setuid/file-capability path is reopened.
+SUPERVISED_FILESYSTEM_SETUP = r'''
+import ctypes
+import os
+import stat
+import sys
+
+if os.geteuid() != 0 or os.getpid() != 1:
+    raise RuntimeError("supervised setup requires the private namespace init")
+scratch, uid, gid, size, inodes, workdir = sys.argv[1:7]
+command = sys.argv[7:]
+if not command or command[0] != "/usr/bin/prlimit":
+    raise RuntimeError("invalid fixed supervised command")
+if not os.path.isabs(workdir) or not os.path.isdir(workdir):
+    raise RuntimeError("invalid supervised working directory")
+if not stat.S_ISREG(os.stat("/usr/bin/sudo", follow_symlinks=False).st_mode):
+    raise RuntimeError("fixed sudo executable is unavailable")
+libc = ctypes.CDLL(None, use_errno=True)
+
+class MountAttr(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in
+                ("attr_set", "attr_clr", "propagation", "userns_fd")]
+
+mount_setattr = libc.mount_setattr
+mount_setattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+                         ctypes.POINTER(MountAttr), ctypes.c_size_t]
+mount_setattr.restype = ctypes.c_int
+mount = libc.mount
+mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                  ctypes.c_ulong, ctypes.c_void_p]
+mount.restype = ctypes.c_int
+
+def checked(rc, operation):
+    if rc != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, operation + ": " + os.strerror(error))
+
+os.chdir("/")
+checked(mount(None, b"/", None, (1 << 14) | (1 << 18), None), "private mount tree")
+# MS_BIND: give sudo a dedicated mount so NOSUID can be restored nowhere else.
+checked(mount(b"/usr/bin/sudo", b"/usr/bin/sudo", None, 1 << 12, None), "isolate fixed sudo mount")
+attributes = MountAttr(1 | 2, 0, 0, 0)  # RDONLY | NOSUID
+checked(mount_setattr(-100, b"/", 0x8000, ctypes.byref(attributes),
+                     ctypes.sizeof(attributes)), "recursive read-only nosuid mount tree")
+# Clear only MOUNT_ATTR_NOSUID on the exact sudo bind mount. RDONLY remains.
+sudo_attributes = MountAttr(0, 2, 0, 0)
+checked(mount_setattr(-100, b"/usr/bin/sudo", 0, ctypes.byref(sudo_attributes),
+                     ctypes.sizeof(sudo_attributes)), "enable fixed sudo mount")
+# Root-owned sticky aggregate scratch prevents the worker from replacing a
+# root-created nested-actor mountpoint even though both share the same tmpfs.
+options = f"size={size},nr_inodes={inodes},mode=1777,uid=0,gid=0".encode("ascii")
+checked(mount(b"tmpfs", os.fsencode(scratch), b"tmpfs", 2 | 4 | 8, options), "private supervised tmpfs")
+worker_home = os.path.join(scratch, "worker-home")
+os.mkdir(worker_home, 0o700)
+os.chown(worker_home, int(uid), int(gid))
+os.chdir(workdir)
+# Replace placeholders after mount setup so the worker sees namespace-local paths.
+command = [worker_home if item == "@WORKER_HOME@" else item for item in command]
 os.execv(command[0], command)
 '''
 
@@ -117,7 +182,6 @@ def stop(process: subprocess.Popen) -> None:
 
 
 def stop_scope(unit: str) -> None:
-    """Kill the complete aggregate cgroup and retire the transient scope."""
     for command in (
         [str(SYSTEMCTL), "kill", "--kill-whom=all", "--signal=KILL", unit],
         [str(SYSTEMCTL), "stop", unit],
@@ -133,8 +197,44 @@ def stop_scope(unit: str) -> None:
         )
 
 
-def scoped(command: list[str], unit: str) -> list[str]:
-    """Wrap a namespace command in one aggregate cgroup budget."""
+def _cgroup_path() -> Path:
+    for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines():
+        if line.startswith("0::"):
+            relative = line[3:]
+            return Path("/sys/fs/cgroup") / relative.lstrip("/")
+    raise RuntimeError("cgroup v2 membership is unavailable")
+
+
+def _bounded_parent_scope() -> bool:
+    """Honor parent-scope reuse only after independently verifying its limits."""
+    if os.environ.get("BLUE_FORGE_PARENT_AGGREGATE") != "1":
+        return False
+    group = _cgroup_path()
+    memory = (group / "memory.max").read_text(encoding="ascii").strip()
+    pids = (group / "pids.max").read_text(encoding="ascii").strip()
+    cpu = (group / "cpu.max").read_text(encoding="ascii").split()
+    check(memory != "max" and int(memory) <= SUPERVISED_MEMORY_BYTES,
+          "parent aggregate memory limit is not bounded")
+    check(pids != "max" and int(pids) <= SUPERVISED_TASKS,
+          "parent aggregate task limit is not bounded")
+    check(cpu and cpu[0] != "max" and int(cpu[0]) > 0,
+          "parent aggregate CPU limit is not bounded")
+    return True
+
+
+def scoped(
+    command: list[str],
+    unit: str,
+    *,
+    memory_bytes: int,
+    tasks: int,
+    cpu_quota: str,
+) -> list[str]:
+    # Nested actor helpers launched by a sandboxed current-test worker remain in
+    # the already-verified parent aggregate cgroup. They still create their own
+    # PID/mount/network namespace and keep per-process prlimits.
+    if _bounded_parent_scope():
+        return command
     check(SYSTEMD_RUN.is_file() and SYSTEMCTL.is_file(),
           "aggregate cgroup controller is unavailable")
     check(Path("/sys/fs/cgroup/cgroup.controllers").is_file(),
@@ -142,21 +242,21 @@ def scoped(command: list[str], unit: str) -> list[str]:
     return [
         str(SYSTEMD_RUN), "--system", "--scope", "--quiet",
         f"--unit={unit}",
-        "-p", f"MemoryMax={ACTOR_MEMORY_BYTES}",
+        "-p", f"MemoryMax={memory_bytes}",
         "-p", "MemorySwapMax=0",
-        "-p", f"TasksMax={ACTOR_TASKS}",
-        "-p", f"CPUQuota={ACTOR_CPU_QUOTA}",
+        "-p", f"TasksMax={tasks}",
+        "-p", f"CPUQuota={cpu_quota}",
         "--",
         *command,
     ]
 
 
-def direct_drain(stream, retained: bytearray, overflow: threading.Event) -> None:
+def bounded_drain(stream, retained: bytearray, overflow: threading.Event) -> None:
     try:
         while chunk := stream.read(8192):
-            if len(retained) + len(chunk) > DIRECT_OUTPUT_BYTES:
+            if len(retained) + len(chunk) > OUTPUT_BYTES:
                 overflow.set()
-                remaining = max(0, DIRECT_OUTPUT_BYTES - len(retained))
+                remaining = max(0, OUTPUT_BYTES - len(retained))
                 if remaining:
                     retained.extend(chunk[:remaining])
             elif not overflow.is_set():
@@ -165,18 +265,42 @@ def direct_drain(stream, retained: bytearray, overflow: threading.Event) -> None
         stream.close()
 
 
+def _secure_scratch_parent() -> Path:
+    parent = Path(os.environ.get("BLUE_FORGE_ISOLATED_TMPDIR", "/tmp"))
+    check(parent.is_absolute() and parent.is_dir() and not parent.is_symlink(),
+          "isolated scratch parent is invalid")
+    info = parent.stat()
+    check(info.st_uid == 0 and info.st_mode & stat.S_ISVTX and info.st_mode & 0o002,
+          "isolated scratch parent must be root-owned sticky writable storage")
+    return parent
+
+
 def parse_invocation():
-    direct = len(sys.argv) >= 2 and sys.argv[1] == "--direct-suite"
-    if direct:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--direct-suite":
         check(len(sys.argv) == 4, "direct suite requires Python and source root")
-        return True, Path(sys.argv[2]), None, Path(sys.argv[3]), None
-    check(len(sys.argv) == 5, "expected root launcher and four path arguments")
-    return False, Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4])
+        return "direct", Path(sys.argv[2]), None, Path(sys.argv[3]), None
+    if len(sys.argv) >= 2 and sys.argv[1] == "--supervised-suite":
+        check(len(sys.argv) == 5,
+              "supervised suite requires Python, supervisor, and source root")
+        return "supervised", Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), None
+    check(len(sys.argv) == 5, "expected root launcher and four actor path arguments")
+    return "actor", Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4])
+
+
+def _live_marker(marker: str) -> bool:
+    encoded = marker.encode("ascii")
+    for path in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            if encoded in path.read_bytes().split(b"\x00"):
+                return True
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+    return False
 
 
 def main() -> int:
     check(os.geteuid() == 0, "expected root launcher")
-    direct, python_bin, supervisor, source_root, control_path = parse_invocation()
+    mode, python_bin, supervisor, source_root, control_path = parse_invocation()
     paths = [python_bin, source_root]
     if supervisor is not None:
         paths.append(supervisor)
@@ -198,22 +322,23 @@ def main() -> int:
     check(caller in permitted, "launcher caller is not an authorized test worker")
     check(rpc.pw_uid not in permitted and rpc.pw_uid != 0,
           "actor UID must be distinct and unprivileged")
-    tests_dir = source_root / "tests" if direct else None
-    if direct:
+
+    tests_dir = source_root / "tests" if mode in {"direct", "supervised"} else None
+    if mode in {"direct", "supervised"}:
         check(caller == current_user.pw_uid,
-              "direct proposed suite is restricted to blueforge-current")
+              f"{mode} proposed suite is restricted to blueforge-current")
         root_info = source_root.stat()
         check(root_info.st_uid == 0 and not root_info.st_mode & 0o022,
-              "direct suite source root must be root-owned and non-writable")
+              f"{mode} suite source root must be root-owned and non-writable")
         check(tests_dir.is_dir() and not tests_dir.is_symlink(),
-              "direct suite tests directory is unavailable")
+              f"{mode} suite tests directory is unavailable")
         tests_info = tests_dir.stat()
         check(tests_info.st_uid == 0 and not tests_info.st_mode & 0o022,
-              "direct suite tests directory must be root-owned and non-writable")
+              f"{mode} suite tests directory must be root-owned and non-writable")
 
     control = None
     selector = selectors.DefaultSelector()
-    if not direct:
+    if mode == "actor":
         control = os.open(
             control_path,
             os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -227,14 +352,19 @@ def main() -> int:
         )
         selector.register(control, selectors.EVENT_READ)
 
-    target = current_user if direct else rpc
-    home = Path(tempfile.mkdtemp(prefix="blue-forge-actor-home-", dir="/tmp"))
+    target = rpc if mode == "actor" else current_user
+    parent = _secure_scratch_parent()
+    home = Path(tempfile.mkdtemp(prefix="blue-forge-isolated-home-", dir=parent))
     process = None
     reader = None
     retained = bytearray()
     overflow = threading.Event()
     unit = f"blue-forge-proposed-{os.getpid()}-{time.monotonic_ns()}.scope"
     interrupted = []
+    marker = (
+        f"blue-forge-supervised-child-{os.getpid()}-{time.monotonic_ns()}"
+        if mode == "supervised" else None
+    )
 
     def interrupted_by(signum, frame):
         interrupted.append(signum)
@@ -244,73 +374,117 @@ def main() -> int:
 
     try:
         home.chmod(0o700)
-        if direct:
+        if mode == "direct":
             proposed_command = [
                 str(python_bin), "-m", "unittest", "discover",
                 "-s", str(tests_dir), "-v",
+            ]
+        elif mode == "supervised":
+            proposed_command = [
+                str(python_bin), "-I", str(supervisor),
+                "--root", str(source_root), "--python", str(python_bin),
             ]
         else:
             proposed_command = [
                 str(python_bin), "-I", str(supervisor), "--actor-root", str(source_root)
             ]
 
-        actor_command = [
-            "/usr/bin/prlimit",
-            "--as=536870912", "--cpu=20", "--nproc=64",
-            "--fsize=16777216", "--nofile=128", "--core=0", "--",
-            "/usr/bin/setpriv",
-            f"--reuid={target.pw_uid}", f"--regid={target.pw_gid}", "--clear-groups",
-            "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
-            "--no-new-privs", "--pdeathsig=KILL", "--",
-            "/usr/bin/env", "-i",
-            f"HOME={home}", f"TMPDIR={home}", "PATH=/usr/bin:/bin",
-            "LANG=C.UTF-8", "PYTHONDONTWRITEBYTECODE=1",
-            f"LD_LIBRARY_PATH={python_bin.parent.parent / 'lib'}",
-        ]
-        if direct:
-            # The helper is exercised by the earlier supervised current-floor
-            # integration test.  A no-suid direct sandbox cannot recursively sudo
-            # the root helper, so make that duplicate diagnostic test skip exactly
-            # as it does in ordinary environments without the installed helper.
-            actor_command.append("BLUE_FORGE_RPC_HELPER=/nonexistent")
-        actor_command.extend(proposed_command)
+        if mode == "supervised":
+            # Keep the capability bounding set available only so the single
+            # fixed sudo bind mount can invoke the constrained root helper.
+            # The unprivileged worker receives no effective/ambient capabilities.
+            actor_command = [
+                "/usr/bin/prlimit",
+                "--as=805306368", "--cpu=120", "--nproc=96",
+                "--fsize=16777216", "--nofile=256", "--core=0", "--",
+                "/usr/bin/setpriv",
+                f"--reuid={target.pw_uid}", f"--regid={target.pw_gid}", "--clear-groups",
+                "--inh-caps=-all", "--ambient-caps=-all", "--pdeathsig=KILL", "--",
+                "/usr/bin/env", "-i",
+                "HOME=@WORKER_HOME@", f"TMPDIR={home}", "PATH=/usr/bin:/bin",
+                "LANG=C.UTF-8", "PYTHONDONTWRITEBYTECODE=1",
+                f"LD_LIBRARY_PATH={python_bin.parent.parent / 'lib'}",
+                f"BLUE_FORGE_RPC_HELPER={FIXED_HELPER}",
+                f"BLUE_FORGE_ISOLATED_TMPDIR={home}",
+                "BLUE_FORGE_PARENT_AGGREGATE=1",
+                "BLUE_FORGE_SUPERVISED_SANDBOX=1",
+                f"BLUE_FORGE_SUPERVISED_MARKER={marker}",
+                *proposed_command,
+            ]
+            setup = SUPERVISED_FILESYSTEM_SETUP
+            storage_bytes = SUPERVISED_STORAGE_BYTES
+            storage_inodes = SUPERVISED_STORAGE_INODES
+            memory_bytes = SUPERVISED_MEMORY_BYTES
+            tasks = SUPERVISED_TASKS
+            cpu_quota = SUPERVISED_CPU_QUOTA
+            lifetime = SUPERVISED_SECONDS
+        else:
+            actor_command = [
+                "/usr/bin/prlimit",
+                "--as=536870912", "--cpu=20", "--nproc=64",
+                "--fsize=16777216", "--nofile=128", "--core=0", "--",
+                "/usr/bin/setpriv",
+                f"--reuid={target.pw_uid}", f"--regid={target.pw_gid}", "--clear-groups",
+                "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
+                "--no-new-privs", "--pdeathsig=KILL", "--",
+                "/usr/bin/env", "-i",
+                f"HOME={home}", f"TMPDIR={home}", "PATH=/usr/bin:/bin",
+                "LANG=C.UTF-8", "PYTHONDONTWRITEBYTECODE=1",
+                f"LD_LIBRARY_PATH={python_bin.parent.parent / 'lib'}",
+            ]
+            if mode == "direct":
+                actor_command.append("BLUE_FORGE_RPC_HELPER=/nonexistent")
+            actor_command.extend(proposed_command)
+            setup = FILESYSTEM_SETUP
+            storage_bytes = ACTOR_STORAGE_BYTES
+            storage_inodes = ACTOR_STORAGE_INODES
+            memory_bytes = ACTOR_MEMORY_BYTES
+            tasks = ACTOR_TASKS
+            cpu_quota = ACTOR_CPU_QUOTA
+            lifetime = ACTOR_SECONDS
 
         namespace_command = [
             "/usr/bin/setpriv", "--pdeathsig=KILL", "--",
             "/usr/bin/unshare", "--mount", "--propagation", "private",
             "--pid", "--fork", "--kill-child=KILL", "--mount-proc", "--net", "--",
-            "/usr/bin/python3", "-I", "-S", "-c", FILESYSTEM_SETUP,
+            "/usr/bin/python3", "-I", "-S", "-c", setup,
             str(home), str(target.pw_uid), str(target.pw_gid),
-            str(ACTOR_STORAGE_BYTES), str(ACTOR_STORAGE_INODES), str(source_root),
+            str(storage_bytes), str(storage_inodes), str(source_root),
             *actor_command,
         ]
-        command = scoped(namespace_command, unit)
+        command = scoped(
+            namespace_command,
+            unit,
+            memory_bytes=memory_bytes,
+            tasks=tasks,
+            cpu_quota=cpu_quota,
+        )
         popen_kwargs = {
             "cwd": source_root,
             "start_new_session": True,
             "env": {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
         }
-        if direct:
+        if mode in {"direct", "supervised"}:
             popen_kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         process = subprocess.Popen(command, **popen_kwargs)
-        if direct:
+        if mode in {"direct", "supervised"}:
             reader = threading.Thread(
-                target=direct_drain, args=(process.stdout, retained, overflow), daemon=True
+                target=bounded_drain, args=(process.stdout, retained, overflow), daemon=True
             )
             reader.start()
 
-        deadline = time.monotonic() + ACTOR_SECONDS
+        deadline = time.monotonic() + lifetime
         while process.poll() is None:
             if interrupted:
                 return 128 + interrupted[0]
             if overflow.is_set():
-                print("isolated_direct_suite=FAIL reason=output budget exceeded", file=sys.stderr)
+                print(f"isolated_{mode}_suite=FAIL reason=output budget exceeded", file=sys.stderr)
                 return 125
             if time.monotonic() >= deadline:
-                label = "isolated_direct_suite" if direct else "isolated_actor"
+                label = "isolated_actor" if mode == "actor" else f"isolated_{mode}_suite"
                 print(f"{label}=FAIL reason=lifetime budget exceeded", file=sys.stderr)
                 return 124
-            if not direct:
+            if mode == "actor":
                 for _key, _mask in selector.select(0.05):
                     data = os.read(control, 1)
                     check(data == b"", "worker lifeline carried unexpected data")
@@ -318,22 +492,20 @@ def main() -> int:
             else:
                 time.sleep(0.05)
 
-        if direct:
+        if mode in {"direct", "supervised"}:
             if reader is not None:
                 reader.join(timeout=3)
-                check(not reader.is_alive(), "direct-suite output drain did not terminate")
+                check(not reader.is_alive(), f"{mode}-suite output drain did not terminate")
             sys.stdout.buffer.write(bytes(retained))
             sys.stdout.buffer.flush()
             if overflow.is_set():
-                print("isolated_direct_suite=FAIL reason=output budget exceeded", file=sys.stderr)
+                print(f"isolated_{mode}_suite=FAIL reason=output budget exceeded", file=sys.stderr)
                 return 125
             if process.returncode == 0:
-                print("isolated_direct_suite=PASS")
+                print(f"isolated_{mode}_suite=PASS")
             return process.returncode if process.returncode >= 0 else 128 - process.returncode
         return process.returncode if process.returncode >= 0 else 128 - process.returncode
     finally:
-        # The transient scope is the aggregate authority for descendant cleanup.
-        # Stop it even if the namespace leader or systemd-run wrapper has exited.
         stop_scope(unit)
         if process is not None:
             try:
@@ -346,12 +518,23 @@ def main() -> int:
         if control is not None:
             os.close(control)
         shutil.rmtree(home, ignore_errors=False)
+        if marker is not None:
+            deadline = time.monotonic() + 5
+            while _live_marker(marker) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            check(not _live_marker(marker),
+                  "detached proposed test descendant survived supervised sandbox teardown")
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        label = "isolated_direct_suite" if len(sys.argv) > 1 and sys.argv[1] == "--direct-suite" else "isolated_actor"
+        if len(sys.argv) > 1 and sys.argv[1] == "--direct-suite":
+            label = "isolated_direct_suite"
+        elif len(sys.argv) > 1 and sys.argv[1] == "--supervised-suite":
+            label = "isolated_supervised_suite"
+        else:
+            label = "isolated_actor"
         print(f"{label}=FAIL reason={str(exc)!r}", file=sys.stderr)
         raise SystemExit(1)

@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """Trusted hardening entrypoint for the frozen-test supervisor.
 
-The transport implementation is retained in a private sibling module.  This
+The transport implementation is retained in a private sibling module. This
 entrypoint installs load-bearing fail-closed fixes before every supervisor,
-worker, and actor mode, then makes child processes re-enter this file.
+worker, and actor mode. Worker-facing actor framing is owned by a broker process
+that never imports proposed application code; proposed objects live in a
+separate executor child within the same kernel sandbox.
 """
 from __future__ import annotations
 
 import ast
 import importlib.util
+import marshal
 import os
 from pathlib import Path
+import signal
+import stat
+import subprocess
 import sys
 import tempfile
 import types
 
 
 _IMPL = Path(__file__).with_name("_run_frozen_tests_supervised_impl.py")
+_EXECUTOR = Path(__file__).with_name("run_proposed_executor.py")
 _spec = importlib.util.spec_from_file_location("_blue_forge_supervisor_impl", _IMPL)
 if _spec is None or _spec.loader is None:
     raise RuntimeError("trusted supervisor implementation is unavailable")
@@ -27,146 +34,122 @@ _spec.loader.exec_module(base)
 base.__file__ = str(Path(__file__).resolve())
 
 
-def _exception_key(exc, exported_validation, exported_blue):
-    """Classify by actual class identity/MRO, never by mutable class name."""
-    cls = type(exc)
-    mro = type.__getattribute__(cls, "__mro__")
-    if exported_validation is not None and any(item is exported_validation for item in mro):
-        return "blue_forge.ValidationError"
-    if exported_blue is not None and any(item is exported_blue for item in mro):
-        return "blue_forge.BlueForgeError"
-    builtins = {
-        AssertionError: "builtins.AssertionError",
-        AttributeError: "builtins.AttributeError",
-        TypeError: "builtins.TypeError",
-        ValueError: "builtins.ValueError",
-        KeyError: "builtins.KeyError",
-        StopIteration: "builtins.StopIteration",
-        RuntimeError: "builtins.RuntimeError",
-    }
-    return builtins.get(cls)
+def _read_exact(stream, count):
+    chunks = bytearray()
+    while len(chunks) < count:
+        chunk = stream.read(count - len(chunks))
+        if not chunk:
+            raise base.SupervisionFailure("proposed executor channel closed")
+        chunks.extend(chunk)
+    return bytes(chunks)
 
 
-def _hardened_actor(root):
-    """Actor transport with exported-exception identity preserved explicitly."""
+def _send_executor(stream, value):
+    payload = marshal.dumps(value, 4)
+    base.require(
+        len(payload) <= base.MAX_FRAME_BYTES,
+        "proposed executor request byte budget exceeded",
+    )
+    stream.write(len(payload).to_bytes(8, "big"))
+    stream.write(payload)
+    stream.flush()
+
+
+def _recv_executor(stream):
+    header = _read_exact(stream, 8)
+    size = int.from_bytes(header, "big")
+    base.require(
+        0 <= size <= base.MAX_FRAME_BYTES,
+        "proposed executor response byte budget exceeded",
+    )
+    try:
+        return marshal.loads(_read_exact(stream, size))
+    except (EOFError, TypeError, ValueError) as exc:
+        raise base.SupervisionFailure("malformed proposed executor response") from exc
+
+
+def _stop_executor(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        process.kill()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        raise base.SupervisionFailure("proposed executor did not terminate") from exc
+
+
+def _broker_actor(root):
+    """Broker worker RPC without importing proposed code in this interpreter."""
     root = root.resolve()
-    sys.path.insert(0, str(root))
-    os.chdir(root)
+    info = _EXECUTOR.lstat()
+    base.require(
+        stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
+        "proposed executor must be a root-owned non-writable regular file",
+    )
+
     wire_in, wire_out = sys.stdin.buffer, sys.stdout.buffer
     sys.stdout = sys.stderr
-    handles = {}
-    identities = {}
-    exported_validation = None
-    exported_blue = None
+    process = subprocess.Popen(
+        [sys.executable, "-I", str(_EXECUTOR), str(root)],
+        cwd=root,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=None,
+        start_new_session=True,
+        bufsize=0,
+    )
+    try:
+        for _number in range(base.MAX_OPERATIONS):
+            raw = wire_in.readline(base.MAX_FRAME_BYTES + 2)
+            if not raw:
+                return
+            base.require(
+                len(raw) <= base.MAX_FRAME_BYTES + 1 and raw.endswith(b"\n"),
+                "oversized actor request",
+            )
+            request = base._wire_load(raw[:-1])
+            base.require(type(request) is dict, "actor request is not an object")
+            sequence = request.get("sequence")
+            base.require(type(sequence) is int, "actor request sequence is invalid")
 
-    def result(value):
-        if value is None or type(value) in (str, bytes, int, float, bool):
-            return ["data", base._encode_data(value)]
-        if type(value) is tuple:
-            return ["tuple", [result(v) for v in value]]
-        oid = id(value)
-        if oid not in identities:
-            base.require(len(handles) < base.MAX_GRAPH_NODES, "actor handle budget exceeded")
-            handle = len(handles)
-            identities[oid] = handle
-            handles[handle] = value
-        return ["handle", [identities[oid], type(value).__name__]]
-
-    def capture_exports():
-        nonlocal exported_validation, exported_blue
-        package = sys.modules.get("blue_forge")
-        if package is None:
-            return
-        namespace = object.__getattribute__(package, "__dict__")
-        validation = namespace.get("ValidationError")
-        blue = namespace.get("BlueForgeError")
-        if type(validation) is type:
-            exported_validation = validation
-        if type(blue) is type:
-            exported_blue = blue
-
-    for _number in range(base.MAX_OPERATIONS):
-        raw = wire_in.readline(base.MAX_FRAME_BYTES + 2)
-        if not raw:
-            return
-        base.require(
-            len(raw) <= base.MAX_FRAME_BYTES + 1 and raw.endswith(b"\n"),
-            "oversized actor request",
-        )
-        request = base._wire_load(raw[:-1])
-        decoder = base._GraphDecoder(request["nodes"], handles)
-        arguments = [decoder.decode(v) for v in request["arguments"]]
-        action = request["action"]
-        try:
-            if action == "module":
-                value = base.importlib.import_module(arguments[0])
-                capture_exports()
-            elif action == "getattr":
-                value = getattr(*arguments)
-            elif action == "setattr":
-                value = setattr(*arguments)
-            elif action == "delattr":
-                value = delattr(*arguments)
-            elif action == "call":
-                function, args, kwargs = arguments
-                value = function(*args, **kwargs)
-            elif action == "getitem":
-                value = arguments[0][arguments[1]]
-            elif action == "setitem":
-                arguments[0][arguments[1]] = arguments[2]
-                value = None
-            elif action == "delitem":
-                del arguments[0][arguments[1]]
-                value = None
-            elif action == "truth":
-                value = bool(arguments[0])
-            elif action == "len":
-                value = len(arguments[0])
-            elif action == "iterate":
-                items = tuple(base.itertools.islice(iter(arguments[0]), base.MAX_GRAPH_NODES + 1))
-                base.require(len(items) <= base.MAX_GRAPH_NODES, "actor iteration budget exceeded")
-                value = items
-            elif action == "next":
-                value = next(arguments[0])
-            elif action == "deepcopy":
-                value = base.copy.deepcopy(arguments[0])
-            elif action == "replace":
-                value = base.dataclasses.replace(arguments[0], **arguments[1])
-            elif action == "object_setattr":
-                value = object.__setattr__(*arguments)
-            elif action == "export":
-                value = base._encode_data(arguments[0])
-            elif action == "cli":
-                cli_args, case_bytes, environment = arguments
-                with tempfile.TemporaryDirectory() as temp:
-                    path = Path(temp) / "case.json"
-                    path.write_bytes(case_bytes)
-                    command = [sys.executable, "-m", "blue_forge", cli_args[0], str(path)]
-                    value = base._run_cli_bounded(command, root, environment)
+            _send_executor(process.stdin, request)
+            response = _recv_executor(process.stdout)
+            base.require(type(response) is dict, "executor response is not an object")
+            base.require(
+                response.get("sequence") == sequence,
+                "executor response sequence mismatch",
+            )
+            base.require(
+                type(response.get("ok")) is bool
+                and type(response.get("states")) is dict,
+                "malformed executor response",
+            )
+            if response["ok"]:
+                base.require("value" in response, "executor success omitted value")
             else:
-                raise base.SupervisionFailure("unknown actor operation")
-            response = {
-                "sequence": request["sequence"],
-                "ok": True,
-                "value": ["data", base._encode_data(value)] if action == "export" else result(value),
-            }
-        except BaseException as exc:
-            response = {
-                "sequence": request["sequence"],
-                "ok": False,
-                "error": _exception_key(exc, exported_validation, exported_blue),
-                "message": str(exc),
-            }
-        states = {}
-        for key in request.get("sync", []):
-            if key in decoder.cache:
-                states[str(key)] = base._encode_data(
-                    object.__getattribute__(decoder.cache[key], "__dict__")
+                base.require(
+                    "error" in response and type(response.get("message")) is str,
+                    "executor failure omitted identity",
                 )
-        response["states"] = states
-        wire_out.write(base._wire_dump(response) + b"\n")
-        wire_out.flush()
-    raise base.SupervisionFailure("actor operation budget exceeded")
+
+            # This is the only worker-facing response serialization path.  The
+            # proposed interpreter is a different process and cannot replace the
+            # broker's codec, response object, handles, or call-frame globals.
+            wire_out.write(base._wire_dump(response) + b"\n")
+            wire_out.flush()
+        raise base.SupervisionFailure("actor operation budget exceeded")
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        _stop_executor(process)
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 def _hardened_request(self, action, *arguments):
@@ -283,9 +266,6 @@ def _hardened_expected_tests(root):
             elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 assignments.append((node.targets[0].id, node.value))
 
-        # Resolve simple aliases such as Base = unittest.TestCase and
-        # Alias = LocalTestCase.  Anything dynamic remains unsupported rather
-        # than being silently omitted from the protected floor.
         changed = True
         while changed:
             changed = False
@@ -320,8 +300,6 @@ def _hardened_expected_tests(root):
         def local_bases(node):
             refs = [_base_ref(item, unittest_aliases, symbols, classes) for item in node.bases]
             if any(kind == "unknown" for kind, _ in refs):
-                # Unknown imported/dynamic bases can contribute tests or alter
-                # discovery.  A protected TestCase must not silently proceed.
                 if any(
                     isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
                     and item.name.startswith("test")
@@ -362,7 +340,7 @@ def _hardened_expected_tests(root):
         for name, node in classes.items():
             if not is_testcase(name):
                 continue
-            local_bases(node)  # validates unknown bases even with no own tests
+            local_bases(node)
             for method_name in sorted(methods(name)):
                 tests.append((path.stem, name, method_name))
 
@@ -438,6 +416,56 @@ def _self_test_exception_identity(python_bin, timeout_seconds, *, local_test=Fal
         raise base.SupervisionFailure("unrelated same-name exception satisfied ValidationError")
 
 
+def _self_test_transport_process_boundary(python_bin, timeout_seconds, *, local_test=False):
+    """Proposed frame walking must not reach worker-facing broker serialization."""
+    with tempfile.TemporaryDirectory(prefix="blue-forge-transport-selftest-") as temp:
+        root = Path(temp)
+        root.chmod(0o755)
+        (root / "tests").mkdir()
+        (root / "blue_forge").mkdir()
+        (root / "blue_forge/__init__.py").write_text(
+            "import inspect\n"
+            "def probe():\n"
+            " frame=inspect.currentframe().f_back\n"
+            " while frame is not None:\n"
+            "  namespace=frame.f_globals\n"
+            "  candidate=namespace.get('base')\n"
+            "  if candidate is not None and hasattr(candidate,'_wire_dump'):\n"
+            "   candidate._wire_dump=lambda value: b'{\\\"sequence\\\":1,\\\"ok\\\":true,\\\"value\\\":[\\\"data\\\",[\\\"scalar\\\",\\\"real\\\"]],\\\"states\\\":{}}'\n"
+            "  frame=frame.f_back\n"
+            " return 'wrong'\n",
+            encoding="utf-8",
+        )
+        (root / "tests/test_transport.py").write_text(
+            "import unittest\n"
+            "from blue_forge import probe\n"
+            "class Transport(unittest.TestCase):\n"
+            " def test_truth(self): self.assertEqual(probe(), 'wrong')\n"
+            " def test_forgery_fails(self): self.assertEqual(probe(), 'real')\n",
+            encoding="utf-8",
+        )
+        base.run_one(
+            root,
+            python_bin,
+            ("test_transport", "Transport", "test_truth"),
+            timeout_seconds,
+            local_test=local_test,
+        )
+        try:
+            base.run_one(
+                root,
+                python_bin,
+                ("test_transport", "Transport", "test_forgery_fails"),
+                timeout_seconds,
+                local_test=local_test,
+            )
+        except base.SupervisionFailure:
+            return
+        raise base.SupervisionFailure(
+            "proposed frame walk rewrote trusted broker observation"
+        )
+
+
 _original_self_test = base._self_test
 
 
@@ -447,15 +475,18 @@ def _combined_self_test(python_bin, timeout_seconds, *, local_test=False):
     _self_test_exception_identity(
         python_bin, timeout_seconds, local_test=local_test
     )
+    _self_test_transport_process_boundary(
+        python_bin, timeout_seconds, local_test=local_test
+    )
 
 
-base._actor = _hardened_actor
+base._actor = _broker_actor
 base._Bridge.request = _hardened_request
 base.expected_tests = _hardened_expected_tests
 base._self_test = _combined_self_test
 
-# Actor-side proposed imports must not recover this entrypoint's patch globals
-# through the ordinary importable __main__ module.
+# The broker imports no proposed module, but keep its importable __main__ inert so
+# application code in descendants never gains a stable reference to this wrapper.
 if "--actor-root" in sys.argv:
     sys.modules["__main__"] = types.ModuleType("__main__")
 
