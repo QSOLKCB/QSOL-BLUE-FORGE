@@ -20,6 +20,8 @@ STORAGE_BYTES = 32 * 1024 * 1024
 STORAGE_INODES = 1024
 MEMORY_BYTES = 512 * 1024 * 1024
 TASKS_MAX = 64
+SUPERVISED_TASKS_MAX = 96
+SUPERVISED = os.environ.get("BLUE_FORGE_SUPERVISED_SANDBOX") == "1"
 
 
 def _cgroup_v2_path() -> Path:
@@ -126,7 +128,12 @@ class ActorFilesystemTests(unittest.TestCase):
             cgroup = result["cgroup"]
             self.assertEqual(cgroup["memory_max"], str(MEMORY_BYTES))
             self.assertEqual(cgroup["memory_swap_max"], "0")
-            self.assertEqual(cgroup["pids_max"], str(TASKS_MAX))
+            # A standalone actor owns its 64-task cgroup. During the supervised
+            # current-floor pass, nested actors deliberately reuse the already
+            # verified parent aggregate, whose extra headroom is for trusted
+            # supervisor/worker machinery, not additional application authority.
+            expected_tasks = SUPERVISED_TASKS_MAX if SUPERVISED else TASKS_MAX
+            self.assertEqual(cgroup["pids_max"], str(expected_tasks))
             quota, period = cgroup["cpu_max"].split()
             self.assertNotEqual(quota, "max")
             self.assertGreater(int(quota), 0)
