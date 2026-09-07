@@ -38,6 +38,7 @@ jobs:
             schemas/blue-forge-hardening-meta-v1.schema.json \
             fixtures/v1/path-traversal-case.json \
             scripts/run_frozen_tests_supervised.py \
+            scripts/_run_frozen_tests_supervised_round1.py \
             scripts/_run_frozen_tests_supervised_impl.py \
             scripts/run_proposed_executor.py \
             scripts/run_proposed_isolated.py; do
@@ -45,6 +46,21 @@ jobs:
             current="$(git ls-tree HEAD -- "$path" | awk '{print $1 " " $2 " " $3}')"
             test -n "$baseline"
             test "$current" = "$baseline"
+          done
+
+          # The governed materializer intentionally supports only root-level
+          # tests/test*.py modules. Fail closed before audit if either the
+          # protected baseline or proposed HEAD contains a nested regression
+          # module that would otherwise be protected but omitted at runtime.
+          for ref in "$BLUE_FORGE_TRUSTED_REF" HEAD; do
+            nested="$(
+              git ls-tree -r --name-only "$ref" -- tests |
+              awk -F/ 'NF > 2 && $NF ~ /^test.*\.py$/ { print; exit }'
+            )"
+            if test -n "$nested"; then
+              echo "nested regression test path is unsupported by governed floor: $nested" >&2
+              exit 1
+            fi
           done
 
       - name: Set up Python
@@ -59,6 +75,7 @@ jobs:
           trusted_auditor="/tmp/blue-forge-trusted-audit-${GITHUB_RUN_ID}.py"
           trusted_runner_dir="/tmp/blue-forge-trusted-runner-${GITHUB_RUN_ID}"
           trusted_supervisor="$trusted_runner_dir/run_frozen_tests_supervised.py"
+          trusted_supervisor_round1="$trusted_runner_dir/_run_frozen_tests_supervised_round1.py"
           trusted_supervisor_impl="$trusted_runner_dir/_run_frozen_tests_supervised_impl.py"
           trusted_executor="$trusted_runner_dir/run_proposed_executor.py"
           trusted_launcher="/tmp/blue-forge-trusted-actor-launcher-${GITHUB_RUN_ID}.py"
@@ -66,18 +83,19 @@ jobs:
           mkdir -p "$trusted_runner_dir"
           git show "${BLUE_FORGE_TRUSTED_REF}:scripts/audit_constitution.py" > "$trusted_auditor"
           git show "${BLUE_FORGE_TRUSTED_REF}:scripts/run_frozen_tests_supervised.py" > "$trusted_supervisor"
+          git show "${BLUE_FORGE_TRUSTED_REF}:scripts/_run_frozen_tests_supervised_round1.py" > "$trusted_supervisor_round1"
           git show "${BLUE_FORGE_TRUSTED_REF}:scripts/_run_frozen_tests_supervised_impl.py" > "$trusted_supervisor_impl"
           git show "${BLUE_FORGE_TRUSTED_REF}:scripts/run_proposed_executor.py" > "$trusted_executor"
           git show "${BLUE_FORGE_TRUSTED_REF}:scripts/run_proposed_isolated.py" > "$trusted_launcher"
           python3 -m py_compile \
-            "$trusted_auditor" "$trusted_supervisor" "$trusted_supervisor_impl" \
-            "$trusted_executor" "$trusted_launcher"
+            "$trusted_auditor" "$trusted_supervisor" "$trusted_supervisor_round1" \
+            "$trusted_supervisor_impl" "$trusted_executor" "$trusted_launcher"
           rm -rf "$trusted_runner_dir/__pycache__"
           sudo chown root:root "$trusted_auditor" "$trusted_launcher"
           sudo chown -R root:root "$trusted_runner_dir"
           sudo chmod 0444 \
             "$trusted_auditor" "$trusted_launcher" "$trusted_supervisor" \
-            "$trusted_supervisor_impl" "$trusted_executor"
+            "$trusted_supervisor_round1" "$trusted_supervisor_impl" "$trusted_executor"
           sudo chmod 0555 "$trusted_runner_dir"
           sudo install -d -m 0755 /usr/local/libexec
           sudo install -o root -g root -m 0555 "$trusted_launcher" /usr/local/libexec/blue-forge-rpc
@@ -160,8 +178,6 @@ jobs:
             sudo useradd --system --no-create-home --shell /usr/sbin/nologin "$user"
           done
           # Only the fixed root-owned launcher is delegated, never arbitrary sudo.
-          # The current-suite worker may preserve only two helper-internal values;
-          # the launcher independently validates both before relying on them.
           printf '%s\n' \
             'Defaults:blueforge-current env_keep += "BLUE_FORGE_ISOLATED_TMPDIR BLUE_FORGE_PARENT_AGGREGATE"' \
             'blueforge-test ALL=(root) NOPASSWD: /usr/local/libexec/blue-forge-rpc *' \
