@@ -8,9 +8,10 @@ objects, and object handles live in a persistent CPython subinterpreter.
 Python 3.12 supplies immutable values to ``run_string(..., shared=...)``. Each
 request therefore enters the proposed subinterpreter as bounded marshal bytes.
 In-process proposed calls run on a detached native thread whose nearest Python
-ancestor uses transport-free globals. Before the first proposed frame executes,
-that thread installs a Linux seccomp filter that irreversibly denies thread and
-process creation. During the call, ``import __main__`` is bound to an inert
+ancestor uses transport-free globals. A CPython audit hook installed before any
+proposed import makes sensitive bootstrap modules non-reimportable and rejects
+every ``_thread.start_new_thread`` event except the one exact detached target the
+trusted runner arms. During each call, ``import __main__`` is bound to an inert
 module. The real run-string module is restored only after the proposed frame has
 unwound, so proposed code cannot park a background thread and wait for trusted
 response state to reappear.
@@ -37,7 +38,6 @@ from __future__ import annotations
 
 import builtins
 import collections
-import ctypes
 import functools
 import importlib.util
 import marshal
@@ -91,9 +91,8 @@ _bf_marshal_dumps = marshal.dumps
 _bf_modules = sys.modules
 _bf_actual_main = _bf_modules["__main__"]
 _bf_inert_main = types.ModuleType("__main__")
-_bf_hard_exit = os._exit
-_bf_strerror = os.strerror
-_bf_machine = os.uname().machine
+_bf_os_read = os.read
+_bf_set_blocking = os.set_blocking
 
 _spec = importlib.util.spec_from_file_location(
     "_blue_forge_executor_support", _BF_SUPPORT_PATH
@@ -105,7 +104,6 @@ _spec.loader.exec_module(_support)
 
 _bf_graph_decoder = _support._GraphDecoder
 _bf_encode_data = _support._encode_data
-_bf_run_cli_bounded = _support._run_cli_bounded
 _bf_require = _support.require
 _bf_max_nodes = _support.MAX_GRAPH_NODES
 _bf_islice = _support.itertools.islice
@@ -113,130 +111,103 @@ _bf_deepcopy = _support.copy.deepcopy
 _bf_replace = _support.dataclasses.replace
 _bf_import_module = _support.importlib.import_module
 _bf_temporary_directory = _support.tempfile.TemporaryDirectory
+_bf_Popen = _support.subprocess.Popen
+_bf_PIPE = _support.subprocess.PIPE
+_bf_DefaultSelector = _support.selectors.DefaultSelector
+_bf_EVENT_READ = _support.selectors.EVENT_READ
+_bf_kill_group = _support._kill_group
 
-# Python 3.12 isolated subinterpreters reject daemon threads. The trusted CLI
-# output-drain helper only needs joinable reader threads and already joins them
-# before returning, so adapt that helper without exposing thread creation to
-# proposed imports.
-_bf_thread_type = _support.threading.Thread
+# The trusted CLI path cannot use threading after the audit boundary is armed.
+# Drain its two pipes in one thread with selectors instead. The proposed CLI is
+# still a separate process inside the actor namespace, and output/lifetime are
+# bounded before any bytes are returned to the trusted test worker.
+def _bf_run_cli_bounded(command, root, environment):
+    process = _bf_Popen(
+        command,
+        cwd=root,
+        env=environment,
+        start_new_session=True,
+        stdout=_bf_PIPE,
+        stderr=_bf_PIPE,
+    )
+    outputs = [bytearray(), bytearray()]
+    streams = (process.stdout, process.stderr)
+    selector = _bf_DefaultSelector()
+    deadline = _bf_monotonic() + 10.0
+    try:
+        for index, stream in enumerate(streams):
+            _bf_set_blocking(stream.fileno(), False)
+            selector.register(stream, _bf_EVENT_READ, index)
+        while selector.get_map():
+            remaining = deadline - _bf_monotonic()
+            if remaining <= 0:
+                raise _bf_RuntimeError("CLI lifetime budget exceeded")
+            for key, _mask in selector.select(min(0.05, remaining)):
+                try:
+                    chunk = _bf_os_read(key.fileobj.fileno(), 8192)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                destination = outputs[key.data]
+                if _bf_len(destination) + _bf_len(chunk) > _BF_MAX_FRAME_BYTES:
+                    raise _bf_RuntimeError("CLI output budget exceeded")
+                destination.extend(chunk)
+        remaining = deadline - _bf_monotonic()
+        if remaining <= 0:
+            raise _bf_RuntimeError("CLI lifetime budget exceeded")
+        rc = process.wait(timeout=remaining)
+        return rc, _bf_bytes(outputs[0]), _bf_bytes(outputs[1])
+    finally:
+        _bf_kill_group(process)
+        selector.close()
+        for stream in streams:
+            if stream is not None and not stream.closed:
+                stream.close()
 
-def _bf_joinable_thread(*args, **kwargs):
-    kwargs["daemon"] = False
-    return _bf_thread_type(*args, **kwargs)
 
-_support.threading.Thread = _bf_joinable_thread
+# Audit hooks cannot be removed through Python's public API. The closure owns an
+# immutable blocked-import set plus one ephemeral exact callable permission. A
+# trusted detached launch consumes that permission in the audit callback before
+# the new thread begins. Any thread start reached by proposed Python, including
+# through a recovered preloaded threading/_thread object, has no permission and
+# is rejected before CPython calls the native thread API.
+def _bf_make_execution_guard(blocked, error_type):
+    allowed = [None]
 
-# An audit hook makes the sensitive bootstrap modules non-reimportable after
-# they are removed/sentinelized below. Audit hooks have no Python API for
-# removal. The immutable blocked-name set and exception type are closure-owned,
-# not kept in the importable proposed __main__ namespace.
-def _bf_make_import_guard(blocked, error_type):
+    def arm(target):
+        if allowed[0] is not None:
+            raise error_type("executor thread permission is already armed")
+        allowed[0] = target
+
     def guard(event, args):
         if event == "import" and args and type(args[0]) is str and args[0] in blocked:
             raise error_type("executor bootstrap module import is blocked")
-    return guard
+        if event == "_thread.start_new_thread":
+            target = args[0] if args else None
+            if target is not allowed[0]:
+                raise error_type("proposed thread creation is blocked")
+            allowed[0] = None
 
-_bf_import_guard = _bf_make_import_guard(
+    return arm, guard
+
+_bf_arm_thread_start, _bf_execution_guard = _bf_make_execution_guard(
     frozenset({
         "_thread", "threading", "ctypes", "_ctypes", "gc",
         "_xxsubinterpreters", "_testcapi", "_testinternalcapi",
     }),
     _bf_RuntimeError,
 )
-sys.addaudithook(_bf_import_guard)
-del _bf_import_guard, _bf_make_import_guard
-
-# Per-thread seccomp is the irreversible boundary behind the import guard. It is
-# installed only on each detached proposed-call thread, so the trusted run-string
-# thread can still launch the separately isolated CLI subprocess. A proposed
-# import may not create threads/processes even if it somehow recovers a low-level
-# start primitive: clone/clone3/fork/vfork fail with EPERM in the kernel.
-_bf_c_ushort = ctypes.c_ushort
-_bf_c_ubyte = ctypes.c_ubyte
-_bf_c_uint32 = ctypes.c_uint32
-_bf_c_ushort_len = ctypes.c_ushort
-_bf_c_int = ctypes.c_int
-_bf_c_ulong = ctypes.c_ulong
-_bf_POINTER = ctypes.POINTER
-_bf_Structure = ctypes.Structure
-_bf_cast = ctypes.cast
-_bf_addressof = ctypes.addressof
-_bf_get_errno = ctypes.get_errno
-_bf_libc = ctypes.CDLL(None, use_errno=True)
-_bf_prctl = _bf_libc.prctl
-_bf_prctl.argtypes = [_bf_c_int, _bf_c_ulong, _bf_c_ulong, _bf_c_ulong, _bf_c_ulong]
-_bf_prctl.restype = _bf_c_int
-
-class _BfSockFilter(_bf_Structure):
-    _fields_ = [
-        ("code", _bf_c_ushort),
-        ("jt", _bf_c_ubyte),
-        ("jf", _bf_c_ubyte),
-        ("k", _bf_c_uint32),
-    ]
-
-class _BfSockFprog(_bf_Structure):
-    _fields_ = [
-        ("len", _bf_c_ushort_len),
-        ("filter", _bf_POINTER(_BfSockFilter)),
-    ]
-
-if _bf_machine in {"x86_64", "amd64"}:
-    _BF_AUDIT_ARCH = 0xC000003E
-    _BF_BLOCKED_SYSCALLS = (
-        56, 57, 58, 435,
-        0x40000000 | 56, 0x40000000 | 57,
-        0x40000000 | 58, 0x40000000 | 435,
-    )
-elif _bf_machine in {"aarch64", "arm64"}:
-    _BF_AUDIT_ARCH = 0xC00000B7
-    _BF_BLOCKED_SYSCALLS = (220, 435)
-else:
-    raise _bf_RuntimeError("unsupported architecture for proposed-call seccomp")
+sys.addaudithook(_bf_execution_guard)
+del _bf_execution_guard, _bf_make_execution_guard
 
 
-def _bf_install_proposed_seccomp():
-    try:
-        # BPF: verify audit architecture, load syscall number, then return EPERM
-        # for every process/thread creation syscall and ALLOW otherwise.
-        instructions = [
-            _BfSockFilter(0x20, 0, 0, 4),                    # LD W ABS arch
-            _BfSockFilter(0x15, 1, 0, _BF_AUDIT_ARCH),       # JEQ arch
-            _BfSockFilter(0x06, 0, 0, 0x80000000),           # KILL_PROCESS
-            _BfSockFilter(0x20, 0, 0, 0),                    # LD W ABS nr
-        ]
-        for syscall_number in _BF_BLOCKED_SYSCALLS:
-            instructions.append(_BfSockFilter(0x15, 0, 1, syscall_number))
-            instructions.append(_BfSockFilter(0x06, 0, 0, 0x00050000 | 1))  # ERRNO EPERM
-        instructions.append(_BfSockFilter(0x06, 0, 0, 0x7FFF0000))  # ALLOW
-        array_type = _BfSockFilter * _bf_len(instructions)
-        program_array = array_type(*instructions)
-        program = _BfSockFprog(
-            _bf_len(instructions),
-            _bf_cast(program_array, _bf_POINTER(_BfSockFilter)),
-        )
-        # PR_SET_NO_NEW_PRIVS=38; PR_SET_SECCOMP=22; SECCOMP_MODE_FILTER=2.
-        if _bf_prctl(38, 1, 0, 0, 0) != 0:
-            raise _bf_RuntimeError(
-                "cannot set no_new_privs for proposed-call seccomp: "
-                + _bf_strerror(_bf_get_errno())
-            )
-        if _bf_prctl(22, 2, _bf_addressof(program), 0, 0) != 0:
-            raise _bf_RuntimeError(
-                "cannot install proposed-call seccomp: "
-                + _bf_strerror(_bf_get_errno())
-            )
-        return None
-    except _bf_BaseException:
-        # Never execute proposed Python if the irreversible boundary cannot be
-        # established. Killing this isolated executor makes the supervisor fail.
-        _bf_hard_exit(120)
-
-
-# Mandatory bootstrap proof: on this runner/architecture, a thread with the
-# proposed-call filter must be unable to create a second native Python thread.
-def _bf_seccomp_self_test(destination):
-    _bf_install_proposed_seccomp()
+# Mandatory bootstrap proof of the load-bearing audit event. The outer thread
+# start is explicitly armed by trusted code; an unarmed nested start from that
+# thread must be rejected by the same CPython audit hook proposed code faces.
+def _bf_thread_guard_self_test(destination):
     try:
         _bf_start_new_thread(_bf_sleep, (0.01,))
     except _bf_BaseException:
@@ -244,18 +215,20 @@ def _bf_seccomp_self_test(destination):
     else:
         destination.append(False)
 
-_bf_seccomp_probe = _bf_deque()
-_bf_start_new_thread(_bf_seccomp_self_test, (_bf_seccomp_probe,))
-_bf_seccomp_deadline = _bf_monotonic() + 2.0
-while not _bf_seccomp_probe and _bf_monotonic() < _bf_seccomp_deadline:
+_bf_thread_guard_probe = _bf_deque()
+_bf_arm_thread_start(_bf_thread_guard_self_test)
+_bf_start_new_thread(_bf_thread_guard_self_test, (_bf_thread_guard_probe,))
+_bf_thread_guard_deadline = _bf_monotonic() + 2.0
+while not _bf_thread_guard_probe and _bf_monotonic() < _bf_thread_guard_deadline:
     _bf_sleep(0.001)
-if not _bf_seccomp_probe or _bf_seccomp_probe.popleft() is not True:
-    raise _bf_RuntimeError("proposed-call seccomp self-test failed")
-del _bf_seccomp_self_test, _bf_seccomp_probe, _bf_seccomp_deadline
+if not _bf_thread_guard_probe or _bf_thread_guard_probe.popleft() is not True:
+    raise _bf_RuntimeError("proposed thread audit self-test failed")
+del _bf_thread_guard_self_test, _bf_thread_guard_probe, _bf_thread_guard_deadline
 
-# The support module retains any stdlib objects it needs. These sentinels are
-# defense in depth only; the audit hook prevents pop-and-reimport, and seccomp
-# is the load-bearing irreversible thread/process boundary for proposed calls.
+# Remove straightforward interpreter/thread/frame escape modules from the
+# proposed import surface. These sentinels are defense in depth; the registered
+# audit hook is the irreversible Python-level boundary that prevents pop and
+# re-import as well as any unarmed native thread start.
 _bf_modules.pop("_blue_forge_executor_support", None)
 _bf_modules["_xxsubinterpreters"] = None
 _bf_modules["gc"] = None
@@ -267,8 +240,6 @@ _bf_modules["_testcapi"] = None
 _bf_modules["_testinternalcapi"] = None
 if _bf_hasattr(sys, "_current_frames"):
     sys._current_frames = None
-
-del ctypes
 
 _BF_OPERATION_SOURCE = r'''
 def execute_action(action, arguments):
@@ -372,30 +343,24 @@ _bf_operations = 0
 def _bf_detached_execute(action, arguments):
     outcomes = _bf_deque()
     invocation = _bf_partial(_bf_execute_action, action, arguments)
-    # Both calls are driven by C-level map/methodcaller/deque machinery. The
-    # seccomp installer frame has fully unwound before the proposed invocation
-    # begins, so it is not present in the proposed Python back-frame chain.
-    calls = _bf_map(
-        _bf_methodcaller("__call__"),
-        (_bf_install_proposed_seccomp, invocation),
-    )
+    calls = _bf_map(_bf_methodcaller("__call__"), (invocation,))
     target = _bf_methodcaller("extend", calls)
 
     # The importable __main__ is inert for the entire lifetime of proposed
     # Python execution. The real run-string module returns only after the
-    # detached frame has fully unwound. Seccomp prevents a background thread
-    # from surviving this boundary and observing the restored trusted module.
+    # detached frame has fully unwound. The audit hook prevents any background
+    # thread from surviving this boundary and observing the restored module.
     _bf_modules["__main__"] = _bf_inert_main
     try:
+        _bf_arm_thread_start(target)
         _bf_start_new_thread(target, (outcomes,))
-        while _bf_len(outcomes) < 2:
+        while not outcomes:
             _bf_sleep(0.001)
     finally:
         _bf_modules["__main__"] = _bf_actual_main
 
-    installer_result = outcomes.popleft()
-    if installer_result is not None or _bf_len(outcomes) != 1:
-        raise _bf_RuntimeError("detached executor seccomp setup produced invalid state")
+    if _bf_len(outcomes) != 1:
+        raise _bf_RuntimeError("detached executor produced an invalid outcome count")
     outcome = outcomes.popleft()
     if (
         _bf_type(outcome) is not _bf_tuple
@@ -478,9 +443,8 @@ def _bf_process_one(raw):
     action = request["action"]
 
     # CLI orchestration is trusted code in this interpreter; the proposed CLI
-    # itself runs in a separate child process. Running the helper here avoids
-    # Python 3.12 DummyThread semantics without exposing response transport to
-    # proposed in-process Python frames.
+    # itself runs in a separate child process. The selector-based drain avoids
+    # creating any trusted helper threads after the audit guard is installed.
     if action == "cli":
         ok, observed, message = _bf_execute_action(action, arguments)
     else:
