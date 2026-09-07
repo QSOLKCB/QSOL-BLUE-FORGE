@@ -9,12 +9,13 @@ Python 3.12 supplies immutable values to ``run_string(..., shared=...)``. Each
 request therefore enters the proposed subinterpreter as bounded marshal bytes.
 In-process proposed calls run on a detached native thread whose nearest Python
 ancestor uses transport-free globals. A CPython audit hook installed before any
-proposed import makes sensitive bootstrap modules non-reimportable and rejects
-every ``_thread.start_new_thread`` event except the one exact detached target the
+proposed import makes sensitive bootstrap modules non-reimportable, rejects
+cross-thread tracing/profiling changes, and rejects every
+``_thread.start_new_thread`` event except the one exact detached target the
 trusted runner arms. During each call, ``import __main__`` is bound to an inert
 module. The real run-string module is restored only after the proposed frame has
-unwound, so proposed code cannot park a background thread and wait for trusted
-response state to reappear.
+unwound, so proposed code cannot park a background thread or tracing callback and
+wait for trusted response state to reappear.
 
 The private runner then emits a bounded observation through a reserved
 ``SystemExit`` envelope. The main interpreter validates that envelope,
@@ -60,6 +61,7 @@ _BF_RESPONSE_PREFIX = __RESPONSE_PREFIX__
 # function resolves only these captured objects from its own transport-free
 # globals mapping.
 _bf_BaseException = BaseException
+_bf_Exception = Exception
 _bf_RuntimeError = RuntimeError
 _bf_SystemExit = SystemExit
 _bf_type = type
@@ -116,6 +118,8 @@ _bf_PIPE = _support.subprocess.PIPE
 _bf_DefaultSelector = _support.selectors.DefaultSelector
 _bf_EVENT_READ = _support.selectors.EVENT_READ
 _bf_kill_group = _support._kill_group
+_bf_settrace_all_threads = _support.threading.settrace_all_threads
+_bf_setprofile_all_threads = _support.threading.setprofile_all_threads
 
 # The trusted CLI path cannot use threading after the audit boundary is armed.
 # Drain its two pipes in one thread with selectors instead. The proposed CLI is
@@ -173,7 +177,10 @@ def _bf_run_cli_bounded(command, root, environment):
 # trusted detached launch consumes that permission in the audit callback before
 # the new thread begins. Any thread start reached by proposed Python, including
 # through a recovered preloaded threading/_thread object, has no permission and
-# is rejected before CPython calls the native thread API.
+# is rejected before CPython calls the native thread API. CPython's direct and
+# all-thread tracing/profile setters emit sys.settrace/sys.setprofile audit
+# events, so those state changes are rejected before they can install callbacks
+# on the trusted subinterpreter control thread.
 def _bf_make_execution_guard(blocked, error_type):
     allowed = [None]
 
@@ -185,6 +192,8 @@ def _bf_make_execution_guard(blocked, error_type):
     def guard(event, args):
         if event == "import" and args and type(args[0]) is str and args[0] in blocked:
             raise error_type("executor bootstrap module import is blocked")
+        if event in {"sys.settrace", "sys.setprofile"}:
+            raise error_type("proposed tracing or profiling is blocked")
         if event == "_thread.start_new_thread":
             target = args[0] if args else None
             if target is not allowed[0]:
@@ -204,9 +213,9 @@ sys.addaudithook(_bf_execution_guard)
 del _bf_execution_guard, _bf_make_execution_guard
 
 
-# Mandatory bootstrap proof of the load-bearing audit event. The outer thread
-# start is explicitly armed by trusted code; an unarmed nested start from that
-# thread must be rejected by the same CPython audit hook proposed code faces.
+# Mandatory bootstrap proof of the load-bearing thread audit event. The outer
+# thread start is explicitly armed by trusted code; an unarmed nested start from
+# that thread must be rejected by the same CPython audit hook proposed code sees.
 def _bf_thread_guard_self_test(destination):
     try:
         _bf_start_new_thread(_bf_sleep, (0.01,))
@@ -225,10 +234,38 @@ if not _bf_thread_guard_probe or _bf_thread_guard_probe.popleft() is not True:
     raise _bf_RuntimeError("proposed thread audit self-test failed")
 del _bf_thread_guard_self_test, _bf_thread_guard_probe, _bf_thread_guard_deadline
 
+
+# Mandatory bootstrap proof of the exact cross-thread tracing route reported in
+# review. threading.settrace_all_threads()/setprofile_all_threads() eventually
+# invoke CPython's audited all-thread setters. The hook must reject both before a
+# callback can be installed on the run-string control thread.
+def _bf_trace_probe(*args):
+    return _bf_trace_probe
+
+for _bf_trace_setter, _bf_hook_attr, _bf_label in (
+    (_bf_settrace_all_threads, "_trace_hook", "trace"),
+    (_bf_setprofile_all_threads, "_profile_hook", "profile"),
+):
+    try:
+        _bf_trace_setter(_bf_trace_probe)
+    except _bf_BaseException:
+        pass
+    else:
+        # If the expected CPython audit event ever disappears, clear the benign
+        # probe before failing closed so bootstrap diagnostics remain bounded.
+        _bf_trace_setter(None)
+        raise _bf_RuntimeError(
+            "proposed cross-thread " + _bf_label + " audit self-test failed"
+        )
+    finally:
+        _bf_object.__setattr__(_support.threading, _bf_hook_attr, None)
+
+del _bf_trace_probe, _bf_trace_setter, _bf_hook_attr, _bf_label
+
 # Remove straightforward interpreter/thread/frame escape modules from the
 # proposed import surface. These sentinels are defense in depth; the registered
 # audit hook is the irreversible Python-level boundary that prevents pop and
-# re-import as well as any unarmed native thread start.
+# re-import, unarmed native thread starts, and cross-thread trace/profile state.
 _bf_modules.pop("_blue_forge_executor_support", None)
 _bf_modules["_xxsubinterpreters"] = None
 _bf_modules["gc"] = None
@@ -349,7 +386,8 @@ def _bf_detached_execute(action, arguments):
     # The importable __main__ is inert for the entire lifetime of proposed
     # Python execution. The real run-string module returns only after the
     # detached frame has fully unwound. The audit hook prevents any background
-    # thread from surviving this boundary and observing the restored module.
+    # thread or trace/profile callback from surviving this boundary and
+    # observing the restored module.
     _bf_modules["__main__"] = _bf_inert_main
     try:
         _bf_arm_thread_start(target)
@@ -386,6 +424,27 @@ def _bf_result(value):
     return ["handle", [_bf_identities[oid], name]]
 
 
+def _bf_named_exception(candidate, expected_name, required_base=None):
+    if _bf_type(candidate) is not _bf_type:
+        return False
+    mro = _bf_type.__getattribute__(candidate, "__mro__")
+    module_name = _bf_type.__getattribute__(candidate, "__module__")
+    type_name = _bf_type.__getattribute__(candidate, "__name__")
+    if module_name != "blue_forge.core" or type_name != expected_name:
+        return False
+    if _bf_Exception not in mro or candidate is _bf_Exception:
+        return False
+    if required_base is not None and (candidate is required_base or required_base not in mro):
+        return False
+    return True
+
+
+# The exact review reproduction must never pass the export guard: object is a
+# type, but it is not an exported BLUE-FORGE exception class.
+if _bf_named_exception(_bf_object, "ValidationError"):
+    raise _bf_RuntimeError("executor exception export hierarchy self-test failed")
+
+
 def _bf_capture_exports():
     global _bf_exported_validation, _bf_exported_blue
     package = _bf_modules.get("blue_forge")
@@ -394,10 +453,16 @@ def _bf_capture_exports():
     namespace = _bf_object.__getattribute__(package, "__dict__")
     validation = namespace.get("ValidationError")
     blue = namespace.get("BlueForgeError")
-    if _bf_type(validation) is _bf_type:
-        _bf_exported_validation = validation
-    if _bf_type(blue) is _bf_type:
-        _bf_exported_blue = blue
+    _bf_require(
+        _bf_named_exception(blue, "BlueForgeError"),
+        "proposed BlueForgeError export has an invalid exception hierarchy",
+    )
+    _bf_require(
+        _bf_named_exception(validation, "ValidationError", blue),
+        "proposed ValidationError export has an invalid exception hierarchy",
+    )
+    _bf_exported_blue = blue
+    _bf_exported_validation = validation
 
 
 def _bf_exception_key(exc):
