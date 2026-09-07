@@ -686,6 +686,353 @@ base._Bridge.close = _hardened_close
 base.expected_tests = _hardened_expected_tests
 base._self_test = _combined_self_test
 
+# ---------------------------------------------------------------------------
+# Review-round P1 hardening: dynamic frozen-test membership, subprocess escape,
+# and the /proc/self/mem response-mailbox overwrite reproduction.
+# ---------------------------------------------------------------------------
+
+def _module_level_nodes(node):
+    """Yield executable module-level AST without descending into definitions."""
+    yield node
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _module_level_nodes(child)
+
+
+def _target_writes_test_member(target):
+    if isinstance(target, ast.Attribute):
+        return target.attr.startswith("test")
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(_target_writes_test_member(item) for item in target.elts)
+    return False
+
+
+def _reject_dynamic_test_membership(tree, path):
+    """Fail closed when module-level code can mutate TestCase membership."""
+    dangerous_names = {"setattr", "delattr", "exec", "eval"}
+    dangerous_attrs = {"setattr", "delattr", "__setattr__", "__delattr__"}
+    for statement in tree.body:
+        for node in _module_level_nodes(statement):
+            if isinstance(node, ast.Call):
+                function = node.func
+                if (
+                    isinstance(function, ast.Name) and function.id in dangerous_names
+                ) or (
+                    isinstance(function, ast.Attribute) and function.attr in dangerous_attrs
+                ):
+                    raise base.SupervisionFailure(
+                        f"dynamic frozen test membership is unsupported in {path.name}"
+                    )
+            if isinstance(node, ast.Assign):
+                if any(_target_writes_test_member(target) for target in node.targets):
+                    raise base.SupervisionFailure(
+                        f"dynamic frozen test member assignment is unsupported in {path.name}"
+                    )
+            elif isinstance(node, ast.AnnAssign):
+                if _target_writes_test_member(node.target):
+                    raise base.SupervisionFailure(
+                        f"dynamic frozen test member assignment is unsupported in {path.name}"
+                    )
+            elif isinstance(node, ast.AugAssign):
+                if _target_writes_test_member(node.target):
+                    raise base.SupervisionFailure(
+                        f"dynamic frozen test member assignment is unsupported in {path.name}"
+                    )
+            elif isinstance(node, ast.Delete):
+                if any(_target_writes_test_member(target) for target in node.targets):
+                    raise base.SupervisionFailure(
+                        f"dynamic frozen test member deletion is unsupported in {path.name}"
+                    )
+
+
+_previous_expected_tests = base.expected_tests
+
+
+def _strict_expected_tests(root):
+    supervised_current = bool(os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"))
+    for path in sorted((root / "tests").glob("test*.py")):
+        base.require(path.is_file() and not path.is_symlink(), "invalid frozen test file")
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if _current_suite_only(tree, path) and not supervised_current:
+            continue
+        _reject_dynamic_test_membership(tree, path)
+    return _previous_expected_tests(root)
+
+
+def _hardened_test_importer(bridge):
+    """Expose no worker-local process creation path to frozen test modules."""
+    real_import = base.builtins.__import__
+    json_proxy = types.ModuleType("json")
+    json_proxy.__dict__.update(vars(base.json))
+    json_proxy.dumps = lambda value, *a, **k: base.json.dumps(base._local(value), *a, **k)
+    dc_proxy = types.ModuleType("dataclasses")
+    dc_proxy.__dict__.update(vars(base.dataclasses))
+    dc_proxy.replace = base._remote_replace
+    process_proxy = types.ModuleType("subprocess")
+
+    for name in (
+        "PIPE", "STDOUT", "DEVNULL", "CompletedProcess", "CalledProcessError",
+        "TimeoutExpired", "SubprocessError",
+    ):
+        setattr(process_proxy, name, getattr(subprocess, name))
+
+    safe_flags = {"-I", "-E", "-s", "-S", "-B", "-P", "-u"}
+    safe_xoptions = {"utf8", "utf8=1", "utf8=0"}
+
+    def cli_details(command):
+        base.require(type(command) in (list, tuple), "subprocess command must be an exact sequence")
+        items = list(command)
+        base.require(items and all(type(item) is str for item in items),
+                     "subprocess command entries must be exact strings")
+        base.require(Path(items[0]).resolve() == Path(sys.executable).resolve(),
+                     "only the current Python executable may invoke proposed CLI")
+        index = 1
+        while index < len(items) and items[index] != "-m":
+            token = items[index]
+            if token in safe_flags:
+                index += 1
+                continue
+            if token == "-X":
+                base.require(index + 1 < len(items) and items[index + 1] in safe_xoptions,
+                             "unsupported Python -X option for proposed CLI")
+                index += 2
+                continue
+            raise base.SupervisionFailure("unsupported Python flag for proposed CLI")
+        base.require(index + 1 < len(items) and items[index:index + 2] == ["-m", "blue_forge"],
+                     "subprocess invocation is not an explicitly bridged proposed CLI")
+        cli = items[index + 2:]
+        base.require(len(cli) == 2 and cli[0] in {"verify", "regression"},
+                     "unsupported proposed CLI invocation")
+        return cli[0], Path(cli[1])
+
+    def run(command, *args, **kwargs):
+        base.require(not args, "positional subprocess.run options are unsupported")
+        allowed = {
+            "env", "check", "text", "universal_newlines", "encoding", "errors",
+            "stdout", "stderr", "capture_output", "timeout", "cwd",
+        }
+        unknown = set(kwargs) - allowed
+        base.require(not unknown, "unsupported subprocess.run option: " + ",".join(sorted(unknown)))
+        subcommand, path = cli_details(command)
+        cwd = kwargs.get("cwd")
+        if cwd is not None:
+            base.require(Path(cwd).resolve() == Path(bridge.root).resolve(),
+                         "proposed CLI cwd must remain the sterile root")
+        timeout = kwargs.get("timeout")
+        if timeout is not None:
+            base.require(type(timeout) in (int, float) and not isinstance(timeout, bool)
+                         and 0 < timeout <= 15,
+                         "proposed CLI timeout exceeds actor budget")
+        capture_output = kwargs.get("capture_output", False)
+        base.require(type(capture_output) is bool, "capture_output must be boolean")
+        stdout_mode = kwargs.get("stdout")
+        stderr_mode = kwargs.get("stderr")
+        if capture_output:
+            base.require(stdout_mode is None and stderr_mode is None,
+                         "capture_output conflicts with stdout/stderr")
+            stdout_mode = subprocess.PIPE
+            stderr_mode = subprocess.PIPE
+        base.require(stdout_mode in (None, subprocess.PIPE, subprocess.DEVNULL),
+                     "unsupported stdout target for proposed CLI")
+        base.require(stderr_mode in (None, subprocess.PIPE, subprocess.DEVNULL, subprocess.STDOUT),
+                     "unsupported stderr target for proposed CLI")
+        env_value = kwargs.get("env")
+        if env_value is None:
+            env = dict(os.environ)
+        else:
+            base.require(type(env_value) is dict and all(
+                type(key) is str and type(value) is str for key, value in env_value.items()
+            ), "proposed CLI environment must be an exact string mapping")
+            env = dict(env_value)
+        env = {key: value for key, value in env.items() if not key.startswith("BLUE_FORGE_")}
+        base.require(path.is_file(), "proposed CLI case path is not a regular file")
+        with path.open("rb") as handle:
+            payload = handle.read(2 * 1024 * 1024)
+        base.require(len(payload) <= 2 * 1024 * 1024,
+                     "proposed CLI case transport budget exceeded")
+        rc, stdout, stderr = bridge.request("cli", [subcommand], payload, env)
+        if stderr_mode == subprocess.STDOUT:
+            stdout = stdout + stderr
+            stderr = b""
+        text_mode = bool(
+            kwargs.get("text") or kwargs.get("universal_newlines")
+            or kwargs.get("encoding") is not None or kwargs.get("errors") is not None
+        )
+        if text_mode:
+            encoding = kwargs.get("encoding") or "utf-8"
+            errors = kwargs.get("errors") or "strict"
+            base.require(type(encoding) is str and type(errors) is str,
+                         "invalid proposed CLI text decoding options")
+            stdout = stdout.decode(encoding, errors)
+            stderr = stderr.decode(encoding, errors)
+        returned_stdout = stdout if stdout_mode == subprocess.PIPE else None
+        returned_stderr = stderr if stderr_mode == subprocess.PIPE else None
+        completed = subprocess.CompletedProcess(command, rc, returned_stdout, returned_stderr)
+        if kwargs.get("check"):
+            completed.check_returncode()
+        return completed
+
+    def check_output(command, *args, **kwargs):
+        base.require("stdout" not in kwargs, "stdout argument not allowed for check_output")
+        kwargs = dict(kwargs)
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["check"] = True
+        return run(command, *args, **kwargs).stdout
+
+    def check_call(command, *args, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs["check"] = True
+        return run(command, *args, **kwargs).returncode
+
+    def call(command, *args, **kwargs):
+        kwargs = dict(kwargs)
+        kwargs.pop("check", None)
+        return run(command, *args, **kwargs).returncode
+
+    def blocked_popen(*args, **kwargs):
+        del args, kwargs
+        raise base.SupervisionFailure(
+            "subprocess.Popen is not available in trusted frozen-test workers"
+        )
+
+    def blocked_shell_helper(*args, **kwargs):
+        del args, kwargs
+        raise base.SupervisionFailure(
+            "shell subprocess helpers are not available in trusted frozen-test workers"
+        )
+
+    process_proxy.run = run
+    process_proxy.check_output = check_output
+    process_proxy.check_call = check_call
+    process_proxy.call = call
+    process_proxy.Popen = blocked_popen
+    process_proxy.getoutput = blocked_shell_helper
+    process_proxy.getstatusoutput = blocked_shell_helper
+    facades = {"json": json_proxy, "dataclasses": dc_proxy, "subprocess": process_proxy}
+
+    def trusted_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 0 and name in facades:
+            return facades[name]
+        return real_import(name, globals, locals, fromlist, level)
+
+    return trusted_import
+
+
+def _self_test_dynamic_membership():
+    with tempfile.TemporaryDirectory(prefix="blue-forge-dynamic-enumeration-") as temp:
+        root = Path(temp)
+        (root / "tests").mkdir()
+        path = root / "tests/test_dynamic.py"
+        path.write_text(
+            "import unittest\n"
+            "class Dynamic(unittest.TestCase): pass\n"
+            "def generated(self): self.fail('must be enumerated or rejected')\n"
+            "setattr(Dynamic, 'test_generated', generated)\n"
+            "class Control(unittest.TestCase):\n"
+            " def test_control(self): pass\n",
+            encoding="utf-8",
+        )
+        try:
+            _strict_expected_tests(root)
+        except base.SupervisionFailure as exc:
+            base.require("dynamic frozen test membership" in str(exc),
+                         "dynamic test rejection failed for an unrelated reason")
+            return
+        raise base.SupervisionFailure("dynamic frozen test installation was silently omitted")
+
+
+def _self_test_subprocess_facade():
+    class FakeBridge:
+        def __init__(self, root):
+            self.root = root
+        def request(self, action, *arguments):
+            base.require(action == "cli", "subprocess self-test escaped CLI bridge")
+            base.require(arguments[0] == ["verify"], "subprocess self-test lost CLI action")
+            return 0, b"bridged", b"diagnostic"
+
+    with tempfile.TemporaryDirectory(prefix="blue-forge-subprocess-facade-") as temp:
+        root = Path(temp)
+        case = root / "case.json"
+        case.write_bytes(b"{}")
+        proxy = _hardened_test_importer(FakeBridge(root))("subprocess")
+        command = [
+            sys.executable, "-I", "-X", "utf8", "-m", "blue_forge", "verify", str(case)
+        ]
+        completed = proxy.run(command, capture_output=True, check=True)
+        base.require(completed.stdout == b"bridged" and completed.stderr == b"diagnostic",
+                     "bridged subprocess.run lost captured output")
+        base.require(proxy.check_output(command) == b"bridged",
+                     "bridged subprocess.check_output failed")
+        base.require(proxy.check_call(command) == 0 and proxy.call(command) == 0,
+                     "bridged subprocess call helpers failed")
+        for operation in (
+            lambda: proxy.Popen(command),
+            lambda: proxy.check_output(["/bin/echo", "escape"]),
+        ):
+            try:
+                operation()
+            except base.SupervisionFailure:
+                pass
+            else:
+                raise base.SupervisionFailure("unbridged subprocess creation reached trusted worker")
+
+
+def _self_test_proc_memory_boundary(python_bin, timeout_seconds, *, local_test=False):
+    if local_test:
+        return
+    with tempfile.TemporaryDirectory(prefix="blue-forge-proc-memory-selftest-") as temp:
+        root = Path(temp)
+        root.chmod(0o755)
+        (root / "tests").mkdir()
+        (root / "blue_forge").mkdir()
+        (root / "blue_forge/__init__.py").write_text(
+            "import os\n"
+            "def probe():\n"
+            " try:\n"
+            "  fd=os.open('/proc/self/mem', os.O_RDWR)\n"
+            " except OSError:\n"
+            "  return 'blocked'\n"
+            " else:\n"
+            "  os.close(fd)\n"
+            "  return 'open'\n",
+            encoding="utf-8",
+        )
+        (root / "tests/test_memory.py").write_text(
+            "import unittest\nfrom blue_forge import probe\n"
+            "class Memory(unittest.TestCase):\n"
+            " def test_blocked(self): self.assertEqual(probe(), 'blocked')\n"
+            " def test_open_fails(self): self.assertEqual(probe(), 'open')\n",
+            encoding="utf-8",
+        )
+        base.run_one(root, python_bin, ("test_memory", "Memory", "test_blocked"),
+                     timeout_seconds, local_test=local_test)
+        try:
+            base.run_one(root, python_bin, ("test_memory", "Memory", "test_open_fails"),
+                         timeout_seconds, local_test=local_test)
+        except base.SupervisionFailure:
+            print("executor_memory_isolation=PASS")
+            return
+        raise base.SupervisionFailure("actor exposed /proc/self/mem to proposed Python")
+
+
+_previous_p1_self_test = base._self_test
+
+
+def _p1_self_test(python_bin, timeout_seconds, *, local_test=False):
+    _previous_p1_self_test(python_bin, timeout_seconds, local_test=local_test)
+    _self_test_dynamic_membership()
+    _self_test_subprocess_facade()
+    _self_test_proc_memory_boundary(
+        python_bin, timeout_seconds, local_test=local_test
+    )
+    print("dynamic_test_enumeration=PASS subprocess_actor_routing=PASS")
+
+
+base.expected_tests = _strict_expected_tests
+base._test_importer = _hardened_test_importer
+base._self_test = _p1_self_test
+
 # The broker imports no proposed module, but keep its importable __main__ inert so
 # application code in descendants never gains a stable reference to this wrapper.
 if "--actor-root" in sys.argv:

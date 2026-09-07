@@ -7,6 +7,9 @@ all other inherited descriptors except diagnostic stderr. Fixed-capacity
 anonymous shared-memory mailboxes, synchronized by process-shared POSIX
 semaphores, carry bounded observations; they are not file-descriptor channels.
 The parent is non-dumpable, preventing same-UID /proc descriptor reopening.
+During every proposed call the child-side response mapping is PROT_NONE and is
+made writable again only after proposed Python has completely unwound; actor
+mode also masks procfs, removing /proc/self/mem as a protection bypass.
 
 Operation selection remains on the subinterpreter control thread. Proposed
 calls enter a fresh transport-free wrapper whose arguments are locals, not a
@@ -564,6 +567,8 @@ def _native_api():
     libc.prctl.restype = ctypes.c_int
     libc.sem_init.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint]
     libc.sem_init.restype = ctypes.c_int
+    libc.mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc.mprotect.restype = ctypes.c_int
     for name in ("sem_trywait", "sem_post", "sem_destroy"):
         function = getattr(libc, name)
         function.argtypes = [ctypes.c_void_p]
@@ -584,13 +589,17 @@ class _Mailbox:
     Linux's 64-bit sem_t fits in an aligned 64-byte reservation. Neither the
     mappings nor their native pointers are shared into the proposed interpreter.
     Semaphore publication supplies the inter-process memory-ordering boundary.
+    The application child can additionally revoke all access to a mailbox VMA;
+    mprotect state is process-local, so the transport parent's mapping remains
+    usable while proposed Python runs with the child-side response pages blocked.
     """
     HEADER = 128
     DATA = 144
 
     def __init__(self, libc):
         self.libc = libc
-        self.storage = mmap.mmap(-1, self.DATA + MAX_FRAME_BYTES)
+        self.length = self.DATA + MAX_FRAME_BYTES
+        self.storage = mmap.mmap(-1, self.length)
         self.address = ctypes.addressof(ctypes.c_char.from_buffer(self.storage))
         self.initialized = []
         try:
@@ -601,6 +610,13 @@ class _Mailbox:
         except BaseException:
             self.close()
             raise
+
+    def protect(self, writable: bool):
+        if type(writable) is not bool:
+            raise RuntimeError("invalid executor mailbox protection mode")
+        protection = (1 | 2) if writable else 0  # PROT_READ|PROT_WRITE / PROT_NONE
+        if self.libc.mprotect(self.address, self.length, protection) != 0:
+            raise OSError(ctypes.get_errno(), "executor mailbox protection failed")
 
     def _wait(self, offset, deadline, alive):
         while True:
@@ -690,13 +706,20 @@ def _application_loop(root, support_path, requests, responses):
             generation, payload = requests.receive(seconds=35.0)
             if generation != expected:
                 raise RuntimeError("executor application generation mismatch")
+            # The parent has a separate VMA for this shared mapping. Revoke all
+            # access only in the application child before any proposed frame can
+            # run, then restore RW after run_string has fully returned/failed.
+            responses.protect(False)
             try:
-                interpreters.run_string(interpreter, "_bf_process_one(_bf_request)",
-                                        {"_bf_request": payload})
-            except interpreters.RunFailedError as exc:
-                observation = _decode_runfailed(exc, loads)
-            else:
-                raise RuntimeError("proposed subinterpreter omitted response envelope")
+                try:
+                    interpreters.run_string(interpreter, "_bf_process_one(_bf_request)",
+                                            {"_bf_request": payload})
+                except interpreters.RunFailedError as exc:
+                    observation = _decode_runfailed(exc, loads)
+                else:
+                    raise RuntimeError("proposed subinterpreter omitted response envelope")
+            finally:
+                responses.protect(True)
             responses.send(generation, dumps(observation, 4))
         raise RuntimeError("executor operation budget exceeded")
     finally:
