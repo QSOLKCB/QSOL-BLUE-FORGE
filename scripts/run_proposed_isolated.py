@@ -52,10 +52,12 @@ import sys
 
 if os.geteuid() != 0 or os.getpid() != 1:
     raise RuntimeError("filesystem setup requires the private namespace init")
-home, uid, gid, size, inodes = sys.argv[1:6]
-command = sys.argv[6:]
+home, uid, gid, size, inodes, workdir = sys.argv[1:7]
+command = sys.argv[7:]
 if not command or command[0] != "/usr/bin/prlimit":
     raise RuntimeError("invalid fixed actor command")
+if not os.path.isabs(workdir) or not os.path.isdir(workdir):
+    raise RuntimeError("invalid fixed actor working directory")
 libc = ctypes.CDLL(None, use_errno=True)
 
 class MountAttr(ctypes.Structure):
@@ -87,6 +89,9 @@ checked(mount_setattr(-100, b"/", 0x8000, ctypes.byref(attributes),
 # MS_NOSUID | MS_NODEV | MS_NOEXEC. The underlying host directory stays empty.
 options = f"size={size},nr_inodes={inodes},mode=0700,uid={uid},gid={gid}".encode("ascii")
 checked(mount(b"tmpfs", os.fsencode(home), b"tmpfs", 2 | 4 | 8, options), "private actor tmpfs")
+# Restore the validated materialized source root after mount setup.  unittest
+# discovery and repository tests intentionally resolve fixtures relative to it.
+os.chdir(workdir)
 os.execv(command[0], command)
 '''
 
@@ -193,12 +198,18 @@ def main() -> int:
     check(caller in permitted, "launcher caller is not an authorized test worker")
     check(rpc.pw_uid not in permitted and rpc.pw_uid != 0,
           "actor UID must be distinct and unprivileged")
+    tests_dir = source_root / "tests" if direct else None
     if direct:
         check(caller == current_user.pw_uid,
               "direct proposed suite is restricted to blueforge-current")
         root_info = source_root.stat()
         check(root_info.st_uid == 0 and not root_info.st_mode & 0o022,
               "direct suite source root must be root-owned and non-writable")
+        check(tests_dir.is_dir() and not tests_dir.is_symlink(),
+              "direct suite tests directory is unavailable")
+        tests_info = tests_dir.stat()
+        check(tests_info.st_uid == 0 and not tests_info.st_mode & 0o022,
+              "direct suite tests directory must be root-owned and non-writable")
 
     control = None
     selector = selectors.DefaultSelector()
@@ -235,7 +246,8 @@ def main() -> int:
         home.chmod(0o700)
         if direct:
             proposed_command = [
-                str(python_bin), "-m", "unittest", "discover", "-s", "tests", "-v"
+                str(python_bin), "-m", "unittest", "discover",
+                "-s", str(tests_dir), "-v",
             ]
         else:
             proposed_command = [
@@ -269,7 +281,8 @@ def main() -> int:
             "--pid", "--fork", "--kill-child=KILL", "--mount-proc", "--net", "--",
             "/usr/bin/python3", "-I", "-S", "-c", FILESYSTEM_SETUP,
             str(home), str(target.pw_uid), str(target.pw_gid),
-            str(ACTOR_STORAGE_BYTES), str(ACTOR_STORAGE_INODES), *actor_command,
+            str(ACTOR_STORAGE_BYTES), str(ACTOR_STORAGE_INODES), str(source_root),
+            *actor_command,
         ]
         command = scoped(namespace_command, unit)
         popen_kwargs = {
