@@ -223,6 +223,51 @@ def _hardened_request(self, action, *arguments):
     raise known[name](message)
 
 
+def _hardened_close(self):
+    """Let the broker reap its executor before using the lifeline as a kill switch."""
+    try:
+        self.process.stdin.close()
+    except OSError:
+        pass
+
+    try:
+        self.process.wait(timeout=6)
+    except subprocess.TimeoutExpired:
+        # Normal EOF should let the broker finish first. If it does not, close
+        # the private lifeline to ask the fixed root launcher for bounded forced
+        # namespace/cgroup teardown, then wait once more for that confirmation.
+        if self.control_fd is not None:
+            os.close(self.control_fd)
+            self.control_fd = None
+        try:
+            self.process.wait(timeout=6)
+        except subprocess.TimeoutExpired as exc:
+            base._kill_group(self.process)
+            raise base.SupervisionFailure(
+                "isolated actor launcher did not confirm namespace teardown"
+            ) from exc
+    finally:
+        if self.control_fd is not None:
+            os.close(self.control_fd)
+            self.control_fd = None
+        if self.process.poll() is None:
+            base._kill_group(self.process)
+        self.control_dir.cleanup()
+        self.reader.join(timeout=3)
+        self.process.stdout.close()
+        self.process.stderr.close()
+
+    diagnostic = bytes(self.tail).decode("utf-8", errors="replace")
+    base.require(
+        self.process.returncode == 0,
+        f"isolated actor launcher failed during cleanup: rc={self.process.returncode}\n{diagnostic}",
+    )
+    base.require(
+        not self.reader.is_alive(),
+        "actor stderr descendants survived namespace teardown",
+    )
+
+
 def _base_ref(expr, unittest_aliases, symbols, classes):
     if isinstance(expr, ast.Attribute):
         if (
@@ -482,6 +527,7 @@ def _combined_self_test(python_bin, timeout_seconds, *, local_test=False):
 
 base._actor = _broker_actor
 base._Bridge.request = _hardened_request
+base._Bridge.close = _hardened_close
 base.expected_tests = _hardened_expected_tests
 base._self_test = _combined_self_test
 
