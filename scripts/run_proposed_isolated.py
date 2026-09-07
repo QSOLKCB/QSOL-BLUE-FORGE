@@ -271,8 +271,15 @@ def _secure_scratch_parent() -> Path:
     check(parent.is_absolute() and parent.is_dir() and not parent.is_symlink(),
           "isolated scratch parent is invalid")
     info = parent.stat()
-    check(info.st_uid == 0 and info.st_mode & stat.S_ISVTX and info.st_mode & 0o002,
-          "isolated scratch parent must be root-owned sticky writable storage")
+    writable_by_unprivileged = bool(info.st_mode & 0o022)
+    check(
+        info.st_uid == 0
+        and (
+            not writable_by_unprivileged
+            or bool(info.st_mode & stat.S_ISVTX)
+        ),
+        "isolated scratch parent must be root-owned and either protected or sticky",
+    )
     return parent
 
 
