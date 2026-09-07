@@ -10,9 +10,11 @@ before proposed Python starts. Three fixed modes are supported:
   test-module import/top-level code, inside an aggregate resource/filesystem
   boundary while retaining access only to the fixed nested actor helper.
 
-No proposed Python runs with elevated authority. In supervised-suite mode the
-filesystem is recursively read-only and nosuid except for an isolated bind mount
-of /usr/bin/sudo. Sudo policy permits only this fixed launcher, so PR-controlled
+No proposed Python runs with elevated authority. Actor mode additionally masks
+/proc after PID-namespace setup so proposed Python cannot use /proc/self/mem to
+rewrite inherited trusted mappings. In supervised-suite mode the filesystem is
+recursively read-only and nosuid except for an isolated bind mount of
+/usr/bin/sudo. Sudo policy permits only this fixed launcher, so PR-controlled
 test code cannot turn that narrow elevation path into arbitrary root execution.
 """
 from __future__ import annotations
@@ -54,7 +56,9 @@ SYSTEMCTL = Path("/usr/bin/systemctl")
 FIXED_HELPER = Path("/usr/local/libexec/blue-forge-rpc")
 
 # Actor/direct setup: all host mounts become read-only+nosuid, followed by one
-# private writable tmpfs owned by the unprivileged target.
+# private writable tmpfs owned by the unprivileged target. Actor mode overlays
+# /proc with an empty read-only tmpfs after unshare --mount-proc has completed;
+# direct-suite mode retains procfs for its diagnostic/current-suite assertions.
 FILESYSTEM_SETUP = r'''
 import ctypes
 import os
@@ -62,8 +66,10 @@ import sys
 
 if os.geteuid() != 0 or os.getpid() != 1:
     raise RuntimeError("filesystem setup requires the private namespace init")
-home, uid, gid, size, inodes, workdir = sys.argv[1:7]
-command = sys.argv[7:]
+home, uid, gid, size, inodes, workdir, mask_proc = sys.argv[1:8]
+command = sys.argv[8:]
+if mask_proc not in {"0", "1"}:
+    raise RuntimeError("invalid procfs isolation mode")
 if not command or command[0] != "/usr/bin/prlimit":
     raise RuntimeError("invalid fixed actor command")
 if not os.path.isabs(workdir) or not os.path.isdir(workdir):
@@ -93,6 +99,14 @@ checked(mount(None, b"/", None, (1 << 14) | (1 << 18), None), "private mount tre
 attributes = MountAttr(1 | 2, 0, 0, 0)  # RDONLY | NOSUID
 checked(mount_setattr(-100, b"/", 0x8000, ctypes.byref(attributes),
                      ctypes.sizeof(attributes)), "recursive read-only mount tree")
+if mask_proc == "1":
+    # The actor needs no procfs API after namespace setup. Cover the namespace's
+    # procfs mount with a private, empty, read-only filesystem before dropping
+    # privileges. This removes /proc/self/mem and /proc/*/fd as memory/descriptor
+    # escape hatches without exposing a writable host-backed replacement.
+    proc_options = b"size=4096,nr_inodes=16,mode=0555,uid=0,gid=0"
+    checked(mount(b"tmpfs", b"/proc", b"tmpfs", 1 | 2 | 4 | 8, proc_options),
+            "mask actor procfs")
 options = f"size={size},nr_inodes={inodes},mode=0700,uid={uid},gid={gid}".encode("ascii")
 checked(mount(b"tmpfs", os.fsencode(home), b"tmpfs", 2 | 4 | 8, options), "private actor tmpfs")
 os.chdir(workdir)
@@ -467,13 +481,18 @@ def main() -> int:
             cpu_quota = ACTOR_CPU_QUOTA
             lifetime = ACTOR_SECONDS
 
+        setup_args = [
+            str(home), str(target.pw_uid), str(target.pw_gid),
+            str(storage_bytes), str(storage_inodes), str(source_root),
+        ]
+        if mode != "supervised":
+            setup_args.append("1" if mode == "actor" else "0")
         namespace_command = [
             "/usr/bin/setpriv", "--pdeathsig=KILL", "--",
             "/usr/bin/unshare", "--mount", "--propagation", "private",
             "--pid", "--fork", "--kill-child=KILL", "--mount-proc", "--net", "--",
             "/usr/bin/python3", "-I", "-S", "-c", setup,
-            str(home), str(target.pw_uid), str(target.pw_gid),
-            str(storage_bytes), str(storage_inodes), str(source_root),
+            *setup_args,
             *actor_command,
         ]
         command = scoped(
