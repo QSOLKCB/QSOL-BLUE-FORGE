@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import importlib
 import importlib.util
+import inspect
 import itertools
 import marshal
 import operator
@@ -131,9 +132,6 @@ def _execute_action(action: str, arguments: list[object], context: tuple[object,
         elif action == "object_setattr":
             value = object.__setattr__(*arguments)
         elif action == "export":
-            # Encoding happens later on the transport thread using a support
-            # function captured before proposed imports. Merely return the
-            # object observed here.
             value = arguments[0]
         elif action == "cli":
             cli_args, case_bytes, environment = arguments
@@ -146,8 +144,6 @@ def _execute_action(action: str, arguments: list[object], context: tuple[object,
             raise RuntimeError("unknown executor operation")
         return (True, value, "")
     except BaseException as exc:
-        # Convert the proposed exception message only after the proposed frame
-        # has unwound, still within this transport-free thread.
         try:
             message = str(exc)
         except BaseException:
@@ -163,8 +159,6 @@ def _detached_execute(action: str, arguments: list[object], context: tuple[objec
     target = operator.methodcaller("extend", calls)
     _thread.start_new_thread(target, (outcomes,))
     while not outcomes:
-        # The outer namespace/cgroup lifetime remains the hard timeout. This
-        # sleep only yields the GIL while the detached invocation is active.
         time.sleep(0.001)
     if len(outcomes) != 1:
         raise RuntimeError("detached executor produced an invalid outcome count")
@@ -172,6 +166,28 @@ def _detached_execute(action: str, arguments: list[object], context: tuple[objec
     if type(outcome) is not tuple or len(outcome) != 3 or type(outcome[0]) is not bool:
         raise RuntimeError("detached executor produced a malformed outcome")
     return outcome
+
+
+def _self_test_frame_boundary(context: tuple[object, ...]) -> None:
+    """Prove detached proposed frames cannot climb into transport-frame locals."""
+    def probe():
+        frame = inspect.currentframe().f_back
+        while frame is not None:
+            namespace = frame.f_locals
+            if any(name in namespace for name in ("wire_out", "request", "dumps")):
+                return False
+            frame = frame.f_back
+        return True
+
+    # These names intentionally mirror the transport locals attacked in review.
+    wire_out = object()
+    request = {"sequence": 1}
+    dumps = marshal.dumps
+    if not wire_out or not request or not dumps:
+        raise RuntimeError("executor frame-boundary self-test setup failed")
+    ok, observed, message = _detached_execute("call", [probe, (), {}], context)
+    if not ok or observed is not True or message != "":
+        raise RuntimeError("executor detached frame boundary self-test failed")
 
 
 def main() -> int:
@@ -182,8 +198,6 @@ def main() -> int:
         raise RuntimeError("invalid proposed executor root")
 
     support = _load_impl()
-    # Capture support objects before any proposed import. The broker never
-    # imports proposed code, and worker-facing serialization does not occur here.
     graph_decoder = support._GraphDecoder
     encode_data = support._encode_data
     run_cli_bounded = support._run_cli_bounded
@@ -206,18 +220,14 @@ def main() -> int:
         sys.executable,
         run_cli_bounded,
     )
+    _self_test_frame_boundary(dispatch_context)
 
     sys.path.insert(0, str(root))
     os.chdir(root)
     wire_in = sys.stdin.buffer
     wire_out = sys.stdout.buffer
-    # Proposed stdout must never share the binary observation channel through
-    # normal Python stdout handles. The transport stream remains a main-thread
-    # local that detached proposed frame chains cannot reach.
     sys.stdout = sys.stderr
     sys.__stdout__ = sys.stderr
-    # Prevent the standard cross-thread frame enumerator from recreating the
-    # frame-walking path that this executor deliberately removes.
     sys._current_frames = None
 
     handles: dict[int, object] = {}
