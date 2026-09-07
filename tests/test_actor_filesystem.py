@@ -1,4 +1,4 @@
-"""Kernel integration check for aggregate disposable actor storage.
+"""Kernel integration checks for aggregate disposable actor resources.
 
 The helper is installed by CI from the externally authorized baseline. Local
 checkouts without that helper skip this integration check, not any core test.
@@ -18,6 +18,16 @@ import unittest
 HELPER = Path(os.environ.get("BLUE_FORGE_RPC_HELPER", "/usr/local/libexec/blue-forge-rpc"))
 STORAGE_BYTES = 32 * 1024 * 1024
 STORAGE_INODES = 1024
+MEMORY_BYTES = 512 * 1024 * 1024
+TASKS_MAX = 64
+
+
+def _cgroup_v2_path() -> Path:
+    for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines():
+        hierarchy, controllers, relative = line.split(":", 2)
+        if hierarchy == "0" and controllers == "":
+            return Path("/sys/fs/cgroup") / relative.lstrip("/")
+    raise RuntimeError("actor is not attached to cgroup v2")
 
 
 def filesystem_probe(marker):
@@ -51,6 +61,15 @@ def filesystem_probe(marker):
     space = os.statvfs(home)
     results["capacity"] = space.f_blocks * space.f_frsize
     results["inodes"] = space.f_files
+
+    cgroup = _cgroup_v2_path()
+    results["cgroup"] = {
+        "memory_max": (cgroup / "memory.max").read_text(encoding="ascii").strip(),
+        "memory_swap_max": (cgroup / "memory.swap.max").read_text(encoding="ascii").strip(),
+        "pids_max": (cgroup / "pids.max").read_text(encoding="ascii").strip(),
+        "cpu_max": (cgroup / "cpu.max").read_text(encoding="ascii").strip(),
+    }
+
     files = []
     written = 0
     results["byte_errno"] = 0
@@ -103,6 +122,17 @@ class ActorFilesystemTests(unittest.TestCase):
             self.assertEqual(result["symlink_errno"], errno.EROFS)
             self.assertEqual(result["capacity"], STORAGE_BYTES)
             self.assertEqual(result["inodes"], STORAGE_INODES)
+
+            cgroup = result["cgroup"]
+            self.assertEqual(cgroup["memory_max"], str(MEMORY_BYTES))
+            self.assertEqual(cgroup["memory_swap_max"], "0")
+            self.assertEqual(cgroup["pids_max"], str(TASKS_MAX))
+            quota, period = cgroup["cpu_max"].split()
+            self.assertNotEqual(quota, "max")
+            self.assertGreater(int(quota), 0)
+            self.assertGreater(int(period), 0)
+            self.assertLessEqual(int(quota) * 2, int(period))
+
             self.assertEqual(result["byte_errno"], errno.ENOSPC)
             self.assertGreater(result["written"], 0)
             self.assertLessEqual(result["written"], STORAGE_BYTES)
