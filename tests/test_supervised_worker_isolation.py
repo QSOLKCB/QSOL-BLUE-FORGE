@@ -85,6 +85,20 @@ class SupervisedWorkerIsolationTests(unittest.TestCase):
         # descendant. The outer namespace/cgroup teardown is responsible for it.
         os.kill(CHILD_PID, 0)
 
+    @unittest.skipUnless(MARKER, "requires the governed supervised current-floor sandbox")
+    def test_nested_helper_containment_is_kernel_derived(self) -> None:
+        helper = Path(os.environ["BLUE_FORGE_RPC_HELPER"])
+        self.assertTrue(helper.is_file())
+        source = helper.read_text(encoding="utf-8")
+
+        # Exact regression for the caller-controlled environment escape: nested
+        # scope reuse must not depend on BLUE_FORGE_PARENT_AGGREGATE at all.
+        self.assertNotIn("BLUE_FORGE_PARENT_AGGREGATE", source)
+        self.assertIn('/proc/self/cgroup', source)
+        self.assertIn('memory.max', source)
+        self.assertIn('pids.max', source)
+        self.assertIn('cpu.max', source)
+
 
 if __name__ == "__main__":
     unittest.main()
