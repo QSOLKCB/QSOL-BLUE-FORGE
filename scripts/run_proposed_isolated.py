@@ -36,6 +36,7 @@ ACTOR_STORAGE_INODES = 1024
 ACTOR_MEMORY_BYTES = 512 * 1024 * 1024
 ACTOR_TASKS = 64
 ACTOR_CPU_QUOTA = "50%"
+ACTOR_GRACEFUL_TEARDOWN_SECONDS = 3
 
 SUPERVISED_SECONDS = 180
 SUPERVISED_STORAGE_BYTES = 64 * 1024 * 1024
@@ -361,6 +362,7 @@ def main() -> int:
     overflow = threading.Event()
     unit = f"blue-forge-proposed-{os.getpid()}-{time.monotonic_ns()}.scope"
     interrupted = []
+    lifeline_deadline = None
     marker = (
         f"blue-forge-supervised-child-{os.getpid()}-{time.monotonic_ns()}"
         if mode == "supervised" else None
@@ -475,20 +477,35 @@ def main() -> int:
 
         deadline = time.monotonic() + lifetime
         while process.poll() is None:
+            now = time.monotonic()
             if interrupted:
                 return 128 + interrupted[0]
             if overflow.is_set():
                 print(f"isolated_{mode}_suite=FAIL reason=output budget exceeded", file=sys.stderr)
                 return 125
-            if time.monotonic() >= deadline:
+            if mode == "actor" and lifeline_deadline is not None and now >= lifeline_deadline:
+                # The trusted worker is gone or closing. Give the broker a short
+                # window to reap its executor and exit naturally, then force the
+                # existing namespace/cgroup teardown without treating that forced
+                # cleanup as an application result.
+                return 0
+            if now >= deadline:
                 label = "isolated_actor" if mode == "actor" else f"isolated_{mode}_suite"
                 print(f"{label}=FAIL reason=lifetime budget exceeded", file=sys.stderr)
                 return 124
             if mode == "actor":
-                for _key, _mask in selector.select(0.05):
-                    data = os.read(control, 1)
-                    check(data == b"", "worker lifeline carried unexpected data")
-                    return 0
+                if lifeline_deadline is None:
+                    for _key, _mask in selector.select(0.05):
+                        data = os.read(control, 1)
+                        check(data == b"", "worker lifeline carried unexpected data")
+                        selector.unregister(control)
+                        lifeline_deadline = min(
+                            deadline,
+                            time.monotonic() + ACTOR_GRACEFUL_TEARDOWN_SECONDS,
+                        )
+                        break
+                else:
+                    time.sleep(0.05)
             else:
                 time.sleep(0.05)
 
