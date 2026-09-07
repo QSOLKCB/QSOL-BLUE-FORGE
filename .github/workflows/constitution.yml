@@ -38,6 +38,7 @@ jobs:
             schemas/blue-forge-hardening-meta-v1.schema.json \
             fixtures/v1/path-traversal-case.json \
             scripts/run_frozen_tests_supervised.py \
+            scripts/_run_frozen_tests_supervised_impl.py \
             scripts/run_proposed_isolated.py; do
             baseline="$(git ls-tree "$BLUE_FORGE_TRUSTED_REF" -- "$path" | awk '{print $1 " " $2 " " $3}')"
             current="$(git ls-tree HEAD -- "$path" | awk '{print $1 " " $2 " " $3}')"
@@ -55,14 +56,22 @@ jobs:
         run: |
           set -euo pipefail
           trusted_auditor="/tmp/blue-forge-trusted-audit-${GITHUB_RUN_ID}.py"
-          trusted_supervisor="/tmp/blue-forge-trusted-test-supervisor-${GITHUB_RUN_ID}.py"
+          trusted_runner_dir="/tmp/blue-forge-trusted-runner-${GITHUB_RUN_ID}"
+          trusted_supervisor="$trusted_runner_dir/run_frozen_tests_supervised.py"
+          trusted_supervisor_impl="$trusted_runner_dir/_run_frozen_tests_supervised_impl.py"
           trusted_launcher="/tmp/blue-forge-trusted-actor-launcher-${GITHUB_RUN_ID}.py"
+          rm -rf "$trusted_runner_dir"
+          mkdir -p "$trusted_runner_dir"
           git show "${BLUE_FORGE_TRUSTED_REF}:scripts/audit_constitution.py" > "$trusted_auditor"
           git show "${BLUE_FORGE_TRUSTED_REF}:scripts/run_frozen_tests_supervised.py" > "$trusted_supervisor"
+          git show "${BLUE_FORGE_TRUSTED_REF}:scripts/_run_frozen_tests_supervised_impl.py" > "$trusted_supervisor_impl"
           git show "${BLUE_FORGE_TRUSTED_REF}:scripts/run_proposed_isolated.py" > "$trusted_launcher"
-          python3 -m py_compile "$trusted_auditor" "$trusted_supervisor" "$trusted_launcher"
-          sudo chown root:root "$trusted_auditor" "$trusted_supervisor" "$trusted_launcher"
-          sudo chmod 0444 "$trusted_auditor" "$trusted_supervisor" "$trusted_launcher"
+          python3 -m py_compile "$trusted_auditor" "$trusted_supervisor" "$trusted_supervisor_impl" "$trusted_launcher"
+          rm -rf "$trusted_runner_dir/__pycache__"
+          sudo chown root:root "$trusted_auditor" "$trusted_launcher"
+          sudo chown -R root:root "$trusted_runner_dir"
+          sudo chmod 0444 "$trusted_auditor" "$trusted_launcher" "$trusted_supervisor" "$trusted_supervisor_impl"
+          sudo chmod 0555 "$trusted_runner_dir"
           sudo install -d -m 0755 /usr/local/libexec
           sudo install -o root -g root -m 0555 "$trusted_launcher" /usr/local/libexec/blue-forge-rpc
           printf 'BLUE_FORGE_TRUSTED_AUDITOR=%s\n' "$trusted_auditor" >> "$GITHUB_ENV"
@@ -256,13 +265,17 @@ jobs:
           sudo chown root:root "$GITHUB_WORKSPACE"
           sudo chmod 000 "$GITHUB_WORKSPACE"
           cd "$BLUE_FORGE_CURRENT_TEST_ROOT"
-          # Exercise every current test through the same bridge before it can be
-          # considered for a future frozen baseline. Unsupported APIs fail closed.
+          # Exercise every current test through the trusted bridge before it can
+          # be considered for a future frozen baseline. Unsupported APIs fail closed.
           sudo unshare --net -- runuser -u blueforge-current -- \
             env HOME="$BLUE_FORGE_CURRENT_TEST_HOME" PATH="$PATH" \
             BLUE_FORGE_RPC_HELPER="$BLUE_FORGE_RPC_HELPER" \
             "$python_bin" -I "$BLUE_FORGE_TRUSTED_TEST_SUPERVISOR" \
               --root "$BLUE_FORGE_CURRENT_TEST_ROOT" --python "$python_bin"
-          sudo unshare --net -- runuser -u blueforge-current -- \
-            env HOME="$BLUE_FORGE_CURRENT_TEST_HOME" PATH="$PATH" \
-            "$python_bin" -m unittest discover -s tests -v
+          # The required ordinary unittest pass is diagnostic rather than trusted,
+          # but it executes the same proposed modules. Give the complete process
+          # tree the same aggregate cgroup, namespace, filesystem, and lifetime
+          # boundaries instead of running it directly on the hosted runner.
+          sudo runuser -u blueforge-current -- \
+            sudo -n "$BLUE_FORGE_RPC_HELPER" --direct-suite \
+              "$python_bin" "$BLUE_FORGE_CURRENT_TEST_ROOT"
