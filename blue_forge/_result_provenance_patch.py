@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import weakref
 
 
 def _payload_for_validated_case(core: Any, case: Any) -> dict[str, Any]:
@@ -97,10 +98,18 @@ def install(core: Any) -> None:
     def payload_for_validated_case(case: Any) -> dict[str, Any]:
         return _payload_for_validated_case(core, case)
 
-    class HardeningResult(tuple):
-        """Evaluator-issued result whose originating case is held in immutable tuple storage."""
+    # Result provenance lives outside caller-writable instance storage.  A base
+    # allocator such as object.__new__ can manufacture an object of the public
+    # type, but it cannot manufacture a corresponding entry in this closure-owned
+    # issuance registry.  Weak references retire entries as results are collected.
+    issued: dict[int, tuple[weakref.ReferenceType[Any], bytes]] = {}
+    identity = id
+    weak_reference = weakref.ref
 
-        __slots__ = ()
+    class HardeningResult:
+        """Case-bound result whose issuance evidence is retained out-of-object."""
+
+        __slots__ = ("__weakref__",)
 
         def __new__(
             cls,
@@ -110,14 +119,24 @@ def install(core: Any) -> None:
         ) -> Any:
             if _token is not core._EVALUATION_TOKEN:
                 raise core.ValidationError("HardeningResult must be created by evaluate()")
-            if not isinstance(originating_case, core.HardeningCase):
+            if type(originating_case) is not core.HardeningCase:
                 raise core.ValidationError(
                     "HardeningResult construction requires an originating HardeningCase"
                 )
             validated_case = core._validated_case(originating_case)
             case_material = core._case_input_material(validated_case)
             case_bytes = core.canonical_bytes(case_material)
-            return tuple.__new__(cls, (case_bytes,))
+            instance = object.__new__(cls)
+            oid = identity(instance)
+
+            def retire(reference: weakref.ReferenceType[Any], *, object_id: int = oid) -> None:
+                current = issued.get(object_id)
+                if current is not None and current[0] is reference:
+                    issued.pop(object_id, None)
+
+            reference = weak_reference(instance, retire)
+            issued[oid] = (reference, case_bytes)
+            return instance
 
         def __init__(
             self,
@@ -125,19 +144,25 @@ def install(core: Any) -> None:
             *,
             _token: object | None = None,
         ) -> None:
-            # All state is established immutably by __new__.
+            # All state is retained by the issuance registry in __new__.
             del originating_case, _token
 
         def __setattr__(self, name: str, value: Any) -> None:
             del name, value
             raise AttributeError("HardeningResult is immutable")
 
+        def _issued_case_bytes(self) -> bytes:
+            oid = identity(self)
+            entry = issued.get(oid)
+            if entry is None or entry[0]() is not self or type(entry[1]) is not bytes:
+                raise core.ValidationError(
+                    "hardening result was not issued by the evaluator boundary"
+                )
+            return entry[1]
+
         @property
         def _case_bytes(self) -> bytes:
-            value = tuple.__getitem__(self, 0)
-            if type(value) is not bytes:
-                raise core.ValidationError("hardening result case provenance is invalid")
-            return value
+            return self._issued_case_bytes()
 
         @classmethod
         def _from_evaluation(cls, case: Any) -> Any:
@@ -145,7 +170,9 @@ def install(core: Any) -> None:
 
         def _recomputed_payload(self) -> dict[str, Any]:
             try:
-                case_value = core.loads_strict(self._case_bytes.decode("utf-8"))
+                case_value = core.loads_strict(
+                    self._issued_case_bytes().decode("utf-8")
+                )
             except (AttributeError, UnicodeDecodeError, IndexError, TypeError) as exc:
                 raise core.ValidationError("hardening result case provenance is invalid") from exc
             case = core.HardeningCase.from_dict(case_value)
