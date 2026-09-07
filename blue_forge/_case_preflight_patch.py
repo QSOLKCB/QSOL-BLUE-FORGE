@@ -24,11 +24,26 @@ def install(core: Any) -> None:
 
     def bounded_case_input_material(case: Any) -> dict[str, Any]:
         try:
+            proposal = case.proposal
             verification = case.verification
         except AttributeError as exc:
             raise core.ValidationError(
                 f"invalid directly constructed hardening case: {exc}"
             ) from exc
+
+        # The original serializer dereferences ``decision.value`` before the
+        # reconstructed case reaches HardeningCase.from_dict().  For direct or
+        # dataclasses.replace()-modified cases, require the exact enum first so
+        # a duck-typed object cannot manufacture a valid decision or execute an
+        # attacker-controlled property at the evaluator boundary.
+        if type(proposal.decision) is not core.Decision:
+            raise core.ValidationError(
+                "proposal.decision must be an exact Decision"
+            )
+        if type(verification.decision) is not core.Decision:
+            raise core.ValidationError(
+                "verification.decision must be an exact Decision"
+            )
 
         variants = verification.variants
         if type(variants) is not tuple:
