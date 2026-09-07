@@ -453,7 +453,7 @@ def _bf_named_exception(candidate, expected_name, required_base=None):
     mro = _bf_type.__getattribute__(candidate, "__mro__")
     module_name = _bf_type.__getattribute__(candidate, "__module__")
     type_name = _bf_type.__getattribute__(candidate, "__name__")
-    if module_name != "blue_forge.core" or type_name != expected_name:
+    if module_name not in {"blue_forge", "blue_forge.core"} or type_name != expected_name:
         return False
     if _bf_Exception not in mro or candidate is _bf_Exception:
         return False
