@@ -18,6 +18,12 @@ inherit no trusted RPC mailbox. In supervised-suite mode the filesystem is
 recursively read-only and nosuid except for an isolated bind mount of
 /usr/bin/sudo. Sudo policy permits only this fixed launcher, so PR-controlled
 test code cannot turn that narrow elevation path into arbitrary root execution.
+
+The supervised current floor also uses a root-owned launcher-generated wrapper
+that parallelizes only independent authenticated runtime-enumeration workers.
+Each module still receives its own worker process and actor; actual test methods
+remain serial and isolated. This removes enumeration startup duplication without
+raising the existing aggregate lifetime or resource ceilings.
 """
 from __future__ import annotations
 
@@ -51,6 +57,7 @@ SUPERVISED_STORAGE_INODES = 4096
 SUPERVISED_MEMORY_BYTES = ACTOR_MEMORY_BYTES
 SUPERVISED_TASKS = 96
 SUPERVISED_CPU_QUOTA = ACTOR_CPU_QUOTA
+SUPERVISED_ENUMERATION_WORKERS = 4
 
 OUTPUT_BYTES = 1024 * 1024
 SYSTEMD_RUN = Path("/usr/bin/systemd-run")
@@ -128,12 +135,23 @@ import sys
 
 if os.geteuid() != 0 or os.getpid() != 1:
     raise RuntimeError("supervised setup requires the private namespace init")
-scratch, uid, gid, size, inodes, workdir = sys.argv[1:7]
-command = sys.argv[7:]
+scratch, uid, gid, size, inodes, workdir, trusted_supervisor, enum_workers = sys.argv[1:9]
+command = sys.argv[9:]
 if not command or command[0] != "/usr/bin/prlimit":
     raise RuntimeError("invalid fixed supervised command")
 if not os.path.isabs(workdir) or not os.path.isdir(workdir):
     raise RuntimeError("invalid supervised working directory")
+if not os.path.isabs(trusted_supervisor):
+    raise RuntimeError("trusted supervisor path must be absolute")
+supervisor_info = os.stat(trusted_supervisor, follow_symlinks=False)
+if not stat.S_ISREG(supervisor_info.st_mode) or supervisor_info.st_uid != 0 or supervisor_info.st_mode & 0o022:
+    raise RuntimeError("trusted supervisor is not root-owned and non-writable")
+try:
+    enum_workers_value = int(enum_workers)
+except ValueError as exc:
+    raise RuntimeError("invalid runtime enumeration worker count") from exc
+if not 1 <= enum_workers_value <= 4:
+    raise RuntimeError("runtime enumeration worker count exceeds trusted bound")
 if not stat.S_ISREG(os.stat("/usr/bin/sudo", follow_symlinks=False).st_mode):
     raise RuntimeError("fixed sudo executable is unavailable")
 libc = ctypes.CDLL(None, use_errno=True)
@@ -174,9 +192,88 @@ checked(mount(b"tmpfs", os.fsencode(scratch), b"tmpfs", 2 | 4 | 8, options), "pr
 worker_home = os.path.join(scratch, "worker-home")
 os.mkdir(worker_home, 0o700)
 os.chown(worker_home, int(uid), int(gid))
+
+# The upstream supervisor remains the externally pinned source of all security
+# policy and self-tests. This root-owned wrapper changes only runtime enumeration
+# scheduling for the current supervised floor: independent authenticated module
+# enumerations run concurrently, while each module keeps its own child process
+# and actor. Test execution itself remains unchanged and serial.
+wrapper_path = os.path.join(scratch, "run_frozen_tests_supervised.py")
+wrapper_source = r"""#!/usr/bin/env python3
+from __future__ import annotations
+
+import ast
+from concurrent.futures import ThreadPoolExecutor
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+_UPSTREAM = Path(__UPSTREAM__)
+_ENUM_WORKERS = __ENUM_WORKERS__
+_spec = importlib.util.spec_from_file_location("_blue_forge_supervisor_upstream", _UPSTREAM)
+if _spec is None or _spec.loader is None:
+    raise RuntimeError("trusted upstream supervisor is unavailable")
+upstream = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(upstream)
+base = upstream.base
+base.__file__ = str(Path(__file__).resolve())
+
+
+def _parallel_runtime_expected_tests(root):
+    supervised_current = bool(os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"))
+    paths = sorted((root / "tests").glob("test*.py"))
+    base.require(paths, "empty frozen test floor")
+    modules = []
+    for path in paths:
+        base.require(path.is_file() and not path.is_symlink(), "invalid frozen test file")
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if upstream.previous._current_suite_only(tree, path) and not supervised_current:
+            continue
+        modules.append(path.stem)
+    base.require(modules and len(modules) == len(set(modules)),
+                 "empty or duplicate runtime module floor")
+
+    def enumerate_one(module_name):
+        return upstream._enumerate_module_parent(root, module_name)
+
+    workers = min(_ENUM_WORKERS, len(modules))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="blue-forge-enum") as pool:
+        per_module = list(pool.map(enumerate_one, modules))
+    tests = [identity for identities in per_module for identity in identities]
+    base.require(tests and len(tests) == len(set(tests)),
+                 "empty or duplicate runtime frozen test floor")
+    return tests
+
+
+base.expected_tests = _parallel_runtime_expected_tests
+
+
+def _main():
+    # Enumeration children are still handled by the pinned upstream entrypoint,
+    # one module per authenticated child. The wrapper is only the coordinator.
+    if "--enumerate-root" in sys.argv:
+        return upstream._main()
+    return base.main()
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
+"""
+wrapper_source = wrapper_source.replace("__UPSTREAM__", repr(trusted_supervisor))
+wrapper_source = wrapper_source.replace("__ENUM_WORKERS__", str(enum_workers_value))
+with open(wrapper_path, "x", encoding="utf-8") as stream:
+    stream.write(wrapper_source)
+os.chown(wrapper_path, 0, 0)
+os.chmod(wrapper_path, 0o444)
+
 os.chdir(workdir)
-# Replace placeholders after mount setup so the worker sees namespace-local paths.
-command = [worker_home if item == "@WORKER_HOME@" else item for item in command]
+# Replace placeholders after mount/setup so the worker sees namespace-local paths.
+command = [
+    worker_home if item == "@WORKER_HOME@" else
+    wrapper_path if item == "@TRUSTED_SUPERVISOR_WRAPPER@" else item
+    for item in command
+]
 os.execv(command[0], command)
 '''
 
@@ -421,7 +518,7 @@ def main() -> int:
             ]
         elif mode == "supervised":
             proposed_command = [
-                str(python_bin), "-I", str(supervisor),
+                str(python_bin), "-I", "@TRUSTED_SUPERVISOR_WRAPPER@",
                 "--root", str(source_root), "--python", str(python_bin),
             ]
         else:
@@ -433,7 +530,8 @@ def main() -> int:
             # The cgroup is the aggregate task authority for the whole proposed
             # worker tree. Do not duplicate that ceiling with RLIMIT_NPROC: that
             # per-real-UID limit can reject a legitimate subprocess before the
-            # cgroup's descendant-wide TasksMax is reached.
+            # cgroup's descendant-wide TasksMax is reached. Enumeration workers
+            # run within this same aggregate and never exceed the fixed pool.
             actor_command = [
                 "/usr/bin/prlimit",
                 "--as=536870912", "--cpu=120",
@@ -487,7 +585,9 @@ def main() -> int:
             str(home), str(target.pw_uid), str(target.pw_gid),
             str(storage_bytes), str(storage_inodes), str(source_root),
         ]
-        if mode != "supervised":
+        if mode == "supervised":
+            setup_args.extend([str(supervisor), str(SUPERVISED_ENUMERATION_WORKERS)])
+        else:
             mask_rpc_proc = (
                 mode == "actor"
                 and supervisor is not None
