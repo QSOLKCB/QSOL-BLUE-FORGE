@@ -5,15 +5,17 @@ The process main interpreter never imports proposed application code. It owns th
 broker-facing request/response framing and marshal codec. Proposed modules,
 objects, and object handles live in a persistent CPython subinterpreter.
 
-Within that subinterpreter, proposed Python operations execute on a detached
-native thread whose Python ancestor frames use a transport-free globals mapping.
-The subinterpreter runner receives the raw returned object only after the
-proposed frame unwinds, converts it to a bounded observation, and transfers that
-observation over a private CPython interpreter channel. The main interpreter
-then independently constructs and serializes the executor response.
+The Python 3.12 internal subinterpreter API supports immutable values passed into
+``run_string(..., shared=...)`` but does not expose the newer channel helpers on
+the hosted runner. Requests therefore enter the proposed interpreter as shared
+bytes. After a proposed operation has fully unwound, the private runner encodes a
+bounded observation and raises a reserved built-in ``SystemExit`` envelope. The
+main interpreter receives that envelope as ``RunFailedError``, validates its
+exact prefix/hex payload, reconstructs the final response, and performs the only
+broker-facing framing.
 
-Proposed imports therefore cannot reach this module's __main__, _write_frame,
-request objects, marshal.dumps reference, or broker-facing stdout framing.
+Proposed imports cannot reach this module's ``__main__``, ``_write_frame``,
+request objects, captured ``marshal.dumps``, or broker-facing stdout framing.
 """
 from __future__ import annotations
 
@@ -24,6 +26,8 @@ import sys
 
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 MAX_OPERATIONS = 4096
+_RESPONSE_PREFIX = "__BLUE_FORGE_EXECUTOR_RESPONSE_V1__:"
+_RUNFAILED_PREFIX = "<class 'SystemExit'>: " + _RESPONSE_PREFIX
 
 
 _SUBINTERPRETER_BOOTSTRAP = r"""
@@ -38,26 +42,44 @@ import operator
 import os
 from pathlib import Path
 import sys
+import tempfile
 import types
 import _thread
 import time
-import _xxsubinterpreters as _bf_interpreters
 
 _BF_ROOT = Path(__ROOT__).resolve()
 _BF_SUPPORT_PATH = Path(__SUPPORT__).resolve()
-_BF_REQUEST_CHANNEL = __REQUEST_CHANNEL__
-_BF_RESPONSE_CHANNEL = __RESPONSE_CHANNEL__
 _BF_MAX_FRAME_BYTES = __MAX_FRAME_BYTES__
 _BF_MAX_OPERATIONS = __MAX_OPERATIONS__
+_BF_RESPONSE_PREFIX = __RESPONSE_PREFIX__
 
-_bf_channel_recv = _bf_interpreters.channel_recv
-_bf_channel_send = _bf_interpreters.channel_send
+# Capture immutable/built-in authorities before any proposed import.  The
+# operation function resolves these names from its own transport-free globals
+# rather than consulting a subsequently modified builtins module.
+_bf_BaseException = BaseException
+_bf_RuntimeError = RuntimeError
+_bf_SystemExit = SystemExit
+_bf_type = type
+_bf_object = object
+_bf_len = len
+_bf_bool = bool
+_bf_tuple = tuple
+_bf_iter = iter
+_bf_next = next
+_bf_getattr = getattr
+_bf_setattr = setattr
+_bf_delattr = delattr
+_bf_str = str
+_bf_bytes = bytes
+_bf_dict = dict
+_bf_list = list
+_bf_any = any
 
 _spec = importlib.util.spec_from_file_location(
     "_blue_forge_executor_support", _BF_SUPPORT_PATH
 )
 if _spec is None or _spec.loader is None:
-    raise RuntimeError("trusted executor implementation support is unavailable")
+    raise _bf_RuntimeError("trusted executor implementation support is unavailable")
 _support = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_support)
 
@@ -71,6 +93,9 @@ _bf_deepcopy = _support.copy.deepcopy
 _bf_replace = _support.dataclasses.replace
 _bf_import_module = _support.importlib.import_module
 
+# Do not leave runner-support or interpreter-control modules importable by the
+# code under test.  The actual run-string namespace is also hidden behind an
+# inert importable __main__ below.
 sys.modules.pop("_blue_forge_executor_support", None)
 sys.modules["_xxsubinterpreters"] = None
 sys.modules["gc"] = None
@@ -81,11 +106,11 @@ def execute_action(action, arguments):
         if action == "module":
             value = import_module(arguments[0])
         elif action == "getattr":
-            value = getattr(*arguments)
+            value = getattr_fn(*arguments)
         elif action == "setattr":
-            value = setattr(*arguments)
+            value = setattr_fn(*arguments)
         elif action == "delattr":
-            value = delattr(*arguments)
+            value = delattr_fn(*arguments)
         elif action == "call":
             function, args, kwargs = arguments
             value = function(*args, **kwargs)
@@ -98,22 +123,22 @@ def execute_action(action, arguments):
             del arguments[0][arguments[1]]
             value = None
         elif action == "truth":
-            value = bool(arguments[0])
+            value = bool_fn(arguments[0])
         elif action == "len":
-            value = len(arguments[0])
+            value = len_fn(arguments[0])
         elif action == "iterate":
-            items = tuple(islice(iter(arguments[0]), max_nodes + 1))
-            if len(items) > max_nodes:
-                raise RuntimeError("executor iteration budget exceeded")
+            items = tuple_fn(islice(iter_fn(arguments[0]), max_nodes + 1))
+            if len_fn(items) > max_nodes:
+                raise RuntimeErrorType("executor iteration budget exceeded")
             value = items
         elif action == "next":
-            value = next(arguments[0])
+            value = next_fn(arguments[0])
         elif action == "deepcopy":
             value = deepcopy(arguments[0])
         elif action == "replace":
             value = replace(arguments[0], **arguments[1])
         elif action == "object_setattr":
-            value = object.__setattr__(*arguments)
+            value = object_type.__setattr__(*arguments)
         elif action == "export":
             value = arguments[0]
         elif action == "cli":
@@ -121,22 +146,37 @@ def execute_action(action, arguments):
             with TemporaryDirectory() as temp:
                 path = PathType(temp) / "case.json"
                 path.write_bytes(case_bytes)
-                command = [python_executable, "-m", "blue_forge", cli_args[0], str(path)]
+                command = [python_executable, "-m", "blue_forge", cli_args[0], str_fn(path)]
                 value = run_cli_bounded(command, root, environment)
         else:
-            raise RuntimeError("unknown executor operation")
+            raise RuntimeErrorType("unknown executor operation")
         return (True, value, "")
-    except BaseException as exc:
+    except BaseExceptionType as exc:
         try:
-            message = str(exc)
-        except BaseException:
+            message = str_fn(exc)
+        except BaseExceptionType:
             message = "exception message unavailable"
         return (False, exc, message)
 '''
 
+# The proposed call's nearest Python ancestor is defined with this deliberately
+# transport-free globals mapping.  It contains no request/response serializer,
+# run-string envelope, broker stream, or interpreter-control object.
 _operation_globals = {
-    "__builtins__": builtins.__dict__,
+    "__builtins__": {},
+    "BaseExceptionType": _bf_BaseException,
+    "RuntimeErrorType": _bf_RuntimeError,
     "import_module": _bf_import_module,
+    "getattr_fn": _bf_getattr,
+    "setattr_fn": _bf_setattr,
+    "delattr_fn": _bf_delattr,
+    "bool_fn": _bf_bool,
+    "len_fn": _bf_len,
+    "tuple_fn": _bf_tuple,
+    "iter_fn": _bf_iter,
+    "next_fn": _bf_next,
+    "object_type": _bf_object,
+    "str_fn": _bf_str,
     "islice": _bf_islice,
     "max_nodes": _bf_max_nodes,
     "deepcopy": _bf_deepcopy,
@@ -144,17 +184,19 @@ _operation_globals = {
     "root": _BF_ROOT,
     "python_executable": sys.executable,
     "run_cli_bounded": _bf_run_cli_bounded,
-    "TemporaryDirectory": _support.tempfile.TemporaryDirectory,
+    "TemporaryDirectory": tempfile.TemporaryDirectory,
     "PathType": Path,
 }
 exec(compile(_BF_OPERATION_SOURCE, "<blue-forge-proposed-operation>", "exec"), _operation_globals)
 _bf_execute_action = _operation_globals["execute_action"]
 
+# Proposed ``import __main__`` receives only this inert module, never the actual
+# run-string namespace where observation encoding is retained.
 sys.modules["__main__"] = types.ModuleType("__main__")
 if hasattr(sys, "_current_frames"):
     sys._current_frames = None
 
-sys.path.insert(0, str(_BF_ROOT))
+sys.path.insert(0, _bf_str(_BF_ROOT))
 os.chdir(_BF_ROOT)
 sys.stdout = sys.stderr
 sys.__stdout__ = sys.stderr
@@ -174,26 +216,30 @@ def _bf_detached_execute(action, arguments):
     _thread.start_new_thread(target, (outcomes,))
     while not outcomes:
         time.sleep(0.001)
-    if len(outcomes) != 1:
-        raise RuntimeError("detached executor produced an invalid outcome count")
+    if _bf_len(outcomes) != 1:
+        raise _bf_RuntimeError("detached executor produced an invalid outcome count")
     outcome = outcomes.popleft()
-    if type(outcome) is not tuple or len(outcome) != 3 or type(outcome[0]) is not bool:
-        raise RuntimeError("detached executor produced a malformed outcome")
+    if (
+        _bf_type(outcome) is not _bf_tuple
+        or _bf_len(outcome) != 3
+        or _bf_type(outcome[0]) is not _bf_bool
+    ):
+        raise _bf_RuntimeError("detached executor produced a malformed outcome")
     return outcome
 
 
 def _bf_result(value):
-    if value is None or type(value) in (str, bytes, int, float, bool):
+    if value is None or _bf_type(value) in (_bf_str, _bf_bytes, int, float, _bf_bool):
         return ["data", _bf_encode_data(value)]
-    if type(value) is tuple:
+    if _bf_type(value) is _bf_tuple:
         return ["tuple", [_bf_result(item) for item in value]]
     oid = id(value)
     if oid not in _bf_identities:
-        _bf_require(len(_bf_handles) < _bf_max_nodes, "executor handle budget exceeded")
-        handle = len(_bf_handles)
+        _bf_require(_bf_len(_bf_handles) < _bf_max_nodes, "executor handle budget exceeded")
+        handle = _bf_len(_bf_handles)
         _bf_identities[oid] = handle
         _bf_handles[handle] = value
-    name = type.__getattribute__(type(value), "__name__")
+    name = _bf_type.__getattribute__(_bf_type(value), "__name__")
     return ["handle", [_bf_identities[oid], name]]
 
 
@@ -202,23 +248,23 @@ def _bf_capture_exports():
     package = sys.modules.get("blue_forge")
     if package is None:
         return
-    namespace = object.__getattribute__(package, "__dict__")
+    namespace = _bf_object.__getattribute__(package, "__dict__")
     validation = namespace.get("ValidationError")
     blue = namespace.get("BlueForgeError")
-    if type(validation) is type:
+    if _bf_type(validation) is _bf_type:
         _bf_exported_validation = validation
-    if type(blue) is type:
+    if _bf_type(blue) is _bf_type:
         _bf_exported_blue = blue
 
 
 def _bf_exception_key(exc):
-    cls = type(exc)
-    mro = type.__getattribute__(cls, "__mro__")
-    if _bf_exported_validation is not None and any(
+    cls = _bf_type(exc)
+    mro = _bf_type.__getattribute__(cls, "__mro__")
+    if _bf_exported_validation is not None and _bf_any(
         item is _bf_exported_validation for item in mro
     ):
         return "blue_forge.ValidationError"
-    if _bf_exported_blue is not None and any(item is _bf_exported_blue for item in mro):
+    if _bf_exported_blue is not None and _bf_any(item is _bf_exported_blue for item in mro):
         return "blue_forge.BlueForgeError"
     exact = {
         AssertionError: "builtins.AssertionError",
@@ -232,23 +278,22 @@ def _bf_exception_key(exc):
     return exact.get(cls)
 
 
-def _bf_process_one():
+def _bf_process_one(raw):
     global _bf_operations
     _bf_operations += 1
     _bf_require(_bf_operations <= _BF_MAX_OPERATIONS, "executor operation budget exceeded")
-    raw = _bf_channel_recv(_BF_REQUEST_CHANNEL)
-    _bf_require(type(raw) is bytes and len(raw) <= _BF_MAX_FRAME_BYTES,
+    _bf_require(_bf_type(raw) is _bf_bytes and _bf_len(raw) <= _BF_MAX_FRAME_BYTES,
                 "invalid executor subinterpreter request")
     try:
         request = marshal.loads(raw)
     except (EOFError, TypeError, ValueError) as exc:
-        raise RuntimeError("malformed executor subinterpreter request") from exc
+        raise _bf_RuntimeError("malformed executor subinterpreter request") from exc
 
-    _bf_require(type(request) is dict, "invalid executor request")
-    _bf_require(type(request.get("action")) is str, "invalid executor action")
-    _bf_require(type(request.get("nodes")) is list, "invalid executor graph")
-    _bf_require(type(request.get("arguments")) is list, "invalid executor arguments")
-    _bf_require(type(request.get("sync")) is list, "invalid executor sync set")
+    _bf_require(_bf_type(request) is _bf_dict, "invalid executor request")
+    _bf_require(_bf_type(request.get("action")) is _bf_str, "invalid executor action")
+    _bf_require(_bf_type(request.get("nodes")) is _bf_list, "invalid executor graph")
+    _bf_require(_bf_type(request.get("arguments")) is _bf_list, "invalid executor arguments")
+    _bf_require(_bf_type(request.get("sync")) is _bf_list, "invalid executor sync set")
 
     decoder = _bf_graph_decoder(request["nodes"], _bf_handles)
     arguments = [decoder.decode(value) for value in request["arguments"]]
@@ -276,18 +321,22 @@ def _bf_process_one():
     states = {}
     for key in request.get("sync", []):
         if key in decoder.cache:
-            states[str(key)] = _bf_encode_data(
-                object.__getattribute__(decoder.cache[key], "__dict__")
+            states[_bf_str(key)] = _bf_encode_data(
+                _bf_object.__getattribute__(decoder.cache[key], "__dict__")
             )
     observation["states"] = states
     payload = marshal.dumps(observation, 4)
-    _bf_require(len(payload) <= _BF_MAX_FRAME_BYTES,
+    _bf_require(_bf_len(payload) <= _BF_MAX_FRAME_BYTES,
                 "executor subinterpreter response exceeds byte budget")
-    _bf_channel_send(_BF_RESPONSE_CHANNEL, payload)
+
+    # This reserved exception is raised only after the proposed frame has fully
+    # unwound.  Proposed exceptions are data in `observation` and cannot escape
+    # this function to impersonate the return envelope.
+    raise _bf_SystemExit(_BF_RESPONSE_PREFIX + payload.hex())
 
 
 if hasattr(sys.modules["__main__"], "_write_frame"):
-    raise RuntimeError("proposed subinterpreter exposes executor transport module")
+    raise _bf_RuntimeError("proposed subinterpreter exposes executor transport module")
 """
 
 
@@ -332,6 +381,25 @@ def _validate_request(request: object) -> dict:
     if type(request.get("sync")) is not list:
         raise RuntimeError("invalid executor sync set")
     return request
+
+
+def _decode_runfailed(exc: BaseException, loads) -> object:
+    text = str(exc)
+    if not text.startswith(_RUNFAILED_PREFIX):
+        raise RuntimeError(f"proposed subinterpreter operation failed: {text}") from exc
+    encoded = text[len(_RUNFAILED_PREFIX):]
+    if not encoded or len(encoded) > MAX_FRAME_BYTES * 2:
+        raise RuntimeError("invalid executor subinterpreter response envelope")
+    try:
+        payload = bytes.fromhex(encoded)
+    except ValueError as decode_exc:
+        raise RuntimeError("malformed executor subinterpreter response envelope") from decode_exc
+    if len(payload) > MAX_FRAME_BYTES:
+        raise RuntimeError("executor subinterpreter response exceeds byte budget")
+    try:
+        return loads(payload)
+    except (EOFError, TypeError, ValueError) as decode_exc:
+        raise RuntimeError("malformed executor subinterpreter observation") from decode_exc
 
 
 def _response_from_observation(sequence: int, observation: object) -> dict:
@@ -379,17 +447,14 @@ def main() -> int:
     sys.stdout = sys.stderr
     sys.__stdout__ = sys.stderr
 
-    request_channel = interpreters.channel_create()
-    response_channel = interpreters.channel_create()
     interpreter = interpreters.create()
     bootstrap = (
         _SUBINTERPRETER_BOOTSTRAP
         .replace("__ROOT__", repr(str(root)))
         .replace("__SUPPORT__", repr(str(support_path)))
-        .replace("__REQUEST_CHANNEL__", str(int(request_channel)))
-        .replace("__RESPONSE_CHANNEL__", str(int(response_channel)))
         .replace("__MAX_FRAME_BYTES__", str(MAX_FRAME_BYTES))
         .replace("__MAX_OPERATIONS__", str(MAX_OPERATIONS))
+        .replace("__RESPONSE_PREFIX__", repr(_RESPONSE_PREFIX))
     )
 
     try:
@@ -411,22 +476,20 @@ def main() -> int:
             )
             if len(request_payload) > MAX_FRAME_BYTES:
                 raise RuntimeError("executor request exceeds byte budget")
-            interpreters.channel_send(request_channel, request_payload)
+
             try:
-                interpreters.run_string(interpreter, "_bf_process_one()")
+                interpreters.run_string(
+                    interpreter,
+                    "_bf_process_one(_bf_request)",
+                    {"_bf_request": request_payload},
+                )
             except interpreters.RunFailedError as exc:
-                raise RuntimeError(
-                    f"proposed subinterpreter operation failed: {exc}"
-                ) from exc
+                observation = _decode_runfailed(exc, loads)
+            else:
+                raise RuntimeError("proposed subinterpreter omitted response envelope")
 
-            raw_observation = interpreters.channel_recv(response_channel)
-            if type(raw_observation) is not bytes or len(raw_observation) > MAX_FRAME_BYTES:
-                raise RuntimeError("invalid executor subinterpreter observation")
-            try:
-                observation = loads(raw_observation)
-            except (EOFError, TypeError, ValueError) as exc:
-                raise RuntimeError("malformed executor subinterpreter observation") from exc
-
+            # The final response and the only broker-facing binary frame are
+            # constructed in the interpreter that never imported proposed code.
             response = _response_from_observation(request["sequence"], observation)
             _write_frame(wire_out, response, dumps)
         raise RuntimeError("executor operation budget exceeded")
@@ -435,11 +498,6 @@ def main() -> int:
             interpreters.destroy(interpreter)
         except RuntimeError:
             pass
-        for channel in (request_channel, response_channel):
-            try:
-                interpreters.channel_destroy(channel)
-            except (RuntimeError, KeyError):
-                pass
 
 
 if __name__ == "__main__":
