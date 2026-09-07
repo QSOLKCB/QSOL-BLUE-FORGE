@@ -26,7 +26,7 @@ MAX_FRAME_BYTES = 8 * 1024 * 1024
 MAX_OPERATIONS = 4096
 
 
-_SUBINTERPRETER_BOOTSTRAP = r'''
+_SUBINTERPRETER_BOOTSTRAP = r"""
 from __future__ import annotations
 
 import builtins
@@ -71,13 +71,8 @@ _bf_deepcopy = _support.copy.deepcopy
 _bf_replace = _support.dataclasses.replace
 _bf_import_module = _support.importlib.import_module
 
-# Do not leave the trusted support module or interpreter-channel module reachable
-# through normal proposed imports. The captured objects remain in the unregistered
-# runner globals used only after proposed frames have unwound.
 sys.modules.pop("_blue_forge_executor_support", None)
 sys.modules["_xxsubinterpreters"] = None
-# gc would make otherwise-unregistered runner globals enumerable. It is not part
-# of the BLUE-FORGE public surface or frozen application contract.
 sys.modules["gc"] = None
 
 _BF_OPERATION_SOURCE = r'''
@@ -139,9 +134,6 @@ def execute_action(action, arguments):
         return (False, exc, message)
 '''
 
-# The proposed call's nearest Python ancestor is defined with this deliberately
-# transport-free globals mapping. In particular it contains no channel, marshal,
-# response-builder, request, or broker-facing stream object.
 _operation_globals = {
     "__builtins__": builtins.__dict__,
     "import_module": _bf_import_module,
@@ -158,8 +150,6 @@ _operation_globals = {
 exec(compile(_BF_OPERATION_SOURCE, "<blue-forge-proposed-operation>", "exec"), _operation_globals)
 _bf_execute_action = _operation_globals["execute_action"]
 
-# The actual run-string globals are intentionally not the module returned by an
-# `import __main__` from proposed code.
 sys.modules["__main__"] = types.ModuleType("__main__")
 if hasattr(sys, "_current_frames"):
     sys._current_frames = None
@@ -296,10 +286,9 @@ def _bf_process_one():
     _bf_channel_send(_BF_RESPONSE_CHANNEL, payload)
 
 
-# Bootstrap invariant: proposed `import __main__` resolves only this inert module.
 if hasattr(sys.modules["__main__"], "_write_frame"):
     raise RuntimeError("proposed subinterpreter exposes executor transport module")
-'''
+"""
 
 
 def _read_exact(stream, count: int) -> bytes:
@@ -438,8 +427,6 @@ def main() -> int:
             except (EOFError, TypeError, ValueError) as exc:
                 raise RuntimeError("malformed executor subinterpreter observation") from exc
 
-            # Response construction and the only broker-facing binary framing are
-            # performed here, in the interpreter that never imported proposed code.
             response = _response_from_observation(request["sequence"], observation)
             _write_frame(wire_out, response, dumps)
         raise RuntimeError("executor operation budget exceeded")
