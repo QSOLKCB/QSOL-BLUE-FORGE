@@ -179,7 +179,6 @@ def _self_test_frame_boundary(context: tuple[object, ...]) -> None:
             frame = frame.f_back
         return True
 
-    # These names intentionally mirror the transport locals attacked in review.
     wire_out = object()
     request = {"sequence": 1}
     dumps = marshal.dumps
@@ -225,7 +224,8 @@ def main() -> int:
     sys.path.insert(0, str(root))
     os.chdir(root)
     wire_in = sys.stdin.buffer
-    wire_out = sys.stdout.buffer
+    transport_stdout = sys.stdout
+    wire_out = transport_stdout.buffer
     sys.stdout = sys.stderr
     sys.__stdout__ = sys.stderr
     sys._current_frames = None
