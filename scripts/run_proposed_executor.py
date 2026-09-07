@@ -1,42 +1,40 @@
 #!/usr/bin/env python3
-"""Transport-side executor for the BLUE-FORGE supervised RPC bridge.
+"""Process-separated executor for the BLUE-FORGE supervised RPC bridge.
 
-The process main interpreter never imports proposed application code. It owns the
-broker-facing request/response framing and marshal codec. Proposed modules,
-objects, and object handles live in a persistent CPython subinterpreter.
+Only the transport parent owns broker-facing descriptors. Before creating the
+proposed subinterpreter, its application child replaces stdin/stdout and closes
+all other inherited descriptors except diagnostic stderr. Fixed-capacity
+anonymous shared-memory mailboxes, synchronized by process-shared POSIX
+semaphores, carry bounded observations; they are not file-descriptor channels.
+The parent is non-dumpable, preventing same-UID /proc descriptor reopening.
 
-Python 3.12 supplies immutable values to ``run_string(..., shared=...)``. Each
-request therefore enters the proposed subinterpreter as bounded marshal bytes.
-In-process proposed calls run on a detached native thread whose nearest Python
-ancestor uses transport-free globals. A CPython audit hook installed before any
-proposed import makes sensitive bootstrap modules non-reimportable, rejects
-cross-thread tracing/profiling changes, and rejects every
-``_thread.start_new_thread`` event except the one exact detached target the
-trusted runner arms. During each call, ``import __main__`` is bound to an inert
-module. The real run-string module is restored only after the proposed frame has
-unwound, so proposed code cannot park a background thread or tracing callback and
-wait for trusted response state to reappear.
-
-The private runner then emits a bounded observation through a reserved
-``SystemExit`` envelope. The main interpreter validates that envelope,
-constructs the final response, and performs the only broker-facing framing.
+Operation selection remains on the subinterpreter control thread. Proposed
+calls enter a fresh transport-free wrapper whose arguments are locals, not a
+shared dispatch dictionary. Namespace mutation fails closed before an observation
+is accepted. Kernel isolation and the existing tracing/thread guards remain
+required. This is tested observation isolation, not universal Python attestation.
 """
 from __future__ import annotations
 
+import ctypes
+import errno
 import marshal
+import mmap
+import os
 from pathlib import Path
+import resource
+import signal
 import sys
-
+import time
 
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 MAX_OPERATIONS = 4096
+OPERATION_SECONDS = 15.0
 _RESPONSE_PREFIX = "__BLUE_FORGE_EXECUTOR_RESPONSE_V1__:"
 _RUNFAILED_PREFIX = "<class 'SystemExit'>: " + _RESPONSE_PREFIX
 
-
 _SUBINTERPRETER_BOOTSTRAP = r"""
 from __future__ import annotations
-
 import builtins
 import collections
 import functools
@@ -57,9 +55,6 @@ _BF_MAX_FRAME_BYTES = __MAX_FRAME_BYTES__
 _BF_MAX_OPERATIONS = __MAX_OPERATIONS__
 _BF_RESPONSE_PREFIX = __RESPONSE_PREFIX__
 
-# Capture trusted primitives before any proposed import. The detached operation
-# function resolves only these captured objects from its own transport-free
-# globals mapping.
 _bf_BaseException = BaseException
 _bf_Exception = Exception
 _bf_RuntimeError = RuntimeError
@@ -85,6 +80,10 @@ _bf_map = map
 _bf_deque = collections.deque
 _bf_partial = functools.partial
 _bf_methodcaller = operator.methodcaller
+_bf_getitem = operator.getitem
+_bf_setitem = operator.setitem
+_bf_delitem = operator.delitem
+_bf_FunctionType = types.FunctionType
 _bf_start_new_thread = _thread.start_new_thread
 _bf_sleep = time.sleep
 _bf_monotonic = time.monotonic
@@ -105,7 +104,6 @@ if _spec is None or _spec.loader is None:
     raise _bf_RuntimeError("trusted executor implementation support is unavailable")
 _support = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_support)
-
 _bf_graph_decoder = _support._GraphDecoder
 _bf_encode_data = _support._encode_data
 _bf_require = _support.require
@@ -123,19 +121,10 @@ _bf_kill_group = _support._kill_group
 _bf_settrace_all_threads = _support.threading.settrace_all_threads
 _bf_setprofile_all_threads = _support.threading.setprofile_all_threads
 
-# The trusted CLI path cannot use threading after the audit boundary is armed.
-# Drain its two pipes in one thread with selectors instead. The proposed CLI is
-# still a separate process inside the actor namespace, and output/lifetime are
-# bounded before any bytes are returned to the trusted test worker.
+
 def _bf_run_cli_bounded(command, root, environment):
-    process = _bf_Popen(
-        command,
-        cwd=root,
-        env=environment,
-        start_new_session=True,
-        stdout=_bf_PIPE,
-        stderr=_bf_PIPE,
-    )
+    process = _bf_Popen(command, cwd=root, env=environment,
+                        start_new_session=True, stdout=_bf_PIPE, stderr=_bf_PIPE)
     outputs = [bytearray(), bytearray()]
     streams = (process.stdout, process.stderr)
     selector = _bf_DefaultSelector()
@@ -174,23 +163,13 @@ def _bf_run_cli_bounded(command, root, environment):
                 stream.close()
 
 
-# Audit hooks cannot be removed through Python's public API. The closure owns an
-# immutable blocked-import set plus one ephemeral exact callable permission. A
-# trusted detached launch consumes that permission in the audit callback before
-# the new thread begins. Any thread start reached by proposed Python, including
-# through a recovered preloaded threading/_thread object, has no permission and
-# is rejected before CPython calls the native thread API. CPython's direct and
-# all-thread tracing/profile setters emit sys.settrace/sys.setprofile audit
-# events, so those state changes are rejected before they can install callbacks
-# on the trusted subinterpreter control thread.
+# Retain the existing thread/import/tracing restrictions and bootstrap controls.
 def _bf_make_execution_guard(blocked, error_type):
     allowed = [None]
-
     def arm(target):
         if allowed[0] is not None:
             raise error_type("executor thread permission is already armed")
         allowed[0] = target
-
     def guard(event, args):
         if event == "import" and args and type(args[0]) is str and args[0] in blocked:
             raise error_type("executor bootstrap module import is blocked")
@@ -201,23 +180,17 @@ def _bf_make_execution_guard(blocked, error_type):
             if target is not allowed[0]:
                 raise error_type("proposed thread creation is blocked")
             allowed[0] = None
-
     return arm, guard
 
 _bf_arm_thread_start, _bf_execution_guard = _bf_make_execution_guard(
-    frozenset({
-        "_thread", "threading", "ctypes", "_ctypes", "gc",
-        "_xxsubinterpreters", "_testcapi", "_testinternalcapi",
-    }),
+    frozenset({"_thread", "threading", "ctypes", "_ctypes", "gc",
+               "_xxsubinterpreters", "_testcapi", "_testinternalcapi"}),
     _bf_RuntimeError,
 )
 sys.addaudithook(_bf_execution_guard)
 del _bf_execution_guard, _bf_make_execution_guard
 
 
-# Mandatory bootstrap proof of the load-bearing thread audit event. The outer
-# thread start is explicitly armed by trusted code; an unarmed nested start from
-# that thread must be rejected by the same CPython audit hook proposed code sees.
 def _bf_thread_guard_self_test(destination):
     try:
         _bf_start_new_thread(_bf_sleep, (0.01,))
@@ -237,18 +210,11 @@ if not _bf_thread_guard_probe or _bf_thread_guard_probe.popleft() is not True:
 del _bf_thread_guard_self_test, _bf_thread_guard_probe, _bf_thread_guard_deadline
 
 
-# Mandatory bootstrap proof of the exact cross-thread tracing route reported in
-# review. CPython 3.12 intentionally reports an audit rejection from the private
-# all-thread setters as an unraisable error rather than propagating it to the
-# caller, so success is measured by state: the setter may return normally, but
-# no trace/profile callback may appear on this control thread.
 def _bf_trace_probe(*args):
     return _bf_trace_probe
 
-
 def _bf_ignore_expected_unraisable(unraisable):
     del unraisable
-
 
 _bf_saved_unraisablehook = sys.unraisablehook
 sys.unraisablehook = _bf_ignore_expected_unraisable
@@ -258,37 +224,19 @@ try:
         (_bf_setprofile_all_threads, _bf_getprofile, "_profile_hook", "profile"),
     ):
         if _bf_trace_getter() is not None:
-            raise _bf_RuntimeError(
-                "executor control thread already has a " + _bf_label + " callback"
-            )
+            raise _bf_RuntimeError("executor control thread already has a " + _bf_label + " callback")
         try:
             _bf_trace_setter(_bf_trace_probe)
         except _bf_BaseException:
-            # A future CPython may propagate the audit rejection. That is also a
-            # valid fail-closed outcome as long as no callback was installed.
             pass
         if _bf_trace_getter() is not None:
-            raise _bf_RuntimeError(
-                "proposed cross-thread " + _bf_label + " audit self-test failed"
-            )
+            raise _bf_RuntimeError("proposed cross-thread " + _bf_label + " audit self-test failed")
         _bf_object.__setattr__(_support.threading, _bf_hook_attr, None)
 finally:
     sys.unraisablehook = _bf_saved_unraisablehook
 
-del (
-    _bf_trace_probe,
-    _bf_ignore_expected_unraisable,
-    _bf_saved_unraisablehook,
-    _bf_trace_setter,
-    _bf_trace_getter,
-    _bf_hook_attr,
-    _bf_label,
-)
-
-# Remove straightforward interpreter/thread/frame escape modules from the
-# proposed import surface. These sentinels are defense in depth; the registered
-# audit hook is the irreversible Python-level boundary that prevents pop and
-# re-import, unarmed native thread starts, and cross-thread trace/profile state.
+del (_bf_trace_probe, _bf_ignore_expected_unraisable, _bf_saved_unraisablehook,
+     _bf_trace_setter, _bf_trace_getter, _bf_hook_attr, _bf_label)
 _bf_modules.pop("_blue_forge_executor_support", None)
 _bf_modules["_xxsubinterpreters"] = None
 _bf_modules["gc"] = None
@@ -301,98 +249,35 @@ _bf_modules["_testinternalcapi"] = None
 if _bf_hasattr(sys, "_current_frames"):
     sys._current_frames = None
 
-_BF_OPERATION_SOURCE = r'''
-def execute_action(action, arguments):
+# Neither code object uses globals. A new namespace and function are created
+# per invocation; the control thread independently checks the namespace later.
+# In particular, there is no persistent getattr_fn/import_module dispatch map.
+_bf_compile_namespace = {"__builtins__": {}}
+exec(compile(r'''
+def execute_action(function, arguments, keywords, exception_type, str_type):
     try:
-        if action == "module":
-            value = import_module(arguments[0])
-        elif action == "getattr":
-            value = getattr_fn(*arguments)
-        elif action == "setattr":
-            value = setattr_fn(*arguments)
-        elif action == "delattr":
-            value = delattr_fn(*arguments)
-        elif action == "call":
-            function, args, kwargs = arguments
-            value = function(*args, **kwargs)
-        elif action == "getitem":
-            value = arguments[0][arguments[1]]
-        elif action == "setitem":
-            arguments[0][arguments[1]] = arguments[2]
-            value = None
-        elif action == "delitem":
-            del arguments[0][arguments[1]]
-            value = None
-        elif action == "truth":
-            value = bool_fn(arguments[0])
-        elif action == "len":
-            value = len_fn(arguments[0])
-        elif action == "iterate":
-            items = tuple_fn(islice(iter_fn(arguments[0]), max_nodes + 1))
-            if len_fn(items) > max_nodes:
-                raise RuntimeErrorType("executor iteration budget exceeded")
-            value = items
-        elif action == "next":
-            value = next_fn(arguments[0])
-        elif action == "deepcopy":
-            value = deepcopy(arguments[0])
-        elif action == "replace":
-            value = replace(arguments[0], **arguments[1])
-        elif action == "object_setattr":
-            value = object_type.__setattr__(*arguments)
-        elif action == "export":
-            value = arguments[0]
-        elif action == "cli":
-            cli_args, case_bytes, environment = arguments
-            with TemporaryDirectory() as temp:
-                path = PathType(temp) / "case.json"
-                path.write_bytes(case_bytes)
-                command = [python_executable, "-m", "blue_forge", cli_args[0], str_fn(path)]
-                value = run_cli_bounded(command, root, environment)
-        else:
-            raise RuntimeErrorType("unknown executor operation")
-        return (True, value, "")
-    except BaseExceptionType as exc:
+        return (True, function(*arguments, **keywords), "")
+    except exception_type as exc:
         try:
-            message = str_fn(exc)
-        except BaseExceptionType:
+            message = str_type(exc)
+        except exception_type:
             message = "exception message unavailable"
         return (False, exc, message)
-'''
 
-_operation_globals = {
-    "__builtins__": {},
-    "BaseExceptionType": _bf_BaseException,
-    "RuntimeErrorType": _bf_RuntimeError,
-    "import_module": _bf_import_module,
-    "getattr_fn": _bf_getattr,
-    "setattr_fn": _bf_setattr,
-    "delattr_fn": _bf_delattr,
-    "bool_fn": _bf_bool,
-    "len_fn": _bf_len,
-    "tuple_fn": _bf_tuple,
-    "iter_fn": _bf_iter,
-    "next_fn": _bf_next,
-    "object_type": _bf_object,
-    "str_fn": _bf_str,
-    "islice": _bf_islice,
-    "max_nodes": _bf_max_nodes,
-    "deepcopy": _bf_deepcopy,
-    "replace": _bf_replace,
-    "root": _BF_ROOT,
-    "python_executable": sys.executable,
-    "run_cli_bounded": _bf_run_cli_bounded,
-    "TemporaryDirectory": _bf_temporary_directory,
-    "PathType": Path,
-}
-exec(compile(_BF_OPERATION_SOURCE, "<blue-forge-proposed-operation>", "exec"), _operation_globals)
-_bf_execute_action = _operation_globals["execute_action"]
+def bounded_iterate(value, iter_fn, tuple_fn, islice_fn, len_fn, limit, error_type):
+    items = tuple_fn(islice_fn(iter_fn(value), limit + 1))
+    if len_fn(items) > limit:
+        raise error_type("executor iteration budget exceeded")
+    return items
+''', "<blue-forge-proposed-operation>", "exec"), _bf_compile_namespace)
+_bf_call_code = _bf_compile_namespace["execute_action"].__code__
+_bf_iterate_code = _bf_compile_namespace["bounded_iterate"].__code__
+del _bf_compile_namespace
 
 sys.path.insert(0, _bf_str(_BF_ROOT))
 os.chdir(_BF_ROOT)
 sys.stdout = sys.stderr
 sys.__stdout__ = sys.stderr
-
 _bf_handles = {}
 _bf_identities = {}
 _bf_exported_validation = None
@@ -400,17 +285,58 @@ _bf_exported_blue = None
 _bf_operations = 0
 
 
+def _bf_fresh_function(code):
+    empty_builtins = {}
+    namespace = {"__builtins__": empty_builtins}
+    return _bf_FunctionType(code, namespace), (namespace, empty_builtins)
+
+
+def _bf_check_namespace(record):
+    namespace, empty_builtins = record
+    if _bf_len(namespace) != 1:
+        raise _bf_RuntimeError("proposed operation mutated its invocation namespace")
+    key = _bf_next(_bf_iter(namespace))
+    if (_bf_type(key) is not _bf_str or key != "__builtins__"
+            or namespace[key] is not empty_builtins or _bf_len(empty_builtins) != 0):
+        raise _bf_RuntimeError("proposed operation mutated its invocation namespace")
+
+
+def _bf_select_operation(action, arguments):
+    # This function runs ONLY on the private control thread, never as an
+    # ancestor of proposed Python. Return native operations or existing API
+    # functions; no reference to this dispatch function enters their globals.
+    plain = {
+        "module": _bf_import_module, "getattr": _bf_getattr,
+        "setattr": _bf_setattr, "delattr": _bf_delattr,
+        "getitem": _bf_getitem, "setitem": _bf_setitem,
+        "delitem": _bf_delitem, "truth": _bf_bool,
+        "len": _bf_len, "next": _bf_next, "deepcopy": _bf_deepcopy,
+        "object_setattr": _bf_object.__setattr__,
+    }
+    if action in plain:
+        return plain[action], arguments, {}, None
+    if action == "call":
+        function, args, kwargs = arguments
+        return function, args, kwargs, None
+    if action == "replace":
+        return _bf_replace, (arguments[0],), arguments[1], None
+    if action == "iterate":
+        function, record = _bf_fresh_function(_bf_iterate_code)
+        args = (arguments[0], _bf_iter, _bf_tuple, _bf_islice, _bf_len,
+                _bf_max_nodes, _bf_RuntimeError)
+        return function, args, {}, record
+    if action == "export":
+        return _bf_getitem, (arguments, 0), {}, None
+    raise _bf_RuntimeError("unknown executor operation")
+
+
 def _bf_detached_execute(action, arguments):
+    function, args, kwargs, extra_record = _bf_select_operation(action, arguments)
+    wrapper, record = _bf_fresh_function(_bf_call_code)
     outcomes = _bf_deque()
-    invocation = _bf_partial(_bf_execute_action, action, arguments)
+    invocation = _bf_partial(wrapper, function, args, kwargs, _bf_BaseException, _bf_str)
     calls = _bf_map(_bf_methodcaller("__call__"), (invocation,))
     target = _bf_methodcaller("extend", calls)
-
-    # The importable __main__ is inert for the entire lifetime of proposed
-    # Python execution. The real run-string module returns only after the
-    # detached frame has fully unwound. The audit hook prevents any background
-    # thread or trace/profile callback from surviving this boundary and
-    # observing the restored module.
     _bf_modules["__main__"] = _bf_inert_main
     try:
         _bf_arm_thread_start(target)
@@ -419,15 +345,15 @@ def _bf_detached_execute(action, arguments):
             _bf_sleep(0.001)
     finally:
         _bf_modules["__main__"] = _bf_actual_main
-
+    # Validate before consuming either a value or an exception from the call.
+    _bf_check_namespace(record)
+    if extra_record is not None:
+        _bf_check_namespace(extra_record)
     if _bf_len(outcomes) != 1:
         raise _bf_RuntimeError("detached executor produced an invalid outcome count")
     outcome = outcomes.popleft()
-    if (
-        _bf_type(outcome) is not _bf_tuple
-        or _bf_len(outcome) != 3
-        or _bf_type(outcome[0]) is not _bf_bool
-    ):
+    if (_bf_type(outcome) is not _bf_tuple or _bf_len(outcome) != 3
+            or _bf_type(outcome[0]) is not _bf_bool):
         raise _bf_RuntimeError("detached executor produced a malformed outcome")
     return outcome
 
@@ -461,9 +387,6 @@ def _bf_named_exception(candidate, expected_name, required_base=None):
         return False
     return True
 
-
-# The exact review reproduction must never pass the export guard: object is a
-# type, but it is not an exported BLUE-FORGE exception class.
 if _bf_named_exception(_bf_object, "ValidationError"):
     raise _bf_RuntimeError("executor exception export hierarchy self-test failed")
 
@@ -476,22 +399,12 @@ def _bf_capture_exports():
     namespace = _bf_object.__getattribute__(package, "__dict__")
     validation = namespace.get("ValidationError")
     blue = namespace.get("BlueForgeError")
-
-    # A minimal proposed package may export neither exception. In that case it
-    # gains no exception-classification authority. Partial surfaces are allowed
-    # only for compatibility with trusted boundary fixtures and each present
-    # class must independently prove the expected BLUE-FORGE identity.
     if blue is not None:
-        _bf_require(
-            _bf_named_exception(blue, "BlueForgeError"),
-            "proposed BlueForgeError export has an invalid exception hierarchy",
-        )
+        _bf_require(_bf_named_exception(blue, "BlueForgeError"),
+                    "proposed BlueForgeError export has an invalid exception hierarchy")
     if validation is not None:
-        _bf_require(
-            _bf_named_exception(validation, "ValidationError", blue),
-            "proposed ValidationError export has an invalid exception hierarchy",
-        )
-
+        _bf_require(_bf_named_exception(validation, "ValidationError", blue),
+                    "proposed ValidationError export has an invalid exception hierarchy")
     _bf_exported_blue = blue
     _bf_exported_validation = validation
 
@@ -499,19 +412,14 @@ def _bf_capture_exports():
 def _bf_exception_key(exc):
     cls = _bf_type(exc)
     mro = _bf_type.__getattribute__(cls, "__mro__")
-    if _bf_exported_validation is not None and _bf_any(
-        item is _bf_exported_validation for item in mro
-    ):
+    if _bf_exported_validation is not None and _bf_any(item is _bf_exported_validation for item in mro):
         return "blue_forge.ValidationError"
     if _bf_exported_blue is not None and _bf_any(item is _bf_exported_blue for item in mro):
         return "blue_forge.BlueForgeError"
     exact = {
-        AssertionError: "builtins.AssertionError",
-        AttributeError: "builtins.AttributeError",
-        TypeError: "builtins.TypeError",
-        ValueError: "builtins.ValueError",
-        KeyError: "builtins.KeyError",
-        StopIteration: "builtins.StopIteration",
+        AssertionError: "builtins.AssertionError", AttributeError: "builtins.AttributeError",
+        TypeError: "builtins.TypeError", ValueError: "builtins.ValueError",
+        KeyError: "builtins.KeyError", StopIteration: "builtins.StopIteration",
         RuntimeError: "builtins.RuntimeError",
     }
     return exact.get(cls)
@@ -527,58 +435,46 @@ def _bf_process_one(raw):
         request = _bf_marshal_loads(raw)
     except (EOFError, TypeError, ValueError) as exc:
         raise _bf_RuntimeError("malformed executor subinterpreter request") from exc
-
     _bf_require(_bf_type(request) is _bf_dict, "invalid executor request")
     _bf_require(_bf_type(request.get("action")) is _bf_str, "invalid executor action")
     _bf_require(_bf_type(request.get("nodes")) is _bf_list, "invalid executor graph")
     _bf_require(_bf_type(request.get("arguments")) is _bf_list, "invalid executor arguments")
     _bf_require(_bf_type(request.get("sync")) is _bf_list, "invalid executor sync set")
-
     decoder = _bf_graph_decoder(request["nodes"], _bf_handles)
     arguments = [decoder.decode(value) for value in request["arguments"]]
     action = request["action"]
-
-    # CLI orchestration is trusted code in this interpreter; the proposed CLI
-    # itself runs in a separate child process. The selector-based drain avoids
-    # creating any trusted helper threads after the audit guard is installed.
     if action == "cli":
-        ok, observed, message = _bf_execute_action(action, arguments)
+        # CLI orchestration never enters an in-process proposed call frame.
+        try:
+            cli_args, case_bytes, environment = arguments
+            with _bf_temporary_directory() as temp:
+                path = Path(temp) / "case.json"
+                path.write_bytes(case_bytes)
+                command = [sys.executable, "-m", "blue_forge", cli_args[0], _bf_str(path)]
+                observed = _bf_run_cli_bounded(command, _BF_ROOT, environment)
+            ok, message = True, ""
+        except _bf_BaseException as exc:
+            ok, observed, message = False, exc, _bf_str(exc)
     else:
         ok, observed, message = _bf_detached_execute(action, arguments)
-
     if ok:
         if action == "module":
             _bf_capture_exports()
-        observation = {
-            "ok": True,
-            "value": (
-                ["data", _bf_encode_data(_bf_encode_data(observed))]
-                if action == "export"
-                else _bf_result(observed)
-            ),
-        }
+        observation = {"ok": True, "value": (
+            ["data", _bf_encode_data(_bf_encode_data(observed))]
+            if action == "export" else _bf_result(observed))}
     else:
-        observation = {
-            "ok": False,
-            "error": _bf_exception_key(observed),
-            "message": message,
-        }
-
+        observation = {"ok": False, "error": _bf_exception_key(observed), "message": message}
     states = {}
     for key in request.get("sync", []):
         if key in decoder.cache:
             states[_bf_str(key)] = _bf_encode_data(
-                _bf_object.__getattribute__(decoder.cache[key], "__dict__")
-            )
+                _bf_object.__getattribute__(decoder.cache[key], "__dict__"))
     observation["states"] = states
     payload = _bf_marshal_dumps(observation, 4)
     _bf_require(_bf_len(payload) <= _BF_MAX_FRAME_BYTES,
                 "executor subinterpreter response exceeds byte budget")
-
-    # Raised only after any proposed in-process frame has unwound and __main__
-    # has been restored. Proposed exceptions were already converted to data.
     raise _bf_SystemExit(_BF_RESPONSE_PREFIX + payload.hex())
-
 
 if _bf_modules.get("__main__") is not _bf_actual_main:
     raise _bf_RuntimeError("executor subinterpreter main module was not preserved")
@@ -598,8 +494,7 @@ def _read_exact(stream, count: int) -> bytes:
 
 
 def _read_frame(stream, loads) -> object:
-    header = _read_exact(stream, 8)
-    size = int.from_bytes(header, "big")
+    size = int.from_bytes(_read_exact(stream, 8), "big")
     if size > MAX_FRAME_BYTES:
         raise RuntimeError("executor request exceeds byte budget")
     return loads(_read_exact(stream, size))
@@ -617,16 +512,10 @@ def _write_frame(stream, value: object, dumps) -> None:
 def _validate_request(request: object) -> dict:
     if type(request) is not dict:
         raise RuntimeError("invalid executor request")
-    if type(request.get("sequence")) is not int:
-        raise RuntimeError("invalid executor sequence")
-    if type(request.get("action")) is not str:
-        raise RuntimeError("invalid executor action")
-    if type(request.get("nodes")) is not list:
-        raise RuntimeError("invalid executor graph")
-    if type(request.get("arguments")) is not list:
-        raise RuntimeError("invalid executor arguments")
-    if type(request.get("sync")) is not list:
-        raise RuntimeError("invalid executor sync set")
+    for field, expected in (("sequence", int), ("action", str), ("nodes", list),
+                            ("arguments", list), ("sync", list)):
+        if type(request.get(field)) is not expected:
+            raise RuntimeError("invalid executor request field: " + field)
     return request
 
 
@@ -652,8 +541,7 @@ def _decode_runfailed(exc: BaseException, loads) -> object:
 def _response_from_observation(sequence: int, observation: object) -> dict:
     if type(observation) is not dict:
         raise RuntimeError("invalid executor observation")
-    ok = observation.get("ok")
-    states = observation.get("states")
+    ok, states = observation.get("ok"), observation.get("states")
     if type(ok) is not bool or type(states) is not dict:
         raise RuntimeError("malformed executor observation")
     response = {"sequence": sequence, "ok": ok, "states": states}
@@ -664,81 +552,152 @@ def _response_from_observation(sequence: int, observation: object) -> dict:
     else:
         if "error" not in observation or type(observation.get("message")) is not str:
             raise RuntimeError("executor failure omitted identity")
-        response["error"] = observation.get("error")
-        response["message"] = observation["message"]
+        response["error"], response["message"] = observation["error"], observation["message"]
     return response
 
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        raise RuntimeError("executor requires one proposed source root")
-    root = Path(sys.argv[1]).resolve()
-    if not root.is_dir() or root.is_symlink():
-        raise RuntimeError("invalid proposed executor root")
+def _native_api():
+    if sys.platform != "linux" or ctypes.sizeof(ctypes.c_void_p) != 8:
+        raise RuntimeError("executor requires 64-bit Linux process isolation")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    libc.prctl.restype = ctypes.c_int
+    libc.sem_init.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint]
+    libc.sem_init.restype = ctypes.c_int
+    for name in ("sem_trywait", "sem_post", "sem_destroy"):
+        function = getattr(libc, name)
+        function.argtypes = [ctypes.c_void_p]
+        function.restype = ctypes.c_int
+    return libc
 
-    support_path = Path(__file__).with_name("_run_frozen_tests_supervised_impl.py").resolve()
-    support_info = support_path.stat()
-    if not support_path.is_file() or support_info.st_mode & 0o022:
-        raise RuntimeError("trusted executor support is unavailable or writable")
 
+def _prctl(libc, operation: int, argument: int = 0) -> int:
+    result = libc.prctl(operation, argument, 0, 0, 0)
+    if result < 0:
+        raise OSError(ctypes.get_errno(), "executor process protection failed")
+    return result
+
+
+class _Mailbox:
+    """One bounded slot; native process-shared semaphores, no backing fd.
+
+    Linux's 64-bit sem_t fits in an aligned 64-byte reservation. Neither the
+    mappings nor their native pointers are shared into the proposed interpreter.
+    Semaphore publication supplies the inter-process memory-ordering boundary.
+    """
+    HEADER = 128
+    DATA = 144
+
+    def __init__(self, libc):
+        self.libc = libc
+        self.storage = mmap.mmap(-1, self.DATA + MAX_FRAME_BYTES)
+        self.address = ctypes.addressof(ctypes.c_char.from_buffer(self.storage))
+        self.initialized = []
+        try:
+            for offset, value in ((0, 1), (64, 0)):
+                if libc.sem_init(self.address + offset, 1, value) != 0:
+                    raise OSError(ctypes.get_errno(), "executor semaphore setup failed")
+                self.initialized.append(offset)
+        except BaseException:
+            self.close()
+            raise
+
+    def _wait(self, offset, deadline, alive):
+        while True:
+            if alive is not None:
+                alive()
+            if self.libc.sem_trywait(self.address + offset) == 0:
+                return
+            error = ctypes.get_errno()
+            if error not in (errno.EAGAIN, errno.EINTR):
+                raise OSError(error, "executor mailbox wait failed")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("executor mailbox lifetime budget exceeded")
+            time.sleep(0.0005)
+
+    def _post(self, offset):
+        if self.libc.sem_post(self.address + offset) != 0:
+            raise OSError(ctypes.get_errno(), "executor mailbox publication failed")
+
+    def send(self, generation, payload, *, seconds=OPERATION_SECONDS, alive=None):
+        if type(payload) is not bytes or len(payload) > MAX_FRAME_BYTES:
+            raise RuntimeError("executor mailbox byte budget exceeded")
+        if type(generation) is not int or not 0 <= generation <= MAX_OPERATIONS:
+            raise RuntimeError("invalid executor mailbox generation")
+        self._wait(0, time.monotonic() + seconds, alive)
+        self.storage[self.DATA:self.DATA + len(payload)] = payload
+        self.storage[self.HEADER:self.DATA] = (
+            generation.to_bytes(8, "big") + len(payload).to_bytes(8, "big"))
+        self._post(64)
+
+    def receive(self, *, seconds=OPERATION_SECONDS, alive=None):
+        self._wait(64, time.monotonic() + seconds, alive)
+        header = self.storage[self.HEADER:self.DATA]
+        generation, size = int.from_bytes(header[:8], "big"), int.from_bytes(header[8:], "big")
+        if generation > MAX_OPERATIONS or size > MAX_FRAME_BYTES:
+            raise RuntimeError("invalid executor mailbox header")
+        payload = self.storage[self.DATA:self.DATA + size]
+        self._post(0)
+        return generation, payload
+
+    def close(self):
+        if self.storage.closed:
+            return
+        for offset in self.initialized:
+            self.libc.sem_destroy(self.address + offset)
+        self.initialized.clear()
+        self.storage.close()
+
+
+def _remove_inherited_transport(libc, parent_pid):
+    _prctl(libc, 1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    if os.getppid() != parent_pid:
+        raise RuntimeError("executor transport parent disappeared during fork")
+    # There is no fallback that leaves the upstream pipe reachable by proposed
+    # Python. Anonymous mailboxes have no fd to preserve here.
+    null = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
     try:
-        import _xxsubinterpreters as interpreters
-    except ImportError as exc:
-        raise RuntimeError("CPython subinterpreter support is unavailable") from exc
-
-    loads = marshal.loads
-    dumps = marshal.dumps
-    wire_in = sys.stdin.buffer
-    transport_stdout = sys.stdout
-    wire_out = transport_stdout.buffer
+        os.dup2(null, 0)
+        os.dup2(2, 1)
+    finally:
+        if null > 2:
+            os.close(null)
+    limit = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    if limit == resource.RLIM_INFINITY:
+        raise RuntimeError("executor descriptor ceiling is unavailable")
+    os.closerange(3, limit)
     sys.stdout = sys.stderr
     sys.__stdout__ = sys.stderr
+    # Actual descriptor identity, not just replacement Python stream objects.
+    if os.fstat(1) != os.fstat(2):
+        raise RuntimeError("executor diagnostic descriptor separation failed")
 
+
+def _application_loop(root, support_path, requests, responses):
+    import _xxsubinterpreters as interpreters
+    loads, dumps = marshal.loads, marshal.dumps
     interpreter = interpreters.create()
-    bootstrap = (
-        _SUBINTERPRETER_BOOTSTRAP
-        .replace("__ROOT__", repr(str(root)))
-        .replace("__SUPPORT__", repr(str(support_path)))
-        .replace("__MAX_FRAME_BYTES__", str(MAX_FRAME_BYTES))
-        .replace("__MAX_OPERATIONS__", str(MAX_OPERATIONS))
-        .replace("__RESPONSE_PREFIX__", repr(_RESPONSE_PREFIX))
-    )
-
+    bootstrap = (_SUBINTERPRETER_BOOTSTRAP
+                 .replace("__ROOT__", repr(str(root)))
+                 .replace("__SUPPORT__", repr(str(support_path)))
+                 .replace("__MAX_FRAME_BYTES__", str(MAX_FRAME_BYTES))
+                 .replace("__MAX_OPERATIONS__", str(MAX_OPERATIONS))
+                 .replace("__RESPONSE_PREFIX__", repr(_RESPONSE_PREFIX)))
     try:
         interpreters.run_string(interpreter, bootstrap)
-        for _number in range(MAX_OPERATIONS):
+        responses.send(0, b"executor-process-ready")
+        for expected in range(1, MAX_OPERATIONS + 1):
+            generation, payload = requests.receive(seconds=35.0)
+            if generation != expected:
+                raise RuntimeError("executor application generation mismatch")
             try:
-                request = _validate_request(_read_frame(wire_in, loads))
-            except EOFError:
-                return 0
-
-            request_payload = dumps(
-                {
-                    "action": request["action"],
-                    "nodes": request["nodes"],
-                    "arguments": request["arguments"],
-                    "sync": request["sync"],
-                },
-                4,
-            )
-            if len(request_payload) > MAX_FRAME_BYTES:
-                raise RuntimeError("executor request exceeds byte budget")
-
-            try:
-                interpreters.run_string(
-                    interpreter,
-                    "_bf_process_one(_bf_request)",
-                    {"_bf_request": request_payload},
-                )
+                interpreters.run_string(interpreter, "_bf_process_one(_bf_request)",
+                                        {"_bf_request": payload})
             except interpreters.RunFailedError as exc:
                 observation = _decode_runfailed(exc, loads)
             else:
                 raise RuntimeError("proposed subinterpreter omitted response envelope")
-
-            # Final response construction and broker-facing framing occur only
-            # in this interpreter, which never imported proposed application code.
-            response = _response_from_observation(request["sequence"], observation)
-            _write_frame(wire_out, response, dumps)
+            responses.send(generation, dumps(observation, 4))
         raise RuntimeError("executor operation budget exceeded")
     finally:
         try:
@@ -747,9 +706,99 @@ def main() -> int:
             pass
 
 
+class _Application:
+    def __init__(self, root, support_path):
+        libc = _native_api()
+        _prctl(libc, 4, 0)  # PR_SET_DUMPABLE: deny reopening parent fds via /proc.
+        if _prctl(libc, 3) != 0:  # PR_GET_DUMPABLE
+            raise RuntimeError("executor transport is still dumpable")
+        self.pid = None
+        self.requests = _Mailbox(libc)
+        try:
+            self.responses = _Mailbox(libc)
+        except BaseException:
+            self.requests.close()
+            raise
+        parent_pid = os.getpid()
+        try:
+            pid = os.fork()  # Before any subinterpreter or helper thread exists.
+            if pid == 0:
+                try:
+                    _remove_inherited_transport(libc, parent_pid)
+                    _application_loop(root, support_path, self.requests, self.responses)
+                except BaseException as exc:
+                    print(f"executor_application=FAIL reason={str(exc)!r}", file=sys.stderr)
+                finally:
+                    os._exit(1)
+            self.pid = pid
+            if self.responses.receive(alive=self._alive) != (0, b"executor-process-ready"):
+                raise RuntimeError("executor application omitted bootstrap completion")
+        except BaseException:
+            self.close()
+            raise
+
+    def _alive(self):
+        if self.pid is None:
+            raise RuntimeError("executor application is not running")
+        waited, status = os.waitpid(self.pid, os.WNOHANG)
+        if waited:
+            self.pid = None
+            raise RuntimeError(f"executor application exited without completion: status={status}")
+
+    def observe(self, generation, request):
+        self.requests.send(generation, request, alive=self._alive)
+        observed_generation, payload = self.responses.receive(alive=self._alive)
+        if observed_generation != generation:
+            raise RuntimeError("executor observation generation mismatch")
+        return marshal.loads(payload)
+
+    def close(self):
+        if self.pid is not None:
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(self.pid, 0)
+            self.pid = None
+        self.requests.close()
+        self.responses.close()
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        raise RuntimeError("executor requires one proposed source root")
+    root = Path(sys.argv[1]).resolve()
+    if not root.is_dir() or root.is_symlink():
+        raise RuntimeError("invalid proposed executor root")
+    support_path = Path(__file__).with_name("_run_frozen_tests_supervised_impl.py").resolve()
+    support_info = support_path.stat()
+    if not support_path.is_file() or support_info.st_mode & 0o022:
+        raise RuntimeError("trusted executor support is unavailable or writable")
+    loads, dumps = marshal.loads, marshal.dumps
+    wire_in, wire_out = sys.stdin.buffer, sys.stdout.buffer
+    sys.stdout = sys.stderr
+    sys.__stdout__ = sys.stderr
+    application = _Application(root, support_path)
+    try:
+        for generation in range(1, MAX_OPERATIONS + 1):
+            try:
+                request = _validate_request(_read_frame(wire_in, loads))
+            except EOFError:
+                return 0
+            payload = dumps({key: request[key] for key in ("action", "nodes", "arguments", "sync")}, 4)
+            observation = application.observe(generation, payload)
+            # Neither this process nor the broker imports proposed code.
+            response = _response_from_observation(request["sequence"], observation)
+            _write_frame(wire_out, response, dumps)
+        raise RuntimeError("executor operation budget exceeded")
+    finally:
+        application.close()
+
+
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        exit_code = main()
     except BaseException as exc:
         print(f"proposed_executor=FAIL reason={str(exc)!r}", file=sys.stderr)
-        raise SystemExit(1)
+        exit_code = 1
+    raise SystemExit(exit_code)

@@ -81,6 +81,17 @@ def _stop_executor(process):
         raise base.SupervisionFailure("proposed executor did not terminate") from exc
 
 
+def _protect_broker_process():
+    # Closing inherited fds is insufficient if a same-UID descendant can reopen
+    # a broker fd through /proc. Apply the native control before spawning it.
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    libc.prctl.restype = ctypes.c_int
+    if libc.prctl(4, 0, 0, 0, 0) != 0 or libc.prctl(3, 0, 0, 0, 0) != 0:
+        raise base.SupervisionFailure("broker descriptor-reopening protection failed")
+
+
 def _broker_actor(root):
     """Broker worker RPC without importing proposed code in this interpreter."""
     root = root.resolve()
@@ -89,6 +100,7 @@ def _broker_actor(root):
         stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
         "proposed executor must be a root-owned non-writable regular file",
     )
+    _protect_broker_process()
 
     wire_in, wire_out = sys.stdin.buffer, sys.stdout.buffer
     sys.stdout = sys.stderr
@@ -567,6 +579,90 @@ def _self_test_transport_process_boundary(python_bin, timeout_seconds, *, local_
         )
 
 
+def _self_test_dispatch_and_descriptors(python_bin, timeout_seconds, *, local_test=False):
+    """Paired reproductions for dispatch poisoning and raw process-fd forgery."""
+    dispatch = r'''
+import inspect
+frame = inspect.currentframe()
+while frame is not None:
+    namespace = frame.f_globals
+    if frame.f_code.co_name == 'execute_action' and 'getattr_fn' in namespace:
+        original = namespace['getattr_fn']
+        namespace['getattr_fn'] = lambda obj, name: (lambda: 'real') if name == 'probe' else original(obj, name)
+    frame = frame.f_back
+del frame
+def probe(): return 'wrong'
+'''
+    descriptors = r'''
+import os
+import marshal
+for sequence, value in ((1, ['handle', [0, 'module']]),
+                         (2, ['handle', [1, 'function']]),
+                         (3, ['data', ['scalar', 'real']])):
+    payload = marshal.dumps({'sequence': sequence, 'ok': True, 'value': value, 'states': {}}, 4)
+    os.write(1, len(payload).to_bytes(8, 'big') + payload)
+os.dup2(2, 1)
+def probe(): return 'wrong'
+'''
+    reopening = r'''
+import os
+from pathlib import Path
+def probe():
+    parent = os.getppid()
+    # Both the immediate transport parent and its upstream broker must deny
+    # same-UID descriptor reopening. No data is written even on failure.
+    for _ in range(2):
+        try:
+            fd = os.open('/proc/%d/fd/1' % parent, os.O_WRONLY)
+        except PermissionError:
+            pass
+        else:
+            os.close(fd)
+            return 'reopened'
+        status = Path('/proc/%d/status' % parent).read_text()
+        parent = int(next(line.split()[1] for line in status.splitlines() if line.startswith('PPid:')))
+    return 'wrong'
+'''
+    mutation = r'''
+import inspect
+frame = inspect.currentframe()
+while frame is not None:
+    if frame.f_code.co_name == 'execute_action':
+        frame.f_globals['getattr_fn'] = lambda *args: (lambda: 'real')
+    frame = frame.f_back
+del frame
+def probe(): return 'wrong'
+'''
+    for name, source in (("dispatch", dispatch), ("descriptors", descriptors),
+                         ("reopening", reopening), ("mutation", mutation)):
+        with tempfile.TemporaryDirectory(prefix="blue-forge-boundary-selftest-") as temp:
+            root = Path(temp)
+            root.chmod(0o755)
+            (root / "tests").mkdir()
+            (root / "blue_forge").mkdir()
+            (root / "blue_forge/__init__.py").write_text(source, encoding="utf-8")
+            (root / "tests/test_boundary.py").write_text(
+                "import unittest\nimport blue_forge\n"
+                "class Boundary(unittest.TestCase):\n"
+                " def test_truth(self): self.assertEqual(blue_forge.probe(), 'wrong')\n"
+                " def test_forgery(self): self.assertEqual(blue_forge.probe(), 'real')\n",
+                encoding="utf-8",
+            )
+            if name != "mutation":
+                base.run_one(root, python_bin, ("test_boundary", "Boundary", "test_truth"),
+                             timeout_seconds, local_test=local_test)
+            try:
+                base.run_one(root, python_bin, ("test_boundary", "Boundary", "test_forgery"),
+                             timeout_seconds, local_test=local_test)
+            except base.SupervisionFailure as exc:
+                if name == "mutation":
+                    base.require("mutated its invocation namespace" in str(exc),
+                                 "namespace mutation failed for an unrelated reason")
+            else:
+                raise base.SupervisionFailure("executor boundary self-test accepted " + name)
+    print("executor_dispatch_isolation=PASS executor_descriptor_isolation=PASS")
+
+
 _original_self_test = base._self_test
 
 
@@ -577,6 +673,9 @@ def _combined_self_test(python_bin, timeout_seconds, *, local_test=False):
         python_bin, timeout_seconds, local_test=local_test
     )
     _self_test_transport_process_boundary(
+        python_bin, timeout_seconds, local_test=local_test
+    )
+    _self_test_dispatch_and_descriptors(
         python_bin, timeout_seconds, local_test=local_test
     )
 
