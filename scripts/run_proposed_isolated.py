@@ -10,9 +10,11 @@ before proposed Python starts. Three fixed modes are supported:
   test-module import/top-level code, inside an aggregate resource/filesystem
   boundary while retaining access only to the fixed nested actor helper.
 
-No proposed Python runs with elevated authority. Actor mode additionally masks
-/proc after PID-namespace setup so proposed Python cannot use /proc/self/mem to
-rewrite inherited trusted mappings. In supervised-suite mode the filesystem is
+No proposed Python runs with elevated authority. Trusted RPC actor mode
+additionally masks /proc after PID-namespace setup so proposed BLUE-FORGE Python
+cannot use /proc/self/mem to rewrite inherited trusted mappings. Fixed-helper
+kernel diagnostics may retain the namespace-local read-only procfs because they
+inherit no trusted RPC mailbox. In supervised-suite mode the filesystem is
 recursively read-only and nosuid except for an isolated bind mount of
 /usr/bin/sudo. Sudo policy permits only this fixed launcher, so PR-controlled
 test code cannot turn that narrow elevation path into arbitrary root execution.
@@ -56,9 +58,9 @@ SYSTEMCTL = Path("/usr/bin/systemctl")
 FIXED_HELPER = Path("/usr/local/libexec/blue-forge-rpc")
 
 # Actor/direct setup: all host mounts become read-only+nosuid, followed by one
-# private writable tmpfs owned by the unprivileged target. Actor mode overlays
-# /proc with an empty read-only tmpfs after unshare --mount-proc has completed;
-# direct-suite mode retains procfs for its diagnostic/current-suite assertions.
+# private writable tmpfs owned by the unprivileged target. The governed RPC
+# actor overlays /proc with an empty read-only tmpfs after unshare --mount-proc;
+# fixed-helper diagnostics/direct-suite retain procfs for kernel assertions.
 FILESYSTEM_SETUP = r'''
 import ctypes
 import os
@@ -100,10 +102,10 @@ attributes = MountAttr(1 | 2, 0, 0, 0)  # RDONLY | NOSUID
 checked(mount_setattr(-100, b"/", 0x8000, ctypes.byref(attributes),
                      ctypes.sizeof(attributes)), "recursive read-only mount tree")
 if mask_proc == "1":
-    # The actor needs no procfs API after namespace setup. Cover the namespace's
-    # procfs mount with a private, empty, read-only filesystem before dropping
-    # privileges. This removes /proc/self/mem and /proc/*/fd as memory/descriptor
-    # escape hatches without exposing a writable host-backed replacement.
+    # The trusted RPC actor needs no procfs API after namespace setup. Cover the
+    # namespace's procfs mount with a private, empty, read-only filesystem before
+    # dropping privileges. Fixed-helper diagnostics use mask_proc=0 because they
+    # inherit no trusted response mailbox and need /proc for cgroup assertions.
     proc_options = b"size=4096,nr_inodes=16,mode=0555,uid=0,gid=0"
     checked(mount(b"tmpfs", b"/proc", b"tmpfs", 1 | 2 | 4 | 8, proc_options),
             "mask actor procfs")
@@ -486,7 +488,12 @@ def main() -> int:
             str(storage_bytes), str(storage_inodes), str(source_root),
         ]
         if mode != "supervised":
-            setup_args.append("1" if mode == "actor" else "0")
+            mask_rpc_proc = (
+                mode == "actor"
+                and supervisor is not None
+                and supervisor.name == "run_frozen_tests_supervised.py"
+            )
+            setup_args.append("1" if mask_rpc_proc else "0")
         namespace_command = [
             "/usr/bin/setpriv", "--pdeathsig=KILL", "--",
             "/usr/bin/unshare", "--mount", "--propagation", "private",
