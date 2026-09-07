@@ -2,22 +2,35 @@
 """Untrusted-side executor for the BLUE-FORGE supervised RPC bridge.
 
 This process imports proposed application code and retains proposed Python object
-handles.  It never speaks the trusted worker protocol directly.  A separate
+handles. It never speaks the trusted worker protocol directly. A separate
 baseline-owned broker process validates requests, receives these bounded
 observations over a private binary channel, and constructs the worker-facing
 response with serializer state that proposed imports cannot reach.
 
-The executor therefore has no signing key and no authority to declare a test
-successful.  Its observations remain untrusted application data.
+Proposed operations execute on a detached native thread. Their Python frame
+chain terminates inside a transport-free dispatch frame; request framing,
+worker-facing output, and marshal serialization remain on the executor's main
+thread. The executor therefore has no signing key and no authority to declare a
+test successful. Its observations remain untrusted application data.
 """
 from __future__ import annotations
 
+import collections
+import copy
+import dataclasses
+import functools
+import importlib
 import importlib.util
+import inspect
+import itertools
 import marshal
+import operator
 import os
 from pathlib import Path
 import sys
 import tempfile
+import _thread
+import time
 
 
 MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -61,6 +74,122 @@ def _write_frame(stream, value: object, dumps) -> None:
     stream.flush()
 
 
+def _execute_action(action: str, arguments: list[object], context: tuple[object, ...]):
+    """Execute proposed behavior without any response-transport ancestor frame.
+
+    This function is entered from CPython's native _thread bootstrap through
+    C-implemented operator/functools/deque combinators. Proposed Python called
+    below can inspect its own Python ancestors, but those ancestors contain no
+    request framing, response stream, marshal codec, signing material, or result
+    sink. The C trampoline records this function's returned outcome only after
+    the proposed frame has unwound.
+    """
+    (
+        import_module,
+        islice,
+        max_nodes,
+        deepcopy,
+        replace,
+        root,
+        python_executable,
+        run_cli_bounded,
+    ) = context
+    try:
+        if action == "module":
+            value = import_module(arguments[0])
+        elif action == "getattr":
+            value = getattr(*arguments)
+        elif action == "setattr":
+            value = setattr(*arguments)
+        elif action == "delattr":
+            value = delattr(*arguments)
+        elif action == "call":
+            function, args, kwargs = arguments
+            value = function(*args, **kwargs)
+        elif action == "getitem":
+            value = arguments[0][arguments[1]]
+        elif action == "setitem":
+            arguments[0][arguments[1]] = arguments[2]
+            value = None
+        elif action == "delitem":
+            del arguments[0][arguments[1]]
+            value = None
+        elif action == "truth":
+            value = bool(arguments[0])
+        elif action == "len":
+            value = len(arguments[0])
+        elif action == "iterate":
+            items = tuple(islice(iter(arguments[0]), max_nodes + 1))
+            if len(items) > max_nodes:
+                raise RuntimeError("executor iteration budget exceeded")
+            value = items
+        elif action == "next":
+            value = next(arguments[0])
+        elif action == "deepcopy":
+            value = deepcopy(arguments[0])
+        elif action == "replace":
+            value = replace(arguments[0], **arguments[1])
+        elif action == "object_setattr":
+            value = object.__setattr__(*arguments)
+        elif action == "export":
+            value = arguments[0]
+        elif action == "cli":
+            cli_args, case_bytes, environment = arguments
+            with tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "case.json"
+                path.write_bytes(case_bytes)
+                command = [python_executable, "-m", "blue_forge", cli_args[0], str(path)]
+                value = run_cli_bounded(command, root, environment)
+        else:
+            raise RuntimeError("unknown executor operation")
+        return (True, value, "")
+    except BaseException as exc:
+        try:
+            message = str(exc)
+        except BaseException:
+            message = "exception message unavailable"
+        return (False, exc, message)
+
+
+def _detached_execute(action: str, arguments: list[object], context: tuple[object, ...]):
+    """Run one dispatch on a native thread and return exactly one C-deposited outcome."""
+    outcomes = collections.deque()
+    invocation = functools.partial(_execute_action, action, arguments, context)
+    calls = map(operator.methodcaller("__call__"), (invocation,))
+    target = operator.methodcaller("extend", calls)
+    _thread.start_new_thread(target, (outcomes,))
+    while not outcomes:
+        time.sleep(0.001)
+    if len(outcomes) != 1:
+        raise RuntimeError("detached executor produced an invalid outcome count")
+    outcome = outcomes.popleft()
+    if type(outcome) is not tuple or len(outcome) != 3 or type(outcome[0]) is not bool:
+        raise RuntimeError("detached executor produced a malformed outcome")
+    return outcome
+
+
+def _self_test_frame_boundary(context: tuple[object, ...]) -> None:
+    """Prove detached proposed frames cannot climb into transport-frame locals."""
+    def probe():
+        frame = inspect.currentframe().f_back
+        while frame is not None:
+            namespace = frame.f_locals
+            if any(name in namespace for name in ("wire_out", "request", "dumps")):
+                return False
+            frame = frame.f_back
+        return True
+
+    # These names intentionally mirror the transport locals attacked in review.
+    wire_out = object()
+    request = {"sequence": 1}
+    dumps = marshal.dumps
+    if not wire_out or not request or not dumps:
+        raise RuntimeError("executor frame-boundary self-test setup failed")
+    ok, observed, message = _detached_execute("call", [probe, (), {}], context)
+    if not ok or observed is not True or message != "":
+        raise RuntimeError("executor detached frame boundary self-test failed")
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         raise RuntimeError("executor requires one proposed source root")
@@ -69,8 +198,6 @@ def main() -> int:
         raise RuntimeError("invalid proposed executor root")
 
     support = _load_impl()
-    # Capture support objects before any proposed import.  The broker never
-    # imports proposed code, and worker-facing serialization does not occur here.
     graph_decoder = support._GraphDecoder
     encode_data = support._encode_data
     run_cli_bounded = support._run_cli_bounded
@@ -83,12 +210,25 @@ def main() -> int:
     loads = marshal.loads
     dumps = marshal.dumps
 
+    dispatch_context = (
+        import_module,
+        islice,
+        max_nodes,
+        deepcopy,
+        replace,
+        root,
+        sys.executable,
+        run_cli_bounded,
+    )
+    _self_test_frame_boundary(dispatch_context)
+
     sys.path.insert(0, str(root))
     os.chdir(root)
     wire_in = sys.stdin.buffer
     wire_out = sys.stdout.buffer
-    # Proposed stdout must never share the binary observation channel.
     sys.stdout = sys.stderr
+    sys.__stdout__ = sys.stderr
+    sys._current_frames = None
 
     handles: dict[int, object] = {}
     identities: dict[int, int] = {}
@@ -106,7 +246,8 @@ def main() -> int:
             handle = len(handles)
             identities[oid] = handle
             handles[handle] = value
-        return ["handle", [identities[oid], type(value).__name__]]
+        name = type.__getattribute__(type(value), "__name__")
+        return ["handle", [identities[oid], name]]
 
     def capture_exports() -> None:
         nonlocal exported_validation, exported_blue
@@ -154,65 +295,21 @@ def main() -> int:
         decoder = graph_decoder(request["nodes"], handles)
         arguments = [decoder.decode(value) for value in request["arguments"]]
         action = request["action"]
-        try:
+        ok, observed, message = _detached_execute(action, arguments, dispatch_context)
+        if ok:
             if action == "module":
-                value = import_module(arguments[0])
                 capture_exports()
-            elif action == "getattr":
-                value = getattr(*arguments)
-            elif action == "setattr":
-                value = setattr(*arguments)
-            elif action == "delattr":
-                value = delattr(*arguments)
-            elif action == "call":
-                function, args, kwargs = arguments
-                value = function(*args, **kwargs)
-            elif action == "getitem":
-                value = arguments[0][arguments[1]]
-            elif action == "setitem":
-                arguments[0][arguments[1]] = arguments[2]
-                value = None
-            elif action == "delitem":
-                del arguments[0][arguments[1]]
-                value = None
-            elif action == "truth":
-                value = bool(arguments[0])
-            elif action == "len":
-                value = len(arguments[0])
-            elif action == "iterate":
-                items = tuple(islice(iter(arguments[0]), max_nodes + 1))
-                require(len(items) <= max_nodes, "executor iteration budget exceeded")
-                value = items
-            elif action == "next":
-                value = next(arguments[0])
-            elif action == "deepcopy":
-                value = deepcopy(arguments[0])
-            elif action == "replace":
-                value = replace(arguments[0], **arguments[1])
-            elif action == "object_setattr":
-                value = object.__setattr__(*arguments)
-            elif action == "export":
-                value = encode_data(arguments[0])
-            elif action == "cli":
-                cli_args, case_bytes, environment = arguments
-                with tempfile.TemporaryDirectory() as temp:
-                    path = Path(temp) / "case.json"
-                    path.write_bytes(case_bytes)
-                    command = [sys.executable, "-m", "blue_forge", cli_args[0], str(path)]
-                    value = run_cli_bounded(command, root, environment)
-            else:
-                raise RuntimeError("unknown executor operation")
             response = {
                 "sequence": request["sequence"],
                 "ok": True,
-                "value": ["data", encode_data(value)] if action == "export" else result(value),
+                "value": ["data", encode_data(observed)] if action == "export" else result(observed),
             }
-        except BaseException as exc:
+        else:
             response = {
                 "sequence": request["sequence"],
                 "ok": False,
-                "error": exception_key(exc),
-                "message": str(exc),
+                "error": exception_key(observed),
+                "message": message,
             }
 
         states = {}
