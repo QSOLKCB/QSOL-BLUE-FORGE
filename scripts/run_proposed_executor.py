@@ -95,6 +95,8 @@ _bf_actual_main = _bf_modules["__main__"]
 _bf_inert_main = types.ModuleType("__main__")
 _bf_os_read = os.read
 _bf_set_blocking = os.set_blocking
+_bf_gettrace = sys.gettrace
+_bf_getprofile = sys.getprofile
 
 _spec = importlib.util.spec_from_file_location(
     "_blue_forge_executor_support", _BF_SUPPORT_PATH
@@ -236,31 +238,52 @@ del _bf_thread_guard_self_test, _bf_thread_guard_probe, _bf_thread_guard_deadlin
 
 
 # Mandatory bootstrap proof of the exact cross-thread tracing route reported in
-# review. threading.settrace_all_threads()/setprofile_all_threads() eventually
-# invoke CPython's audited all-thread setters. The hook must reject both before a
-# callback can be installed on the run-string control thread.
+# review. CPython 3.12 intentionally reports an audit rejection from the private
+# all-thread setters as an unraisable error rather than propagating it to the
+# caller, so success is measured by state: the setter may return normally, but
+# no trace/profile callback may appear on this control thread.
 def _bf_trace_probe(*args):
     return _bf_trace_probe
 
-for _bf_trace_setter, _bf_hook_attr, _bf_label in (
-    (_bf_settrace_all_threads, "_trace_hook", "trace"),
-    (_bf_setprofile_all_threads, "_profile_hook", "profile"),
-):
-    try:
-        _bf_trace_setter(_bf_trace_probe)
-    except _bf_BaseException:
-        pass
-    else:
-        # If the expected CPython audit event ever disappears, clear the benign
-        # probe before failing closed so bootstrap diagnostics remain bounded.
-        _bf_trace_setter(None)
-        raise _bf_RuntimeError(
-            "proposed cross-thread " + _bf_label + " audit self-test failed"
-        )
-    finally:
-        _bf_object.__setattr__(_support.threading, _bf_hook_attr, None)
 
-del _bf_trace_probe, _bf_trace_setter, _bf_hook_attr, _bf_label
+def _bf_ignore_expected_unraisable(unraisable):
+    del unraisable
+
+
+_bf_saved_unraisablehook = sys.unraisablehook
+sys.unraisablehook = _bf_ignore_expected_unraisable
+try:
+    for _bf_trace_setter, _bf_trace_getter, _bf_hook_attr, _bf_label in (
+        (_bf_settrace_all_threads, _bf_gettrace, "_trace_hook", "trace"),
+        (_bf_setprofile_all_threads, _bf_getprofile, "_profile_hook", "profile"),
+    ):
+        if _bf_trace_getter() is not None:
+            raise _bf_RuntimeError(
+                "executor control thread already has a " + _bf_label + " callback"
+            )
+        try:
+            _bf_trace_setter(_bf_trace_probe)
+        except _bf_BaseException:
+            # A future CPython may propagate the audit rejection. That is also a
+            # valid fail-closed outcome as long as no callback was installed.
+            pass
+        if _bf_trace_getter() is not None:
+            raise _bf_RuntimeError(
+                "proposed cross-thread " + _bf_label + " audit self-test failed"
+            )
+        _bf_object.__setattr__(_support.threading, _bf_hook_attr, None)
+finally:
+    sys.unraisablehook = _bf_saved_unraisablehook
+
+del (
+    _bf_trace_probe,
+    _bf_ignore_expected_unraisable,
+    _bf_saved_unraisablehook,
+    _bf_trace_setter,
+    _bf_trace_getter,
+    _bf_hook_attr,
+    _bf_label,
+)
 
 # Remove straightforward interpreter/thread/frame escape modules from the
 # proposed import surface. These sentinels are defense in depth; the registered
