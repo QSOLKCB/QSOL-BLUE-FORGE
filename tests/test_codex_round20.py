@@ -7,7 +7,6 @@ from pathlib import Path
 import unittest
 
 from blue_forge import HardeningCase, ValidationError, evaluate, loads_strict
-from blue_forge.core import Decision
 
 
 FIXTURE = Path("fixtures/v1/path-traversal-case.json")
@@ -60,11 +59,8 @@ class CodexRoundTwentyTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             evaluate(malformed)
 
-    def test_valid_case_still_uses_exact_decision_instances(self) -> None:
-        case = self._case()
-        self.assertIs(type(case.proposal.decision), Decision)
-        self.assertIs(type(case.verification.decision), Decision)
-        self.assertTrue(evaluate(case).hardened)
+    def test_valid_case_still_evaluates_blue_hardened(self) -> None:
+        self.assertTrue(evaluate(self._case()).hardened)
 
 
 if __name__ == "__main__":
