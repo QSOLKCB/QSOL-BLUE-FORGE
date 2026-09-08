@@ -257,9 +257,10 @@ round2._hardened_test_importer = _hardened_test_importer
 round2.previous._self_test_subprocess_facade = _subprocess_policy_self_test
 base._test_importer = _hardened_test_importer
 
-# Keep useful compatibility names available to any trusted diagnostics that
-# import the final supervisor as a module.
+# Keep useful compatibility names available to any trusted diagnostics and the
+# root-owned current-suite scheduler that import this final supervisor.
 previous = round2.previous
+_enumerate_module_parent = round2._enumerate_module_parent
 
 
 def _main():
