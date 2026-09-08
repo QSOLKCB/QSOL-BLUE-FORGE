@@ -62,10 +62,13 @@ _bf_BaseException = BaseException
 _bf_Exception = Exception
 _bf_RuntimeError = RuntimeError
 _bf_SystemExit = SystemExit
+_bf_BlockingIOError = BlockingIOError
 _bf_type = type
 _bf_object = object
 _bf_len = len
 _bf_bool = bool
+_bf_int = int
+_bf_float = float
 _bf_tuple = tuple
 _bf_iter = iter
 _bf_next = next
@@ -74,12 +77,15 @@ _bf_setattr = setattr
 _bf_delattr = delattr
 _bf_str = str
 _bf_bytes = bytes
+_bf_bytearray = bytearray
 _bf_dict = dict
 _bf_list = list
 _bf_any = any
 _bf_id = id
 _bf_hasattr = hasattr
 _bf_map = map
+_bf_enumerate = enumerate
+_bf_min = min
 _bf_deque = collections.deque
 _bf_partial = functools.partial
 _bf_methodcaller = operator.methodcaller
@@ -120,6 +126,7 @@ _bf_import_module = _support.importlib.import_module
 _bf_temporary_directory = _support.tempfile.TemporaryDirectory
 _bf_Popen = _support.subprocess.Popen
 _bf_PIPE = _support.subprocess.PIPE
+_bf_STDOUT = _support.subprocess.STDOUT
 _bf_DefaultSelector = _support.selectors.DefaultSelector
 _bf_EVENT_READ = _support.selectors.EVENT_READ
 _bf_kill_group = _support._kill_group
@@ -127,25 +134,28 @@ _bf_settrace_all_threads = _support.threading.settrace_all_threads
 _bf_setprofile_all_threads = _support.threading.setprofile_all_threads
 
 
-def _bf_run_cli_bounded(command, root, environment):
+def _bf_run_cli_bounded(command, root, environment, merge_stderr=False):
+    if _bf_type(merge_stderr) is not _bf_bool:
+        raise _bf_RuntimeError("CLI stderr merge mode must be boolean")
+    stderr_target = _bf_STDOUT if merge_stderr else _bf_PIPE
     process = _bf_Popen(command, cwd=root, env=environment,
-                        start_new_session=True, stdout=_bf_PIPE, stderr=_bf_PIPE)
-    outputs = [bytearray(), bytearray()]
-    streams = (process.stdout, process.stderr)
+                        start_new_session=True, stdout=_bf_PIPE, stderr=stderr_target)
+    outputs = [_bf_bytearray()] if merge_stderr else [_bf_bytearray(), _bf_bytearray()]
+    streams = (process.stdout,) if merge_stderr else (process.stdout, process.stderr)
     selector = _bf_DefaultSelector()
     deadline = _bf_monotonic() + 10.0
     try:
-        for index, stream in enumerate(streams):
+        for index, stream in _bf_enumerate(streams):
             _bf_set_blocking(stream.fileno(), False)
             selector.register(stream, _bf_EVENT_READ, index)
         while selector.get_map():
             remaining = deadline - _bf_monotonic()
             if remaining <= 0:
                 raise _bf_RuntimeError("CLI lifetime budget exceeded")
-            for key, _mask in selector.select(min(0.05, remaining)):
+            for key, _mask in selector.select(_bf_min(0.05, remaining)):
                 try:
                     chunk = _bf_os_read(key.fileobj.fileno(), 8192)
-                except BlockingIOError:
+                except _bf_BlockingIOError:
                     continue
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -159,6 +169,8 @@ def _bf_run_cli_bounded(command, root, environment):
         if remaining <= 0:
             raise _bf_RuntimeError("CLI lifetime budget exceeded")
         rc = process.wait(timeout=remaining)
+        if merge_stderr:
+            return rc, _bf_bytes(outputs[0]), b""
         return rc, _bf_bytes(outputs[0]), _bf_bytes(outputs[1])
     finally:
         _bf_kill_group(process)
@@ -385,7 +397,9 @@ def _bf_detached_execute(action, arguments):
 
 
 def _bf_result(value):
-    if value is None or _bf_type(value) in (_bf_str, _bf_bytes, int, float, _bf_bool):
+    if value is None or _bf_type(value) in (
+        _bf_str, _bf_bytes, _bf_int, _bf_float, _bf_bool
+    ):
         return ["data", _bf_encode_data(value)]
     if _bf_type(value) is _bf_tuple:
         return ["tuple", [_bf_result(item) for item in value]]
@@ -472,12 +486,23 @@ def _bf_process_one(raw):
     if action == "cli":
         # CLI orchestration never enters an in-process proposed call frame.
         try:
-            cli_args, case_bytes, environment = arguments
+            if _bf_len(arguments) == 3:
+                cli_args, case_bytes, environment = arguments
+                merge_stderr = False
+            else:
+                _bf_require(_bf_len(arguments) == 4, "invalid CLI executor arguments")
+                cli_args, case_bytes, environment, merge_stderr = arguments
+            _bf_require(
+                _bf_type(merge_stderr) is _bf_bool,
+                "CLI stderr merge mode must be boolean",
+            )
             with _bf_temporary_directory() as temp:
                 path = Path(temp) / "case.json"
                 path.write_bytes(case_bytes)
                 command = [sys.executable, "-m", "blue_forge", cli_args[0], _bf_str(path)]
-                observed = _bf_run_cli_bounded(command, _BF_ROOT, environment)
+                observed = _bf_run_cli_bounded(
+                    command, _BF_ROOT, environment, merge_stderr
+                )
             ok, message = True, ""
         except _bf_BaseException as exc:
             ok, observed, message = False, exc, _bf_str(exc)
