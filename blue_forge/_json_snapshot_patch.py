@@ -5,9 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-
-def _member_path(path: str, key: str) -> str:
-    return f"{path}[{json.dumps(key, ensure_ascii=True)}]"
+from ._validation_patch import _member_path
 
 
 def _has_surrogate(value: str) -> bool:
