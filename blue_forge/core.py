@@ -70,7 +70,8 @@ def _pairs_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _reject_float(value: str) -> Any:
-    raise ValidationError(f"floating-point values are not allowed: {value}")
+    del value
+    raise ValidationError("floating-point values are not allowed")
 
 
 def _reject_constant(value: str) -> Any:
