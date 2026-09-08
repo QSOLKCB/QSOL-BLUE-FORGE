@@ -1,13 +1,17 @@
-"""Regressions for the September 2026 Astra review findings."""
+"""Regressions for the September 2026 Astra and Codex review findings."""
 
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import os
 from pathlib import Path
 import unittest
 
+import blue_forge
+import blue_forge.core as core
 from blue_forge import HardeningCase, ValidationError, evaluate, loads_strict
+from blue_forge._result_provenance_patch import install as install_result_provenance
 
 CURRENT_SUITE_ONLY = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +50,26 @@ class AstraReviewRegressions(unittest.TestCase):
         self.assertLess(len(message), 256)
         self.assertNotIn(oversized, message)
         self.assertIn("object key exceeds", message)
+
+    def test_result_patch_reinstall_preserves_regression_record(self):
+        if os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"):
+            # Re-run the actual installer inside the proposed actor. This is the
+            # transport-safe equivalent of package reload and directly exercises
+            # the wrapper-stacking root cause under supervision.
+            install_result_provenance(core)
+            package = core
+        else:
+            # Reproduce the reported public consumer path exactly.
+            package = importlib.reload(blue_forge)
+
+        case = package.HardeningCase.from_dict(self._case_value())
+        result = package.evaluate(case)
+        self.assertTrue(result.hardened)
+        record = package.regression_record(case, result)
+        self.assertEqual(record["hardening_status"], "BLUE_HARDENED")
+        self.assertEqual(
+            record["hardening_receipt_sha256"], result.receipt_sha256
+        )
 
 
 if __name__ == "__main__":
