@@ -11,8 +11,10 @@ from __future__ import annotations
 import ast
 import base64
 import builtins
+import contextlib
 import hashlib
 import hmac
+import importlib
 import importlib.util
 import os
 from pathlib import Path
@@ -93,7 +95,7 @@ while frame is not None:
 del frame
 def probe(): return 'wrong'
 '''
-    for name, source in (
+    for name, candidate_source in (
         ("dispatch", dispatch),
         ("descriptors", descriptors),
         ("reopening", reopening),
@@ -107,7 +109,7 @@ def probe(): return 'wrong'
             (root / "tests").mkdir()
             (root / "blue_forge").mkdir()
             (root / "blue_forge/__init__.py").write_text(
-                source, encoding="utf-8"
+                candidate_source, encoding="utf-8"
             )
             (root / "tests/test_boundary.py").write_text(
                 "import unittest\nimport blue_forge\n"
@@ -154,8 +156,9 @@ previous._self_test_dispatch_and_descriptors = (
 )
 
 
-def _flatten_suite(suite, module_name):
-    identities = []
+def _suite_cases(suite, module_name):
+    """Return validated runtime-selected TestCase instances without rebuilding them."""
+    cases = []
 
     def visit(item):
         if isinstance(item, base.unittest.TestSuite):
@@ -176,14 +179,69 @@ def _flatten_suite(suite, module_name):
             cls.__module__ == module_name,
             "runtime discovery escaped the selected frozen module",
         )
-        identities.append((module_name, cls.__name__, method))
+        cases.append(item)
 
     visit(suite)
+    identities = [
+        (module_name, type(item).__name__, item._testMethodName)
+        for item in cases
+    ]
     base.require(
         identities and len(identities) == len(set(identities)),
         "empty or duplicate runtime frozen test floor",
     )
+    return cases
+
+
+def _require_reconstructible_case(item):
+    """Fail closed if load_tests mutates per-instance state after construction."""
+    cls = type(item)
+    method = getattr(item, "_testMethodName", None)
+    try:
+        fresh = cls(method)
+        selected_state = object.__getattribute__(item, "__dict__")
+        fresh_state = object.__getattribute__(fresh, "__dict__")
+        same_state = selected_state == fresh_state
+    except BaseException as exc:
+        raise base.SupervisionFailure(
+            "runtime discovery returned a non-reconstructible TestCase instance"
+        ) from exc
+    base.require(
+        same_state,
+        "runtime discovery returned configured TestCase instance state; "
+        "per-instance load_tests mutation is unsupported",
+    )
+
+
+def _flatten_suite(suite, module_name):
+    cases = _suite_cases(suite, module_name)
+    identities = []
+    for item in cases:
+        _require_reconstructible_case(item)
+        identities.append(
+            (module_name, type(item).__name__, item._testMethodName)
+        )
     return identities
+
+
+@contextlib.contextmanager
+def _trusted_test_facades(importer):
+    """Expose worker facades through sys.modules as well as injected __import__."""
+    facades = getattr(importer, "_blue_forge_facades", None)
+    base.require(
+        type(facades) is dict and type(facades.get("subprocess")) is types.ModuleType,
+        "trusted test importer omitted subprocess facade",
+    )
+    sentinel = object()
+    prior = sys.modules.get("subprocess", sentinel)
+    sys.modules["subprocess"] = facades["subprocess"]
+    try:
+        yield
+    finally:
+        if prior is sentinel:
+            sys.modules.pop("subprocess", None)
+        else:
+            sys.modules["subprocess"] = prior
 
 
 def _enumerate_module_worker(root, module_name):
@@ -193,40 +251,48 @@ def _enumerate_module_worker(root, module_name):
     global_base._ACTIVE_BRIDGE = bridge
     finder = global_base._ProxyLoader(bridge)
     sys.meta_path.insert(0, finder)
-    sys.path.insert(0, str(root / "tests"))
+    test_path = str(root / "tests")
+    sys.path.insert(0, test_path)
     try:
         path = root / "tests" / (module_name + ".py")
         global_base.require(
             path.is_file() and not path.is_symlink(),
             "invalid runtime-enumeration test module",
         )
-        source = path.read_text(encoding="utf-8")
+        source_text = path.read_text(encoding="utf-8")
         tree = global_base._TestTransform().visit(
-            ast.parse(source, filename=str(path))
+            ast.parse(source_text, filename=str(path))
         )
         ast.fix_missing_locations(tree)
         module = types.ModuleType(module_name)
         module.__file__ = str(path)
+        importer = _hardened_test_importer(bridge)
         module.__dict__["__builtins__"] = {
             **vars(builtins),
-            "__import__": global_base._test_importer(bridge),
+            "__import__": importer,
         }
         module.__dict__["_remote_object_setattr"] = (
             global_base._remote_object_setattr
         )
         sys.modules[module_name] = module
-        exec(
-            compile(tree, str(path), "exec", dont_inherit=True),
-            module.__dict__,
-        )
-        suite = global_base.unittest.defaultTestLoader.loadTestsFromModule(
-            module
-        )
-        return _flatten_suite(suite, module_name)
+        with _trusted_test_facades(importer):
+            exec(
+                compile(tree, str(path), "exec", dont_inherit=True),
+                module.__dict__,
+            )
+            suite = global_base.unittest.defaultTestLoader.loadTestsFromModule(
+                module
+            )
+            return _flatten_suite(suite, module_name)
     finally:
         bridge.close()
         if finder in sys.meta_path:
             sys.meta_path.remove(finder)
+        try:
+            sys.path.remove(test_path)
+        except ValueError:
+            pass
+        sys.modules.pop(module_name, None)
         global_base._ACTIVE_BRIDGE = None
 
 
@@ -387,6 +453,24 @@ def _runtime_membership_self_test():
         base.require(
             identities == expected,
             "runtime discovery omitted dynamically installed tests",
+        )
+
+    class Configured(base.unittest.TestCase):
+        def test_state(self):
+            pass
+
+    selected = Configured("test_state")
+    selected.expected = "configured"
+    try:
+        _require_reconstructible_case(selected)
+    except base.SupervisionFailure as exc:
+        base.require(
+            "configured TestCase instance state" in str(exc),
+            "configured TestCase state failed closed for an unrelated reason",
+        )
+    else:
+        raise base.SupervisionFailure(
+            "runtime discovery accepted configured TestCase instance state"
         )
 
 
@@ -746,7 +830,97 @@ def _hardened_test_importer(bridge):
             return facades[name]
         return real_import(name, globals, locals, fromlist, level)
 
+    trusted_import._blue_forge_facades = facades
     return trusted_import
+
+
+def _runtime_worker_run(root, identity, *, local_test=False):
+    """Run the actual suite-selected instance under facade-complete mediation."""
+    global_base = base
+    module_name, class_name, method_name = identity
+    bridge = global_base._Bridge(root, local_test=local_test)
+    global_base._ACTIVE_BRIDGE = bridge
+    finder = global_base._ProxyLoader(bridge)
+    sys.meta_path.insert(0, finder)
+    test_path = str(root / "tests")
+    sys.path.insert(0, test_path)
+    try:
+        path = root / "tests" / (module_name + ".py")
+        global_base.require(
+            path.is_file() and not path.is_symlink(),
+            "invalid runtime worker test module",
+        )
+        source_text = path.read_text(encoding="utf-8")
+        tree = global_base._TestTransform().visit(
+            ast.parse(source_text, filename=str(path))
+        )
+        ast.fix_missing_locations(tree)
+        module = types.ModuleType(module_name)
+        module.__file__ = str(path)
+        importer = _hardened_test_importer(bridge)
+        module.__dict__["__builtins__"] = {
+            **vars(builtins),
+            "__import__": importer,
+        }
+        module.__dict__["_remote_object_setattr"] = (
+            global_base._remote_object_setattr
+        )
+        sys.modules[module_name] = module
+        with _trusted_test_facades(importer):
+            exec(
+                compile(tree, str(path), "exec", dont_inherit=True),
+                module.__dict__,
+            )
+            suite = global_base.unittest.defaultTestLoader.loadTestsFromModule(
+                module
+            )
+            cases = _suite_cases(suite, module_name)
+            matches = [
+                item
+                for item in cases
+                if (
+                    type(item).__name__ == class_name
+                    and item._testMethodName == method_name
+                )
+            ]
+            global_base.require(
+                len(matches) == 1,
+                "runtime worker could not select the authenticated frozen test",
+            )
+            selected = matches[0]
+            _require_reconstructible_case(selected)
+            result = global_base.unittest.TestResult()
+            global_base.unittest.TestSuite([selected]).run(result)
+        global_base.require(
+            bridge.fatal is None,
+            f"RPC failure was caught by a test: {bridge.fatal}",
+        )
+        global_base.require(
+            result.testsRun == 1
+            and not (
+                result.failures
+                or result.errors
+                or result.skipped
+                or result.expectedFailures
+                or result.unexpectedSuccesses
+            ),
+            "frozen test failed: "
+            + ".".join(identity)
+            + "\n"
+            + "\n".join(
+                item[1] for item in result.failures + result.errors
+            ),
+        )
+    finally:
+        bridge.close()
+        if finder in sys.meta_path:
+            sys.meta_path.remove(finder)
+        try:
+            sys.path.remove(test_path)
+        except ValueError:
+            pass
+        sys.modules.pop(module_name, None)
+        global_base._ACTIVE_BRIDGE = None
 
 
 def _subprocess_policy_self_test():
@@ -771,9 +945,8 @@ def _subprocess_policy_self_test():
         root = Path(temp)
         case = root / "case.json"
         case.write_bytes(b"{}")
-        proxy = _hardened_test_importer(
-            FakeBridge(root)
-        )("subprocess")
+        importer = _hardened_test_importer(FakeBridge(root))
+        proxy = importer("subprocess")
         command = [
             sys.executable,
             "-I",
@@ -801,6 +974,24 @@ def _subprocess_policy_self_test():
             and proxy.call(command) == 0,
             "bridged subprocess call helpers failed",
         )
+
+        with _trusted_test_facades(importer):
+            imported = importlib.import_module("subprocess")
+            indexed = sys.modules["subprocess"]
+            base.require(
+                imported is proxy and indexed is proxy,
+                "alternative subprocess import escaped trusted facade",
+            )
+            base.require(
+                imported.check_output(command) == b"bridged"
+                and indexed.call(command) == 0,
+                "alternative subprocess import bypassed actor routing",
+            )
+        base.require(
+            sys.modules.get("subprocess") is subprocess,
+            "subprocess facade leaked outside trusted test scope",
+        )
+
         for operation in (
             lambda: proxy.Popen(command),
             lambda: proxy.run(
@@ -840,6 +1031,7 @@ previous._self_test_subprocess_facade = _subprocess_policy_self_test
 
 base.expected_tests = _runtime_expected_tests
 base._test_importer = _hardened_test_importer
+base._worker_run = _runtime_worker_run
 
 
 if "--actor-root" in sys.argv:
