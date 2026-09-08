@@ -813,12 +813,16 @@ def _state_preservation_self_test():
     import tempfile
 
     marker_name = "blue-forge-enumeration-state-" + base.secrets.token_hex(8)
-    marker = Path.home() / marker_name
+    prior_home = os.environ.get("HOME")
     try:
-        marker.unlink(missing_ok=True)
         with tempfile.TemporaryDirectory(prefix="blue-forge-enumeration-state-") as temp:
-            root = Path(temp)
+            top = Path(temp)
+            root = top / "root"
+            home = top / "home"
+            root.mkdir()
             root.chmod(0o755)
+            home.mkdir()
+            os.environ["HOME"] = str(home)
             (root / "tests").mkdir()
             (root / "blue_forge").mkdir()
             (root / "blue_forge/__init__.py").write_text(
@@ -841,7 +845,10 @@ def _state_preservation_self_test():
                 "serial suite state self-test selected the wrong oracle",
             )
     finally:
-        marker.unlink(missing_ok=True)
+        if prior_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = prior_home
     print("serial_runtime_discovery_execution=PASS")
 
 
