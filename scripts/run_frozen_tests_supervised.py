@@ -529,13 +529,40 @@ def _hardened_test_importer(bridge):
         )
         return items
 
+    def unwrap_env(items):
+        """Unwrap the supported GNU env COMMAND form without executing env."""
+        if not items or Path(items[0]).name != "env":
+            return items, {}
+        index = 1
+        if index < len(items) and items[index] == "--":
+            index += 1
+        overrides = {}
+        while index < len(items):
+            token = items[index]
+            if token.startswith("-"):
+                return None, {}
+            if "=" not in token:
+                break
+            key, value = token.split("=", 1)
+            base.require(
+                bool(key), "invalid env assignment before proposed CLI"
+            )
+            overrides[key] = value
+            index += 1
+        if index >= len(items):
+            return None, {}
+        return items[index:], overrides
+
     def cli_details(command):
         items = exact_sequence(command)
         if not items:
             return None
+        inner, env_overrides = unwrap_env(items)
+        if not inner:
+            return None
         try:
             same_python = (
-                Path(items[0]).resolve()
+                Path(inner[0]).resolve()
                 == Path(sys.executable).resolve()
             )
         except (OSError, RuntimeError):
@@ -543,30 +570,30 @@ def _hardened_test_importer(bridge):
         if not same_python:
             return None
         index = 1
-        while index < len(items) and items[index] != "-m":
-            token = items[index]
+        while index < len(inner) and inner[index] != "-m":
+            token = inner[index]
             if token in safe_flags:
                 index += 1
                 continue
             if token == "-X":
                 base.require(
-                    index + 1 < len(items)
-                    and items[index + 1] in safe_xoptions,
+                    index + 1 < len(inner)
+                    and inner[index + 1] in safe_xoptions,
                     "unsupported Python -X option for proposed CLI",
                 )
                 index += 2
                 continue
             return None
-        if index >= len(items):
+        if index >= len(inner):
             return None
-        if index + 1 >= len(items) or items[index + 1] != "blue_forge":
+        if index + 1 >= len(inner) or inner[index + 1] != "blue_forge":
             return None
-        cli = items[index + 2 :]
+        cli = inner[index + 2 :]
         base.require(
             len(cli) == 2 and cli[0] in {"verify", "regression"},
             "unsupported proposed CLI invocation",
         )
-        return cli[0], Path(cli[1])
+        return cli[0], Path(cli[1]), env_overrides
 
     def shell_wrapped_arguments(items):
         """Return command-interpreter arguments, including env/busybox wrappers."""
@@ -610,6 +637,17 @@ def _hardened_test_importer(bridge):
         items = exact_sequence(command)
         if items is None:
             return
+        if items and Path(items[0]).name == "env":
+            inner, _overrides = unwrap_env(items)
+            candidate = items[1:] if inner is None else inner
+            base.require(
+                not any(
+                    "blue_forge" in item
+                    or _looks_like_proposed_path(item, bridge.root)
+                    for item in candidate
+                ),
+                "unsupported env-wrapped proposed application execution",
+            )
         wrapped = shell_wrapped_arguments(items)
         if wrapped:
             base.require(
@@ -650,7 +688,7 @@ def _hardened_test_importer(bridge):
                 )
 
     def bridged_run(command, kwargs, details):
-        subcommand, path = details
+        subcommand, path, env_overrides = details
         allowed = {
             "env",
             "check",
@@ -684,6 +722,7 @@ def _hardened_test_importer(bridge):
                 and 0 < timeout <= 15,
                 "proposed CLI timeout exceeds actor budget",
             )
+        actor_timeout = timeout if timeout is not None else 10.0
         capture_output = kwargs.get("capture_output", False)
         base.require(
             type(capture_output) is bool,
@@ -726,6 +765,7 @@ def _hardened_test_importer(bridge):
                 "proposed CLI environment must be an exact string mapping",
             )
             environment = dict(env_value)
+        environment.update(env_overrides)
         environment = {
             key: value
             for key, value in environment.items()
@@ -742,9 +782,20 @@ def _hardened_test_importer(bridge):
             "proposed CLI case transport budget exceeded",
         )
         merge_stderr = stderr_mode == subprocess.STDOUT
-        rc, stdout, stderr = bridge.request(
-            "cli", [subcommand], payload, environment, merge_stderr
+        rc, stdout, stderr, timed_out = bridge.request(
+            "cli", [subcommand], payload, environment, merge_stderr, actor_timeout
         )
+        base.require(type(timed_out) is bool, "invalid actor CLI timeout observation")
+        if timed_out:
+            if timeout is None:
+                raise base.SupervisionFailure(
+                    "proposed CLI exceeded actor execution budget"
+                )
+            output = stdout if stdout_mode == subprocess.PIPE else None
+            error_output = stderr if stderr_mode == subprocess.PIPE else None
+            raise subprocess.TimeoutExpired(
+                command, timeout, output=output, stderr=error_output
+            )
         text_mode = bool(
             kwargs.get("text")
             or kwargs.get("universal_newlines")
@@ -975,12 +1026,16 @@ def _subprocess_policy_self_test():
                 "subprocess self-test lost CLI action",
             )
             base.require(
-                len(arguments) == 4 and type(arguments[3]) is bool,
-                "subprocess self-test lost stderr merge mode",
+                len(arguments) == 5
+                and type(arguments[3]) is bool
+                and type(arguments[4]) in (int, float),
+                "subprocess self-test lost stderr merge or timeout mode",
             )
+            if arguments[4] == 0.125:
+                return -9, b"partial", b"", True
             if arguments[3]:
-                return 0, b"merged", b""
-            return 0, b"bridged", b"diagnostic"
+                return 0, b"merged", b"", False
+            return 0, b"bridged", b"diagnostic", False
 
     with tempfile.TemporaryDirectory(
         prefix="blue-forge-subprocess-policy-"
@@ -1008,6 +1063,16 @@ def _subprocess_policy_self_test():
             and completed.stderr == b"diagnostic",
             "bridged subprocess.run lost captured output",
         )
+        env_command = ["env", *command]
+        base.require(
+            proxy.check_output(env_command) == b"bridged",
+            "env-wrapped proposed CLI bypassed actor routing",
+        )
+        assigned_env_command = ["env", "SELFTEST_FLAG=1", *command]
+        base.require(
+            proxy.check_output(assigned_env_command) == b"bridged",
+            "env assignment wrapper bypassed actor routing",
+        )
         merged = proxy.run(
             command,
             stdout=subprocess.PIPE,
@@ -1018,6 +1083,17 @@ def _subprocess_policy_self_test():
             merged.stdout == b"merged" and merged.stderr is None,
             "bridged subprocess.run did not preserve actor-side stderr merge",
         )
+        try:
+            proxy.run(command, capture_output=True, timeout=0.125)
+        except subprocess.TimeoutExpired as exc:
+            base.require(
+                exc.timeout == 0.125 and exc.output == b"partial",
+                "bridged subprocess.run lost the requested timeout observation",
+            )
+        else:
+            raise base.SupervisionFailure(
+                "bridged subprocess.run ignored the requested timeout"
+            )
         base.require(
             proxy.check_output(command) == b"bridged",
             "bridged subprocess.check_output failed",
@@ -1050,12 +1126,16 @@ def _subprocess_policy_self_test():
             "-c",
             f"{sys.executable} -m blue_forge verify {case}",
         ]
+        unsupported_env = [
+            "env", "-i", sys.executable, "-m", "blue_forge", "verify", str(case)
+        ]
         for operation in (
             lambda: proxy.Popen(command),
             lambda: proxy.run(
                 [sys.executable, "-c", "import blue_forge"]
             ),
             lambda: proxy.run(shell_wrapped),
+            lambda: proxy.run(unsupported_env),
         ):
             try:
                 operation()

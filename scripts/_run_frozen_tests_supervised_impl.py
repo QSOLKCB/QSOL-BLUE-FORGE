@@ -441,6 +441,41 @@ def _class_recipe(cls):
     return {"name": cls.__name__, "source": source}
 
 
+def _make_graph_scalar_encoder():
+    """Capture scalar identities/converters before any proposed import."""
+    kind = type
+    bool_type = bool
+    str_type = str
+    int_type = int
+    float_type = float
+    bytes_type = bytes
+    integer_text = str
+    float_hex = float.hex
+    b64encode = base64.b64encode
+    bytes_decode = bytes.decode
+    render_text = str
+
+    def encode(value):
+        t = kind(value)
+        if value is None or t is bool_type or t is str_type:
+            return True, ["scalar", value], t
+        if t is int_type:
+            return True, ["int", integer_text(value)], t
+        if t is float_type:
+            return True, ["float", float_hex(value)], t
+        if t is bytes_type:
+            return True, ["bytes", bytes_decode(b64encode(value), "ascii")], t
+        return False, None, t
+
+    def text(value):
+        return render_text(value)
+
+    return encode, text
+
+
+_graph_scalar_encode, _graph_text = _make_graph_scalar_encoder()
+
+
 class _GraphEncoder:
     """Preserve aliases, scalar types, and builtin-subclass boundary fixtures."""
     def __init__(self):
@@ -449,15 +484,9 @@ class _GraphEncoder:
         self.sync = {}
 
     def encode(self, value):
-        t = type(value)
-        if value is None or t is bool or t is str:
-            return ["scalar", value]
-        if t is int:
-            return ["int", str(value)]
-        if t is float:
-            return ["float", value.hex()]
-        if t is bytes:
-            return ["bytes", base64.b64encode(value).decode("ascii")]
+        matched, scalar, t = _graph_scalar_encode(value)
+        if matched:
+            return scalar
         if isinstance(value, _Remote):
             return ["remote", value._handle]
         oid = id(value)
@@ -470,9 +499,9 @@ class _GraphEncoder:
         if isinstance(value, mock.Mock):
             require(isinstance(value.side_effect, BaseException), "unsupported mock boundary recipe")
             node = {"kind": "mock", "error": type(value.side_effect).__name__,
-                    "message": str(value.side_effect)}
+                    "message": _graph_text(value.side_effect)}
         elif isinstance(value, BaseException):
-            node = {"kind": "exception", "error": t.__name__, "message": str(value)}
+            node = {"kind": "exception", "error": t.__name__, "message": _graph_text(value)}
         elif isinstance(value, (dict, list, tuple, frozenset, set)):
             base = next(c for c in (dict, list, tuple, frozenset, set) if isinstance(value, c))
             node = {"kind": base.__name__, "class": None}
@@ -483,6 +512,11 @@ class _GraphEncoder:
                 node["items"] = [[self.encode(k), self.encode(v)] for k, v in dict.items(value)]
             else:
                 node["items"] = [self.encode(v) for v in base.__iter__(value)]
+            # Exact mutable containers are watched by the process-separated
+            # executor. A changed actor copy fails the RPC instead of allowing a
+            # frozen non-mutation assertion to observe the untouched worker copy.
+            if t in (dict, list, set):
+                self.sync[index] = value
             if t is not base:
                 try:
                     state = object.__getattribute__(value, "__dict__")
@@ -692,7 +726,10 @@ def _actor(root):
         states = {}
         for key in request.get("sync", []):
             if key in decoder.cache:
-                states[str(key)] = _encode_data(object.__getattribute__(decoder.cache[key], "__dict__"))
+                value = decoder.cache[key]
+                if type(value) in (dict, list, set):
+                    continue
+                states[str(key)] = _encode_data(object.__getattribute__(value, "__dict__"))
         response["states"] = states
         wire_out.write(_wire_dump(response) + b"\n")
         wire_out.flush()
@@ -1117,9 +1154,10 @@ def _self_test_boundary_transport(python_bin, timeout_seconds, *, local_test=Fal
             "def boundary(value):\n"
             " if type(value) is not list: raise ValidationError('exact list required')\n"
             " return value\n"
-            "def shared(value): return value[0] is value[1]\n", encoding="utf-8")
+            "def shared(value): return value[0] is value[1]\n"
+            "def mutate(value): value['mutated']=True\n", encoding="utf-8")
         (root / "tests/test_boundary.py").write_text(
-            "import unittest\nfrom blue_forge import boundary, shared, ValidationError\n"
+            "import unittest\nfrom blue_forge import boundary, shared, mutate, ValidationError\n"
             "class Boundary(unittest.TestCase):\n"
             " def test_preserved(self):\n"
             "  class ExplodingList(list):\n"
@@ -1127,9 +1165,18 @@ def _self_test_boundary_transport(python_bin, timeout_seconds, *, local_test=Fal
             "  self.assertEqual(boundary(['retained']), ['retained'])\n"
             "  with self.assertRaisesRegex(ValidationError, 'exact list'):\n"
             "   boundary(ExplodingList(['retained']))\n"
-            "  child=['leaf']; self.assertTrue(shared([child,child]))\n", encoding="utf-8")
+            "  child=['leaf']; self.assertTrue(shared([child,child]))\n"
+            " def test_mutation_rejected(self):\n"
+            "  value={'stable':True}; before=dict(value); mutate(value); self.assertEqual(value,before)\n",
+            encoding="utf-8")
         run_one(root, python_bin, ("test_boundary", "Boundary", "test_preserved"),
                 timeout_seconds, local_test=local_test)
+        try:
+            run_one(root, python_bin, ("test_boundary", "Boundary", "test_mutation_rejected"),
+                    timeout_seconds, local_test=local_test)
+        except SupervisionFailure:
+            return
+        raise SupervisionFailure("actor mutation of an exact container argument was hidden")
 
 
 def _self_test_encoder_failure(python_bin, timeout_seconds, *, local_test=False):
