@@ -100,11 +100,9 @@ def _hardened_test_importer(bridge):
 # ---------------------------------------------------------------------------
 # Proposed-source provenance
 # ---------------------------------------------------------------------------
-# The frozen/proposed workflow marks only the trust-critical oracle run with
-# BLUE_FORGE_PRIVATE_PROPOSED_SOURCE=1. In that run the proposed blue_forge
-# files are root:blueforge-rpc 0440: readable by the isolated actor account but
-# not by the trusted blueforge-test worker. That makes read+compile("<string>")
-# impossible regardless of caller-controlled co_filename metadata.
+# Only the trust-critical frozen/proposed root is private to the actor. Existing
+# supervisor self-test roots remain readable, so their attack fixtures can still
+# be constructed and executed as local boundary controls.
 def _require_private_proposed_source(root: Path):
     source_root = root / "blue_forge"
     files = sorted(source_root.glob("*.py"))
@@ -121,11 +119,14 @@ def _require_private_proposed_source(root: Path):
 
 
 def _worker_run(root, identity, *, local_test=False):
-    if (
-        not local_test
-        and os.environ.get("BLUE_FORGE_PRIVATE_PROPOSED_SOURCE") == "1"
-    ):
-        _require_private_proposed_source(Path(root))
+    private_root = os.environ.get("BLUE_FORGE_PRIVATE_PROPOSED_SOURCE_ROOT")
+    if not local_test and type(private_root) is str and private_root:
+        try:
+            is_private_root = Path(root).resolve() == Path(private_root).resolve()
+        except (OSError, RuntimeError):
+            raise base.SupervisionFailure("invalid private proposed source root")
+        if is_private_root:
+            _require_private_proposed_source(Path(root))
     return _legacy_worker_run(root, identity, local_test=local_test)
 
 
