@@ -20,6 +20,15 @@ def install(core: Any) -> None:
             )
         return value
 
+    def required_attr(value: Any, name: str, label: str) -> Any:
+        """Translate malformed exact records into the public validation hierarchy."""
+        try:
+            return object.__getattribute__(value, name)
+        except AttributeError as exc:
+            raise core.ValidationError(
+                f"{label} is missing required field {name}"
+            ) from exc
+
     original_case_input_material = core._case_input_material
 
     def bounded_case_input_material(case: Any) -> dict[str, Any]:
@@ -31,8 +40,8 @@ def install(core: Any) -> None:
                 "direct hardening case must be an exact HardeningCase"
             )
 
-        proposal = object.__getattribute__(case, "proposal")
-        verification = object.__getattribute__(case, "verification")
+        proposal = required_attr(case, "proposal", "hardening case")
+        verification = required_attr(case, "verification", "hardening case")
         if type(proposal) is not core.Proposal:
             raise core.ValidationError("case.proposal must be an exact Proposal")
         if type(verification) is not core.Verification:
@@ -43,13 +52,13 @@ def install(core: Any) -> None:
         # Establish the exact nested record types before reading any of their
         # members.  dataclasses.replace() is a construction mechanism, not a
         # validation boundary, so every directly supplied record is rechecked.
-        original = object.__getattribute__(verification, "original")
+        original = required_attr(verification, "original", "case.verification")
         if type(original) is not core.Evidence:
             raise core.ValidationError(
                 "verification.original must be an exact Evidence"
             )
 
-        variants = object.__getattribute__(verification, "variants")
+        variants = required_attr(verification, "variants", "case.verification")
         if type(variants) is not tuple:
             raise core.ValidationError("verification.variants must be an exact tuple")
         if not variants or len(variants) > core.MAX_VARIANT_ITEMS:
@@ -62,7 +71,9 @@ def install(core: Any) -> None:
                     "verification.variants entries must be exact Evidence instances"
                 )
 
-        benign = object.__getattribute__(verification, "benign_controls")
+        benign = required_attr(
+            verification, "benign_controls", "case.verification"
+        )
         if type(benign) is not tuple:
             raise core.ValidationError(
                 "verification.benign_controls must be an exact tuple"
@@ -82,8 +93,10 @@ def install(core: Any) -> None:
         # dataclasses.replace()-modified cases, require the exact enum first so
         # a duck-typed object cannot manufacture a valid decision or execute an
         # attacker-controlled property at the evaluator boundary.
-        proposal_decision = object.__getattribute__(proposal, "decision")
-        verification_decision = object.__getattribute__(verification, "decision")
+        proposal_decision = required_attr(proposal, "decision", "case.proposal")
+        verification_decision = required_attr(
+            verification, "decision", "case.verification"
+        )
         if type(proposal_decision) is not core.Decision:
             raise core.ValidationError(
                 "proposal.decision must be an exact Decision"
@@ -97,24 +110,38 @@ def install(core: Any) -> None:
         # as mapping keys. Validate the exact bounded string domain first, so a
         # programmatically replaced ID cannot execute __hash__ or __eq__ there.
         core._evidence_id(
-            object.__getattribute__(original, "evidence_id"),
+            required_attr(
+                original, "evidence_id", "verification.original"
+            ),
             "original",
             "verification.original evidence id",
         )
         for item in variants:
             core._evidence_id(
-                object.__getattribute__(item, "evidence_id"),
+                required_attr(
+                    item, "evidence_id", "verification.variants entry"
+                ),
                 "variant",
                 "verification.variants evidence id",
             )
         for item in benign:
             core._evidence_id(
-                object.__getattribute__(item, "evidence_id"),
+                required_attr(
+                    item, "evidence_id", "verification.benign_controls entry"
+                ),
                 "benign",
                 "verification.benign_controls evidence id",
             )
 
-        return original_case_input_material(case)
+        try:
+            return original_case_input_material(case)
+        except AttributeError as exc:
+            # Any remaining malformed exact dataclass field must stay within the
+            # documented BlueForgeError/ValidationError API rather than leaking
+            # an implementation AttributeError to programmatic callers.
+            raise core.ValidationError(
+                "direct hardening case is missing a required field"
+            ) from exc
 
     original_from_dict = core.HardeningCase.from_dict
 
