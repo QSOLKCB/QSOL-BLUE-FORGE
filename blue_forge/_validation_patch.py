@@ -155,13 +155,34 @@ def install(core: Any) -> None:
         return value
 
     def exact_keys(value: dict[Any, Any], expected: set[str], label: str) -> None:
-        if any(type(key) is not str for key in value):
-            raise core.ValidationError(f"{label} object keys must be strings")
+        if len(value) > MAX_OBJECT_ITEMS:
+            raise core.ValidationError(
+                f"{label} exceeds {MAX_OBJECT_ITEMS} members"
+            )
+        for key in value:
+            if type(key) is not str:
+                raise core.ValidationError(f"{label} object keys must be strings")
+            if len(key) > core.MAX_STRING_CHARS:
+                raise core.ValidationError(
+                    f"{label} object key exceeds {core.MAX_STRING_CHARS} characters"
+                )
+            if _has_unpaired_surrogate(key):
+                raise core.ValidationError(
+                    f"{label} object key contains an unpaired Unicode surrogate"
+                )
         actual = set(value)
         if actual != expected:
+            # Every rendered name has already passed the shared string ceiling,
+            # but keep the aggregate diagnostic independently bounded as well.
+            def summary(names: set[str]) -> str:
+                ordered = sorted(names)
+                shown = ordered[:8]
+                suffix = "" if len(ordered) <= 8 else f", ... +{len(ordered) - 8} more"
+                return "[" + ", ".join(repr(name[:96]) for name in shown) + suffix + "]"
+
             raise core.ValidationError(
                 f"{label} fields changed: "
-                f"missing={sorted(expected - actual)} extra={sorted(actual - expected)}"
+                f"missing={summary(expected - actual)} extra={summary(actual - expected)}"
             )
 
     def bounded_string(value: Any, label: str) -> str:
