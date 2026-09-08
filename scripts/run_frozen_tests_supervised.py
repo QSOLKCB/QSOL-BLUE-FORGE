@@ -5,7 +5,8 @@ The reviewed round-3 entrypoint is retained byte-for-byte in a sibling module.
 This layer closes cached native-process references, requires proposed source to
 be unreadable from the trusted frozen worker, makes Remote truth/str/repr and
 iteration observe bounded actor-side behavior, fails closed on direct-call
-output, and restores deterministic serial runtime test enumeration.
+output in the frozen oracle, and restores deterministic serial runtime test
+enumeration.
 """
 from __future__ import annotations
 
@@ -137,11 +138,12 @@ def _worker_run(root, identity, *, local_test=False):
 # ---------------------------------------------------------------------------
 # Direct proposed-call output
 # ---------------------------------------------------------------------------
-# The executor deliberately maps proposed stdout onto its bounded diagnostic
-# channel so proposed code never receives a broker-facing descriptor. Treat any
-# bytes on that channel as a supervised-test failure. This is intentionally
-# stricter than relaying output: a faulty direct API call cannot make a trusted
-# redirect_stdout/no-output assertion pass merely because its print was hidden.
+# The executor maps proposed stdout onto its bounded diagnostic channel so the
+# application process never receives a broker-facing descriptor. In the trusted
+# frozen/proposed oracle, any actor diagnostic bytes make the test fail closed;
+# therefore a direct API call cannot hide unexpected stdout from redirect_stdout
+# assertions. The PR-controlled current floor intentionally retains ordinary
+# stderr diagnostics and is also rerun through the independent direct sandbox.
 def _require_silent_actor(bridge):
     diagnostic_bytes = object.__getattribute__(bridge, "diagnostic_bytes")
     base.require(
@@ -165,8 +167,11 @@ def _bridge_close(self):
     # The retained descriptor-isolation control intentionally writes forged
     # response frames to fd 1. The executor correctly redirects those bytes to
     # diagnostic stderr; do not reinterpret that baseline-owned attack traffic
-    # as application output. Real frozen/current roots remain strict.
-    if not _trusted_transport_attack_selftest(self):
+    # as application output. Likewise, the PR-controlled supervised-current
+    # floor contains tests that intentionally exercise stderr diagnostics. The
+    # trusted frozen/proposed oracle has neither exemption and stays fail-closed.
+    supervised_current = bool(os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"))
+    if not supervised_current and not _trusted_transport_attack_selftest(self):
         # The retained close joins the diagnostic drain, so this count is
         # complete for the actor lifetime rather than racing a pipe buffer.
         _require_silent_actor(self)
