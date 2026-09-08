@@ -3,8 +3,9 @@
 
 The reviewed round-3 entrypoint is retained byte-for-byte in a sibling module.
 This layer closes cached native-process references, requires proposed source to
-be unreadable from the trusted frozen worker, and makes Remote truth/str/repr
-observe bounded actor-side behavior instead of trusted synthetic values.
+be unreadable from the trusted frozen worker, makes Remote truth/str/repr and
+iteration observe bounded actor-side behavior, fails closed on direct-call
+output, and restores deterministic serial runtime test enumeration.
 """
 from __future__ import annotations
 
@@ -33,6 +34,9 @@ _legacy_importer = round3._hardened_test_importer
 _legacy_subprocess_self_test = round3._subprocess_policy_self_test
 _legacy_final_boundary_self_test = round3._final_boundary_self_test
 _legacy_worker_run = base._worker_run
+_legacy_bridge_close = base._Bridge.close
+_legacy_base_main = base.main
+_serial_expected_tests = base.expected_tests
 
 # These CPython audit events sit below Python module aliases. A cached reference
 # such as pathlib.os.system therefore cannot escape merely because it points at
@@ -131,6 +135,50 @@ def _worker_run(root, identity, *, local_test=False):
 
 
 # ---------------------------------------------------------------------------
+# Direct proposed-call output
+# ---------------------------------------------------------------------------
+# The executor deliberately maps proposed stdout onto its bounded diagnostic
+# channel so proposed code never receives a broker-facing descriptor. Treat any
+# bytes on that channel as a supervised-test failure. This is intentionally
+# stricter than relaying output: a faulty direct API call cannot make a trusted
+# redirect_stdout/no-output assertion pass merely because its print was hidden.
+def _require_silent_actor(bridge):
+    diagnostic_bytes = object.__getattribute__(bridge, "diagnostic_bytes")
+    base.require(
+        type(diagnostic_bytes) is int and diagnostic_bytes == 0,
+        "proposed direct API emitted output during trusted supervision",
+    )
+
+
+def _bridge_close(self):
+    result = _legacy_bridge_close(self)
+    # The retained close joins the diagnostic drain, so this count is complete
+    # for the actor lifetime rather than a race against an unread pipe buffer.
+    _require_silent_actor(self)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Deterministic runtime enumeration
+# ---------------------------------------------------------------------------
+# The root-owned current-suite launcher historically tried to replace this with
+# a ThreadPoolExecutor coordinator. Runtime discovery is semantically ordered:
+# module import/load_tests may share HOME-relative state. Capture the serial
+# baseline-owned oracle before any outer wrapper can replace it and restore it
+# immediately before the real supervisor main routine starts.
+def _restore_serial_expected_tests():
+    base.expected_tests = _serial_expected_tests
+
+
+def _deterministic_base_main(*args, **kwargs):
+    replaced = base.expected_tests is not _serial_expected_tests
+    _restore_serial_expected_tests()
+    if replaced:
+        print("deterministic_runtime_enumeration=PASS")
+    return _legacy_base_main(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Remote observation
 # ---------------------------------------------------------------------------
 _SIZED_REMOTE_KINDS = frozenset(
@@ -160,6 +208,44 @@ def _remote_bool(self):
     value = bridge.request("truth", self)
     base.require(type(value) is bool, "invalid proposed truth observation")
     return value
+
+
+class _RemoteIterator:
+    """Trusted iterator wrapper that advances one actor item per ``next``."""
+
+    __slots__ = ("_bridge", "_iterator")
+
+    def __init__(self, bridge, iterator):
+        object.__setattr__(self, "_bridge", bridge)
+        object.__setattr__(self, "_iterator", iterator)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        bridge = object.__getattribute__(self, "_bridge")
+        iterator = object.__getattribute__(self, "_iterator")
+        return bridge.request("next", iterator)
+
+
+def _remote_iter(self):
+    bridge = object.__getattribute__(self, "_bridge")
+    # Invoke the actual actor-side __iter__ protocol but do not materialize any
+    # yielded values. Every later __next__ is a separate bounded RPC operation.
+    # Objects that expose only the legacy sequence protocol fail closed rather
+    # than falling back to the old eager MAX_GRAPH_NODES materialization path.
+    try:
+        iterator_method = bridge.request("getattr", self, "__iter__")
+    except AttributeError as exc:
+        raise base.SupervisionFailure(
+            "remote iterable without explicit __iter__ is unsupported"
+        ) from exc
+    iterator = bridge.request("call", iterator_method, (), {})
+    base.require(
+        type(iterator) is base._Remote,
+        "proposed __iter__ did not return a remote iterator",
+    )
+    return _RemoteIterator(bridge, iterator)
 
 
 def _remote_render(self, template: str, label: str) -> str:
@@ -192,8 +278,11 @@ def _remote_str(self):
 
 
 base._Remote.__bool__ = _remote_bool
+base._Remote.__iter__ = _remote_iter
 base._Remote.__repr__ = _remote_repr
 base._Remote.__str__ = _remote_str
+base._Bridge.close = _bridge_close
+base.main = _deterministic_base_main
 
 
 def _cached_process_self_test():
@@ -281,6 +370,103 @@ def _remote_observation_self_test():
     print("remote_representation=PASS mapping_view_truth=PASS")
 
 
+def _remote_iteration_self_test():
+    class IteratorBridge:
+        def __init__(self):
+            self.actions = []
+            self.next_count = 0
+
+        def request(self, action, *arguments):
+            self.actions.append(action)
+            if action == "getattr":
+                base.require(
+                    len(arguments) == 2 and arguments[1] == "__iter__",
+                    "lazy iteration requested an unexpected attribute",
+                )
+                return base._Remote(self, 90, "method-wrapper")
+            if action == "call":
+                base.require(
+                    len(arguments) == 3
+                    and type(arguments[0]) is base._Remote
+                    and object.__getattribute__(arguments[0], "_handle") == 90
+                    and arguments[1] == ()
+                    and arguments[2] == {},
+                    "lazy iteration used an invalid __iter__ call envelope",
+                )
+                return base._Remote(self, 91, "generator")
+            if action == "next":
+                base.require(
+                    len(arguments) == 1
+                    and type(arguments[0]) is base._Remote
+                    and object.__getattribute__(arguments[0], "_handle") == 91,
+                    "lazy iteration advanced the wrong actor handle",
+                )
+                self.next_count += 1
+                if self.next_count == 1:
+                    return "first"
+                raise StopIteration
+            raise base.SupervisionFailure(
+                "lazy iteration used eager or unexpected actor operation"
+            )
+
+    bridge = IteratorBridge()
+    source = base._Remote(bridge, 1, "generator")
+    iterator = iter(source)
+    base.require(
+        bridge.actions == ["getattr", "call"],
+        "Remote iteration consumed values while creating the iterator",
+    )
+    base.require(next(iterator) == "first", "Remote iterator lost its first item")
+    base.require(
+        bridge.actions == ["getattr", "call", "next"],
+        "Remote iterator eagerly consumed more than one item",
+    )
+    try:
+        next(iterator)
+    except StopIteration:
+        pass
+    else:
+        raise base.SupervisionFailure("Remote iterator lost StopIteration")
+    base.require(
+        "iterate" not in bridge.actions,
+        "Remote iterator fell back to eager actor materialization",
+    )
+    print("remote_lazy_iteration=PASS")
+
+
+def _direct_output_policy_self_test():
+    class NoisyBridge:
+        diagnostic_bytes = 1
+
+    try:
+        _require_silent_actor(NoisyBridge())
+    except base.SupervisionFailure as exc:
+        base.require(
+            "emitted output" in str(exc),
+            "direct-output guard failed for an unrelated reason",
+        )
+    else:
+        raise base.SupervisionFailure(
+            "direct proposed-call output was not fail-closed"
+        )
+    print("direct_call_output_policy=PASS")
+
+
+def _deterministic_enumeration_self_test():
+    marker = lambda root: []
+    base.expected_tests = marker
+    base.require(
+        base.expected_tests is marker,
+        "deterministic enumeration self-test could not install override",
+    )
+    _restore_serial_expected_tests()
+    base.require(
+        base.expected_tests is _serial_expected_tests,
+        "serial runtime test enumeration was not restored",
+    )
+    print("serial_runtime_enumeration=PASS")
+
+
 def _final_boundary_self_test(
     python_bin, timeout_seconds, *, local_test=False
 ):
@@ -290,6 +476,9 @@ def _final_boundary_self_test(
     # These are pure trusted-worker controls and add no actor startup, preserving
     # the existing fixed aggregate current-suite lifetime.
     _remote_observation_self_test()
+    _remote_iteration_self_test()
+    _direct_output_policy_self_test()
+    _deterministic_enumeration_self_test()
 
 
 # Round-3 and retained functions resolve these globals dynamically. Patch every
