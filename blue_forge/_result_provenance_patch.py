@@ -102,6 +102,22 @@ def install(core: Any) -> None:
     regression_record() additionally requires that recomputation to match its
     independently supplied case.
     """
+    installed = getattr(core, "_result_provenance_installation", None)
+    if (
+        type(installed) is tuple
+        and len(installed) == 3
+        and getattr(core, "HardeningResult", None) is installed[0]
+        and getattr(core, "evaluate", None) is installed[1]
+        and getattr(core, "regression_record", None) is installed[2]
+    ):
+        return
+
+    original_regression_record = getattr(
+        core, "_result_provenance_original_regression_record", None
+    )
+    if original_regression_record is None:
+        original_regression_record = core.regression_record
+        core._result_provenance_original_regression_record = original_regression_record
 
     def payload_for_validated_case(case: Any) -> dict[str, Any]:
         return _payload_for_validated_case(core, case)
@@ -192,8 +208,6 @@ def install(core: Any) -> None:
     def evaluate(case: Any) -> Any:
         return HardeningResult._from_evaluation(case)
 
-    original_regression_record = core.regression_record
-
     def regression_record(case: Any, result: Any) -> dict[str, Any]:
         # Exact type is still part of the public value contract, but the object
         # construction route is not trusted as provenance. The original routine
@@ -208,3 +222,8 @@ def install(core: Any) -> None:
     core.HardeningResult = HardeningResult
     core.evaluate = evaluate
     core.regression_record = regression_record
+    core._result_provenance_installation = (
+        HardeningResult,
+        evaluate,
+        regression_record,
+    )
