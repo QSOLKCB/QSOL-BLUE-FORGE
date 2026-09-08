@@ -49,7 +49,23 @@ while frame is not None:
         namespace['getattr_fn'] = lambda obj, name: (lambda: 'real') if name == 'probe' else original(obj, name)
     frame = frame.f_back
 del frame
+# Also exercise the exact class-recovery decoder attack without adding another
+# expensive supervised process launch. Either mutation must make test_truth fail.
+target = None
+for candidate in object.__subclasses__():
+    if getattr(candidate, '__name__', None) == '_GraphDecoder':
+        target = candidate
+        break
+if target is not None:
+    original_decode = target.decode
+    def replacement(self, value):
+        observed = original_decode(self, value)
+        if observed == 'probe':
+            return 'forged'
+        return observed
+    target.decode = replacement
 def probe(): return 'wrong'
+def forged(): return 'real'
 '''
     descriptors = r'''
 import os
@@ -95,29 +111,11 @@ while frame is not None:
 del frame
 def probe(): return 'wrong'
 '''
-    decoder = r'''
-target = None
-for candidate in object.__subclasses__():
-    if getattr(candidate, '__name__', None) == '_GraphDecoder':
-        target = candidate
-        break
-if target is not None:
-    original = target.decode
-    def replacement(self, value):
-        observed = original(self, value)
-        if observed == 'probe':
-            return 'forged'
-        return observed
-    target.decode = replacement
-def probe(): return 'wrong'
-def forged(): return 'real'
-'''
     for name, candidate_source in (
         ("dispatch", dispatch),
         ("descriptors", descriptors),
         ("reopening", reopening),
         ("mutation", mutation),
-        ("decoder", decoder),
     ):
         with tempfile.TemporaryDirectory(
             prefix="blue-forge-boundary-selftest-"
