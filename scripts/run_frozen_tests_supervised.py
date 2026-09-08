@@ -6,16 +6,22 @@ This layer closes cached native-process references, requires proposed source to
 be unreadable from the trusted frozen worker, makes Remote truth/str/repr and
 iteration observe bounded actor-side behavior, fails closed on direct-call
 output in the frozen oracle, and restores deterministic serial runtime test
-enumeration.
+enumeration without the launcher's parallel race.
 """
 from __future__ import annotations
 
+import ast
+import base64
+import builtins
 import contextlib
+import hashlib
+import hmac
 import importlib.util
 import os
 from pathlib import Path
 import sys
 import threading
+import types
 
 
 _ROUND3 = Path(__file__).with_name("_run_frozen_tests_supervised_round3.py")
@@ -37,7 +43,6 @@ _legacy_final_boundary_self_test = round3._final_boundary_self_test
 _legacy_worker_run = base._worker_run
 _legacy_bridge_close = base._Bridge.close
 _legacy_base_main = base.main
-_serial_expected_tests = base.expected_tests
 
 # These CPython audit events sit below Python module aliases. A cached reference
 # such as pathlib.os.system therefore cannot escape merely because it points at
@@ -105,9 +110,6 @@ def _hardened_test_importer(bridge):
 # ---------------------------------------------------------------------------
 # Proposed-source provenance
 # ---------------------------------------------------------------------------
-# Only the trust-critical frozen/proposed root is private to the actor. Existing
-# supervisor self-test roots remain readable, so their attack fixtures can still
-# be constructed and executed as local boundary controls.
 def _require_private_proposed_source(root: Path):
     source_root = root / "blue_forge"
     files = sorted(source_root.glob("*.py"))
@@ -142,8 +144,8 @@ def _worker_run(root, identity, *, local_test=False):
 # application process never receives a broker-facing descriptor. In the trusted
 # frozen/proposed oracle, any actor diagnostic bytes make the test fail closed;
 # therefore a direct API call cannot hide unexpected stdout from redirect_stdout
-# assertions. The PR-controlled current floor intentionally retains ordinary
-# stderr diagnostics and is also rerun through the independent direct sandbox.
+# assertions. The PR-controlled current floor retains ordinary stderr semantics
+# and is independently rerun through the direct sandbox.
 def _require_silent_actor(bridge):
     diagnostic_bytes = object.__getattribute__(bridge, "diagnostic_bytes")
     base.require(
@@ -153,7 +155,6 @@ def _require_silent_actor(bridge):
 
 
 def _trusted_transport_attack_selftest(bridge):
-    """Recognize only the retained baseline-owned descriptor-forgery roots."""
     root = object.__getattribute__(bridge, "root")
     try:
         name = Path(root).name
@@ -164,16 +165,8 @@ def _trusted_transport_attack_selftest(bridge):
 
 def _bridge_close(self):
     result = _legacy_bridge_close(self)
-    # The retained descriptor-isolation control intentionally writes forged
-    # response frames to fd 1. The executor correctly redirects those bytes to
-    # diagnostic stderr; do not reinterpret that baseline-owned attack traffic
-    # as application output. Likewise, the PR-controlled supervised-current
-    # floor contains tests that intentionally exercise stderr diagnostics. The
-    # trusted frozen/proposed oracle has neither exemption and stays fail-closed.
     supervised_current = bool(os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"))
     if not supervised_current and not _trusted_transport_attack_selftest(self):
-        # The retained close joins the diagnostic drain, so this count is
-        # complete for the actor lifetime rather than racing a pipe buffer.
         _require_silent_actor(self)
     return result
 
@@ -181,17 +174,192 @@ def _bridge_close(self):
 # ---------------------------------------------------------------------------
 # Deterministic runtime enumeration
 # ---------------------------------------------------------------------------
-# The root-owned current-suite launcher historically tried to replace this with
-# a ThreadPoolExecutor coordinator. Runtime discovery is semantically ordered:
-# module import/load_tests may share HOME-relative state. Capture the serial
-# baseline-owned oracle before any outer wrapper can replace it and restore it
-# immediately before the real supervisor main routine starts.
+# The launcher used to run one authenticated module enumeration per thread.
+# That races shared HOME/module setup. Enumerate the sorted module floor inside
+# one authenticated child and one actor bridge instead: module setup is serial,
+# shared writable state is observed in reference order, and repeated actor/process
+# startup no longer consumes the fixed 240-second current-suite lifetime.
+def _runtime_module_names(root: Path) -> list[str]:
+    supervised_current = bool(os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"))
+    paths = sorted((root / "tests").glob("test*.py"))
+    base.require(paths, "empty frozen test floor")
+    modules: list[str] = []
+    for path in paths:
+        base.require(
+            path.is_file() and not path.is_symlink(),
+            "invalid frozen test file",
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if (
+            round3.round2.previous._current_suite_only(tree, path)
+            and not supervised_current
+        ):
+            continue
+        modules.append(path.stem)
+    base.require(
+        modules and len(modules) == len(set(modules)),
+        "empty or duplicate runtime module floor",
+    )
+    return modules
+
+
+def _serial_enumeration_worker(root: Path, modules: list[str]):
+    bridge = base._Bridge(root, local_test=False)
+    base._ACTIVE_BRIDGE = bridge
+    finder = base._ProxyLoader(bridge)
+    sys.meta_path.insert(0, finder)
+    test_path = str(root / "tests")
+    sys.path.insert(0, test_path)
+    loaded: list[str] = []
+    try:
+        importer = _hardened_test_importer(bridge)
+        identities = []
+        with round3._trusted_test_facades(importer):
+            for module_name in modules:
+                path = root / "tests" / (module_name + ".py")
+                base.require(
+                    path.is_file() and not path.is_symlink(),
+                    "invalid serial-enumeration test module",
+                )
+                source_text = path.read_text(encoding="utf-8")
+                tree = base._TestTransform().visit(
+                    ast.parse(source_text, filename=str(path))
+                )
+                ast.fix_missing_locations(tree)
+                module = types.ModuleType(module_name)
+                module.__file__ = str(path)
+                module.__dict__["__builtins__"] = {
+                    **vars(builtins),
+                    "__import__": importer,
+                }
+                module.__dict__["_remote_object_setattr"] = (
+                    base._remote_object_setattr
+                )
+                sys.modules[module_name] = module
+                loaded.append(module_name)
+                exec(
+                    compile(tree, str(path), "exec", dont_inherit=True),
+                    module.__dict__,
+                )
+                suite = base.unittest.defaultTestLoader.loadTestsFromModule(module)
+                identities.extend(
+                    round3.round2._flatten_suite(suite, module_name)
+                )
+        base.require(
+            identities and len(identities) == len(set(identities)),
+            "empty or duplicate serial runtime test floor",
+        )
+        return identities
+    finally:
+        try:
+            bridge.close()
+        finally:
+            if finder in sys.meta_path:
+                sys.meta_path.remove(finder)
+            try:
+                sys.path.remove(test_path)
+            except ValueError:
+                pass
+            for module_name in loaded:
+                sys.modules.pop(module_name, None)
+            base._ACTIVE_BRIDGE = None
+
+
+def _serial_enumeration_child(root: Path):
+    raw_secret = sys.stdin.buffer.read(64)
+    sys.stdin.close()
+    try:
+        secret = bytes.fromhex(raw_secret.decode("ascii"))
+    except (UnicodeError, ValueError) as exc:
+        raise base.SupervisionFailure("invalid trusted serial-enumeration key") from exc
+    base.require(len(secret) == 32, "missing trusted serial-enumeration key")
+    modules = _runtime_module_names(root)
+    identities = _serial_enumeration_worker(root.resolve(), modules)
+    payload = base._wire_dump([list(identity) for identity in identities])
+    mac = hmac.new(
+        secret, b"SERIAL-ENUM:" + payload, hashlib.sha256
+    ).hexdigest()
+    print(
+        "trusted_serial_enumeration="
+        + mac
+        + ":"
+        + base64.b64encode(payload).decode("ascii")
+    )
+
+
+def _deterministic_expected_tests(root: Path):
+    modules = _runtime_module_names(root)
+    secret = base.secrets.token_bytes(32)
+    command = [
+        sys.executable,
+        "-I",
+        str(Path(__file__).resolve()),
+        "--enumerate-all-root",
+        str(root),
+    ]
+    rc, diagnostic, timed_out = base._run_process_bounded(
+        command,
+        cwd=root,
+        env=dict(os.environ),
+        timeout_seconds=90,
+        input_bytes=secret.hex().encode("ascii"),
+    )
+    base.require(
+        not timed_out and rc == 0,
+        "trusted serial runtime enumeration failed: "
+        f"rc={rc}\n{diagnostic}",
+    )
+    lines = diagnostic.splitlines()
+    prefix = "trusted_serial_enumeration="
+    base.require(
+        lines and lines[-1].startswith(prefix),
+        "missing authenticated serial runtime enumeration",
+    )
+    record = lines[-1][len(prefix):]
+    try:
+        mac, encoded = record.split(":", 1)
+        payload = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise base.SupervisionFailure(
+            "malformed authenticated serial runtime enumeration"
+        ) from exc
+    expected = hmac.new(
+        secret, b"SERIAL-ENUM:" + payload, hashlib.sha256
+    ).hexdigest()
+    base.require(
+        hmac.compare_digest(mac, expected),
+        "serial runtime enumeration authentication failed",
+    )
+    value = base._wire_load(payload)
+    base.require(type(value) is list, "serial runtime enumeration is not a list")
+    module_set = set(modules)
+    identities = []
+    for item in value:
+        base.require(
+            type(item) is list
+            and len(item) == 3
+            and all(type(part) is str for part in item),
+            "serial runtime enumeration contains an invalid identity",
+        )
+        identity = tuple(item)
+        base.require(
+            identity[0] in module_set and identity[2].startswith("test"),
+            "serial runtime enumeration identity escaped its module floor",
+        )
+        identities.append(identity)
+    base.require(
+        identities and len(identities) == len(set(identities)),
+        "empty or duplicate authenticated serial runtime floor",
+    )
+    return identities
+
+
 def _restore_serial_expected_tests():
-    base.expected_tests = _serial_expected_tests
+    base.expected_tests = _deterministic_expected_tests
 
 
 def _deterministic_base_main(*args, **kwargs):
-    replaced = base.expected_tests is not _serial_expected_tests
+    replaced = base.expected_tests is not _deterministic_expected_tests
     _restore_serial_expected_tests()
     if replaced:
         print("deterministic_runtime_enumeration=PASS")
@@ -250,10 +418,6 @@ class _RemoteIterator:
 
 def _remote_iter(self):
     bridge = object.__getattribute__(self, "_bridge")
-    # Invoke the actual actor-side __iter__ protocol but do not materialize any
-    # yielded values. Every later __next__ is a separate bounded RPC operation.
-    # Objects that expose only the legacy sequence protocol fail closed rather
-    # than falling back to the old eager MAX_GRAPH_NODES materialization path.
     try:
         iterator_method = bridge.request("getattr", self, "__iter__")
     except AttributeError as exc:
@@ -270,9 +434,6 @@ def _remote_iter(self):
 
 def _remote_render(self, template: str, label: str) -> str:
     bridge = object.__getattribute__(self, "_bridge")
-    # str.format's !r/!s conversions invoke the actor object's actual repr/str
-    # protocol without trusting a worker-side placeholder or the actor's mutable
-    # builtins.repr/builtins.str names.
     formatter = bridge.request("getattr", template, "format")
     rendered = bridge.request("call", formatter, (self,), {})
     base.require(type(rendered) is str, f"invalid proposed {label} observation")
@@ -303,11 +464,10 @@ base._Remote.__repr__ = _remote_repr
 base._Remote.__str__ = _remote_str
 base._Bridge.close = _bridge_close
 base.main = _deterministic_base_main
+base.expected_tests = _deterministic_expected_tests
 
 
 def _cached_process_self_test():
-    # pathlib imported os before the facade scope exists. This exact cached
-    # reference must still hit the lower audit boundary and fail before launch.
     import pathlib
 
     class LiveBridge:
@@ -481,7 +641,7 @@ def _deterministic_enumeration_self_test():
     )
     _restore_serial_expected_tests()
     base.require(
-        base.expected_tests is _serial_expected_tests,
+        base.expected_tests is _deterministic_expected_tests,
         "serial runtime test enumeration was not restored",
     )
     print("serial_runtime_enumeration=PASS")
@@ -493,8 +653,6 @@ def _final_boundary_self_test(
     _legacy_final_boundary_self_test(
         python_bin, timeout_seconds, local_test=local_test
     )
-    # These are pure trusted-worker controls and add no actor startup, preserving
-    # the existing fixed aggregate current-suite lifetime.
     _remote_observation_self_test()
     _remote_iteration_self_test()
     _direct_output_policy_self_test()
@@ -519,6 +677,12 @@ _enumerate_module_parent = round3._enumerate_module_parent
 
 
 def _main():
+    if (
+        len(sys.argv) == 3
+        and sys.argv[1] == "--enumerate-all-root"
+    ):
+        _serial_enumeration_child(Path(sys.argv[2]))
+        return 0
     return round3._main()
 
 
