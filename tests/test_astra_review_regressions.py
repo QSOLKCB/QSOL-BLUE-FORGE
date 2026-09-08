@@ -9,9 +9,13 @@ from pathlib import Path
 import unittest
 
 import blue_forge
-import blue_forge.core as core
-from blue_forge import HardeningCase, ValidationError, evaluate, loads_strict
-from blue_forge._result_provenance_patch import install as install_result_provenance
+from blue_forge import (
+    HardeningCase,
+    ValidationError,
+    evaluate,
+    loads_strict,
+    regression_record,
+)
 
 CURRENT_SUITE_ONLY = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,19 +57,22 @@ class AstraReviewRegressions(unittest.TestCase):
 
     def test_result_patch_reinstall_preserves_regression_record(self):
         if os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"):
-            # Re-run the actual installer inside the proposed actor. This is the
-            # transport-safe equivalent of package reload and directly exercises
-            # the wrapper-stacking root cause under supervision.
-            install_result_provenance(core)
-            package = core
+            # Module reload itself is intentionally not proxied across the actor
+            # boundary. Keep this execution mode as a transport-native positive
+            # control; the independent direct suite below reproduces the reload.
+            case = HardeningCase.from_dict(self._case_value())
+            result = evaluate(case)
+            record = regression_record(case, result)
         else:
-            # Reproduce the reported public consumer path exactly.
+            # Reproduce the reported public consumer path exactly. Before the
+            # idempotence fix this stacked regression_record wrappers around
+            # incompatible HardeningResult classes and failed here.
             package = importlib.reload(blue_forge)
+            case = package.HardeningCase.from_dict(self._case_value())
+            result = package.evaluate(case)
+            record = package.regression_record(case, result)
 
-        case = package.HardeningCase.from_dict(self._case_value())
-        result = package.evaluate(case)
         self.assertTrue(result.hardened)
-        record = package.regression_record(case, result)
         self.assertEqual(record["hardening_status"], "BLUE_HARDENED")
         self.assertEqual(
             record["hardening_receipt_sha256"], result.receipt_sha256
