@@ -817,6 +817,7 @@ def _state_preservation_self_test():
     try:
         with tempfile.TemporaryDirectory(prefix="blue-forge-enumeration-state-") as temp:
             top = Path(temp)
+            top.chmod(0o755)
             root = top / "root"
             home = top / "home"
             root.mkdir()
