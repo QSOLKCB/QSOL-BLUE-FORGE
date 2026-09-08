@@ -106,10 +106,15 @@ def install(core: Any) -> None:
     if (
         type(installed) is tuple
         and len(installed) == 3
-        and getattr(core, "HardeningResult", None) is installed[0]
         and getattr(core, "evaluate", None) is installed[1]
         and getattr(core, "regression_record", None) is installed[2]
     ):
+        # Another package installer may transiently replace HardeningResult while
+        # reloading blue_forge. If our installed evaluate/regression wrappers are
+        # still the exact live functions, this is the same installation, not a
+        # new core generation. Restore the stable result class rather than
+        # stacking a fresh wrapper/class pair around the existing installation.
+        core.HardeningResult = installed[0]
         return
 
     original_regression_record = getattr(
