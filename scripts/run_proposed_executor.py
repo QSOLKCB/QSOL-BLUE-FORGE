@@ -365,13 +365,7 @@ def bounded_iterate(value, iter_fn, tuple_fn, islice_fn, len_fn, limit, error_ty
         raise error_type("executor iteration budget exceeded")
     return items
 
-def decode_graph(recurse, value, nodes, handles, cache, classes, deps):
-    (type_fn, len_fn, require_fn, int_type, int_fn, float_fromhex_fn,
-     b64decode_fn, builtin_exceptions, magic_mock, dict_type, list_type,
-     tuple_type, frozenset_type, set_type, object_type, dict_setitem,
-     dict_update, dict_copy, list_extend, set_update, object_getattribute,
-     compile_fn, exec_fn, builtin_snapshot, io_module, any_type, path_type,
-     json_module, unittest_module, copy_module, str_type) = deps
+def decode_graph(value, nodes, handles, cache, classes):
     require_fn(type_fn(value) is list_type and len_fn(value) == 2,
                "invalid transport value")
     tag, data = value
@@ -447,7 +441,7 @@ def decode_graph(recurse, value, nodes, handles, cache, classes, deps):
     items = node.get("items")
     if kind in {"tuple", "frozenset"}:
         require_fn(type_fn(items) is list_type, "invalid transport node items")
-        children = [recurse(recurse, child, nodes, handles, cache, classes, deps)
+        children = [decode_graph(child, nodes, handles, cache, classes)
                     for child in items]
         obj = base.__new__(cls, children)
         cache[data] = obj
@@ -459,19 +453,19 @@ def decode_graph(recurse, value, nodes, handles, cache, classes, deps):
             for pair in items:
                 require_fn(type_fn(pair) is list_type and len_fn(pair) == 2,
                            "invalid dictionary transport item")
-                key_value = recurse(recurse, pair[0], nodes, handles, cache, classes, deps)
-                child_value = recurse(recurse, pair[1], nodes, handles, cache, classes, deps)
+                key_value = decode_graph(pair[0], nodes, handles, cache, classes)
+                child_value = decode_graph(pair[1], nodes, handles, cache, classes)
                 dict_setitem(obj, key_value, child_value)
         elif kind == "list":
             require_fn(type_fn(items) is list_type, "invalid transport node items")
-            list_extend(obj, [recurse(recurse, child, nodes, handles, cache, classes, deps)
+            list_extend(obj, [decode_graph(child, nodes, handles, cache, classes)
                               for child in items])
         elif kind == "set":
             require_fn(type_fn(items) is list_type, "invalid transport node items")
-            set_update(obj, [recurse(recurse, child, nodes, handles, cache, classes, deps)
+            set_update(obj, [decode_graph(child, nodes, handles, cache, classes)
                              for child in items])
     if "state" in node:
-        state = recurse(recurse, node["state"], nodes, handles, cache, classes, deps)
+        state = decode_graph(node["state"], nodes, handles, cache, classes)
         require_fn(type_fn(state) is dict_type, "invalid boundary object state")
         dict_update(object_getattribute(obj, "__dict__"), state)
     return obj
@@ -481,15 +475,45 @@ _bf_iterate_code = _bf_compile_namespace["bounded_iterate"].__code__
 _bf_decode_code = _bf_compile_namespace["decode_graph"].__code__
 del _bf_compile_namespace
 
-_bf_decode_dependencies = (
-    _bf_type, _bf_len, _bf_require, _bf_int, _bf_int, _bf_float_fromhex,
-    _bf_b64decode, _bf_builtin_exceptions, _bf_MagicMock, _bf_dict, _bf_list,
-    _bf_tuple, _bf_frozenset, _bf_set, _bf_object, _bf_dict_setitem,
-    _bf_dict_update, _bf_dict_copy, _bf_list_extend, _bf_set_update,
-    _bf_object_getattribute, _bf_compile, _bf_exec, _bf_builtin_snapshot,
-    _bf_io_module, _bf_Any, Path, _bf_json_module, _bf_unittest_module,
-    _bf_copy_module, _bf_str,
-)
+# A template of trusted primitive references is copied into a private globals
+# dictionary for each request. Recursive decode calls therefore use direct
+# global lookups instead of unpacking a large dependency tuple at every node,
+# while the resulting function and its private globals are still destroyed before
+# any proposed import/getattr/call begins.
+_bf_decode_globals_template = {
+    "type_fn": _bf_type,
+    "len_fn": _bf_len,
+    "require_fn": _bf_require,
+    "int_type": _bf_int,
+    "int_fn": _bf_int,
+    "float_fromhex_fn": _bf_float_fromhex,
+    "b64decode_fn": _bf_b64decode,
+    "builtin_exceptions": _bf_builtin_exceptions,
+    "magic_mock": _bf_MagicMock,
+    "dict_type": _bf_dict,
+    "list_type": _bf_list,
+    "tuple_type": _bf_tuple,
+    "frozenset_type": _bf_frozenset,
+    "set_type": _bf_set,
+    "object_type": _bf_object,
+    "dict_setitem": _bf_dict_setitem,
+    "dict_update": _bf_dict_update,
+    "dict_copy": _bf_dict_copy,
+    "list_extend": _bf_list_extend,
+    "set_update": _bf_set_update,
+    "object_getattribute": _bf_object_getattribute,
+    "compile_fn": _bf_compile,
+    "exec_fn": _bf_exec,
+    "builtin_snapshot": _bf_builtin_snapshot,
+    "io_module": _bf_io_module,
+    "any_type": _bf_Any,
+    "path_type": Path,
+    "json_module": _bf_json_module,
+    "unittest_module": _bf_unittest_module,
+    "copy_module": _bf_copy_module,
+    "str_type": _bf_str,
+}
+_bf_decode_global_count = _bf_len(_bf_decode_globals_template) + 2
 
 sys.path.insert(0, _bf_str(_BF_ROOT))
 os.chdir(_BF_ROOT)
@@ -720,22 +744,30 @@ def _bf_process_one(raw):
     _bf_require(_bf_type(request.get("sync")) is _bf_list, "invalid executor sync set")
 
     # Decode the request before entering any proposed operation. The callable is
-    # rebuilt from an immutable code object with empty globals for this request
-    # only and is destroyed before import/getattr/call dispatch begins.
+    # rebuilt from an immutable code object with private globals for this request
+    # only; the self-reference is broken and all references are dropped before
+    # import/getattr/call dispatch begins.
     cache = {}
     classes = {}
-    decode, decode_record = _bf_fresh_function(_bf_decode_code)
+    decode_globals = _bf_dict_copy(_bf_decode_globals_template)
+    decode_globals["__builtins__"] = {}
+    decode = _bf_FunctionType(_bf_decode_code, decode_globals)
+    decode_globals["decode_graph"] = decode
     try:
         arguments = [
-            decode(
-                decode, value, request["nodes"], _bf_handles, cache, classes,
-                _bf_decode_dependencies,
-            )
+            decode(value, request["nodes"], _bf_handles, cache, classes)
             for value in request["arguments"]
         ]
     finally:
-        _bf_check_namespace(decode_record)
-        del decode, decode_record, classes
+        _bf_require(
+            _bf_len(decode_globals) == _bf_decode_global_count
+            and decode_globals.get("decode_graph") is decode
+            and _bf_type(decode_globals.get("__builtins__")) is _bf_dict
+            and _bf_len(decode_globals["__builtins__"]) == 0,
+            "request decoder namespace was mutated",
+        )
+        _bf_dict_pop(decode_globals, "decode_graph", None)
+        del decode, decode_globals, classes
 
     data_indices = _bf_argument_data_indices(request["nodes"], request["arguments"])
     watched = {}
