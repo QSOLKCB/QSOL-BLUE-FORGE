@@ -14,7 +14,7 @@ mode also masks procfs, removing /proc/self/mem as a protection bypass.
 Operation selection remains on the subinterpreter control thread. Proposed
 calls enter a fresh transport-free wrapper whose arguments are locals, not a
 shared dispatch dictionary. Namespace mutation fails closed before an observation
-is accepted. Kernel isolation and the existing tracing/thread guards remain
+is accepted. Kernel isolation and the existing audit/thread/tracing guards remain
 required. This is tested observation isolation, not universal Python attestation.
 """
 from __future__ import annotations
@@ -99,6 +99,8 @@ _bf_os_read = os.read
 _bf_set_blocking = os.set_blocking
 _bf_gettrace = sys.gettrace
 _bf_getprofile = sys.getprofile
+_bf_audit = sys.audit
+_bf_addaudithook = sys.addaudithook
 
 _spec = importlib.util.spec_from_file_location(
     "_blue_forge_executor_support", _BF_SUPPORT_PATH
@@ -166,7 +168,8 @@ def _bf_run_cli_bounded(command, root, environment):
                 stream.close()
 
 
-# Retain the existing thread/import/tracing restrictions and bootstrap controls.
+# Retain the existing import/thread/tracing restrictions and block any later
+# audit-hook registration before proposed modules are imported.
 def _bf_make_execution_guard(blocked, error_type):
     allowed = [None]
     def arm(target):
@@ -178,6 +181,8 @@ def _bf_make_execution_guard(blocked, error_type):
             raise error_type("executor bootstrap module import is blocked")
         if event in {"sys.settrace", "sys.setprofile"}:
             raise error_type("proposed tracing or profiling is blocked")
+        if event == "sys.addaudithook":
+            raise error_type("proposed audit-hook registration is blocked")
         if event == "_thread.start_new_thread":
             target = args[0] if args else None
             if target is not allowed[0]:
@@ -190,8 +195,26 @@ _bf_arm_thread_start, _bf_execution_guard = _bf_make_execution_guard(
                "_xxsubinterpreters", "_testcapi", "_testinternalcapi"}),
     _bf_RuntimeError,
 )
-sys.addaudithook(_bf_execution_guard)
+_bf_addaudithook(_bf_execution_guard)
 del _bf_execution_guard, _bf_make_execution_guard
+
+
+# CPython may suppress RuntimeError raised by an existing audit hook during
+# sys.addaudithook(). Verify the security property by effect: an attempted
+# later hook must never observe a subsequent custom audit event.
+_bf_audit_hook_probe = _bf_deque()
+def _bf_candidate_audit_hook(event, args):
+    del args
+    if event == "blue_forge.executor.audit_hook_probe":
+        _bf_audit_hook_probe.append(True)
+try:
+    _bf_addaudithook(_bf_candidate_audit_hook)
+except _bf_BaseException:
+    pass
+_bf_audit("blue_forge.executor.audit_hook_probe")
+if _bf_audit_hook_probe:
+    raise _bf_RuntimeError("proposed audit-hook registration self-test failed")
+del _bf_candidate_audit_hook, _bf_audit_hook_probe
 
 
 def _bf_thread_guard_self_test(destination):
