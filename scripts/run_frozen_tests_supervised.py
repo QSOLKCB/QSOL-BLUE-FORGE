@@ -25,6 +25,7 @@ import types
 
 
 _ROUND3 = Path(__file__).with_name("_run_frozen_tests_supervised_round3.py")
+_RETAINED_EXECUTOR = Path(__file__).with_name("run_proposed_executor.py")
 _spec = importlib.util.spec_from_file_location(
     "_blue_forge_supervisor_round3_final", _ROUND3
 )
@@ -157,10 +158,7 @@ class _CliFlagBridge:
                 and arguments[0][0] in {"verify", "regression"},
                 "retained CLI bridge produced an invalid action envelope",
             )
-            arguments = (
-                [arguments[0][0], *flags],
-                *arguments[1:],
-            )
+            arguments = ([arguments[0][0], *flags], *arguments[1:])
         return bridge.request(action, *arguments)
 
 
@@ -181,9 +179,7 @@ def _arm_process_method(function, source_bridge, root):
 
 
 def _hardened_test_importer(bridge):
-    mediated_bridge = (
-        _CliFlagBridge(bridge) if isinstance(bridge, base._Bridge) else bridge
-    )
+    mediated_bridge = _CliFlagBridge(bridge) if isinstance(bridge, base._Bridge) else bridge
     importer = _legacy_importer(mediated_bridge)
     facades = importer._blue_forge_facades
     process_proxy = facades["subprocess"]
@@ -194,6 +190,78 @@ def _hardened_test_importer(bridge):
             _arm_process_method(getattr(process_proxy, name), bridge, Path(bridge.root)),
         )
     return importer
+
+
+def _patched_executor_bootstrap(executor) -> str:
+    """Patch only retained CLI command construction before proposed Python exists."""
+    bootstrap = executor._SUBINTERPRETER_BOOTSTRAP
+    capture = "_bf_modules = sys.modules\n"
+    capture_replacement = capture + "_bf_sys_executable = sys.executable\n"
+    base.require(
+        bootstrap.count(capture) == 1,
+        "retained executor bootstrap executable capture changed",
+    )
+    old = '                command = [sys.executable, "-m", "blue_forge", cli_args[0], _bf_str(path)]'
+    new = '''                _bf_require(
+                    _bf_type(cli_args) is _bf_list and _bf_len(cli_args) >= 1,
+                    "invalid proposed CLI interpreter envelope",
+                )
+                _bf_cli_subcommand = cli_args[0]
+                _bf_cli_flags = cli_args[1:]
+                _bf_require(
+                    _bf_type(_bf_cli_subcommand) is _bf_str
+                    and _bf_cli_subcommand in ("verify", "regression"),
+                    "invalid proposed CLI subcommand",
+                )
+                _bf_cli_index = 0
+                while _bf_cli_index < _bf_len(_bf_cli_flags):
+                    _bf_cli_token = _bf_cli_flags[_bf_cli_index]
+                    _bf_require(_bf_type(_bf_cli_token) is _bf_str,
+                                "invalid proposed CLI Python flag")
+                    if _bf_cli_token in ("-I", "-E", "-s", "-S", "-B", "-P", "-u"):
+                        _bf_cli_index += 1
+                        continue
+                    _bf_require(
+                        _bf_cli_token == "-X"
+                        and _bf_cli_index + 1 < _bf_len(_bf_cli_flags)
+                        and _bf_cli_flags[_bf_cli_index + 1] in ("utf8", "utf8=1", "utf8=0"),
+                        "unsupported proposed CLI Python flag",
+                    )
+                    _bf_cli_index += 2
+                command = [_bf_sys_executable, *_bf_cli_flags, "-m", "blue_forge",
+                           _bf_cli_subcommand, _bf_str(path)]'''
+    base.require(
+        bootstrap.count(old) == 1,
+        "retained executor CLI construction changed",
+    )
+    return bootstrap.replace(capture, capture_replacement, 1).replace(old, new, 1)
+
+
+def _executor_entry(root: Path) -> int:
+    """Run the retained executor with the reviewed CLI-flag patch in memory."""
+    spec = importlib.util.spec_from_file_location(
+        "_blue_forge_retained_executor", _RETAINED_EXECUTOR
+    )
+    if spec is None or spec.loader is None:
+        raise base.SupervisionFailure("retained proposed executor is unavailable")
+    executor = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(executor)
+    executor._SUBINTERPRETER_BOOTSTRAP = _patched_executor_bootstrap(executor)
+    prior_argv = sys.argv
+    sys.argv = [str(_RETAINED_EXECUTOR), str(root)]
+    try:
+        return executor.main()
+    except BaseException as exc:
+        print(f"proposed_executor=FAIL reason={str(exc)!r}", file=sys.stderr)
+        return 1
+    finally:
+        sys.argv = prior_argv
+
+
+# The baseline-owned first-stage broker checks this path for root ownership and
+# non-writability before spawning it. Re-enter this pinned final supervisor as
+# the executor wrapper, so no new unpinned control file is introduced.
+round3.round2.previous._EXECUTOR = Path(__file__).resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -234,12 +302,6 @@ def _worker_run(root, identity, *, local_test=False):
 # ---------------------------------------------------------------------------
 # Direct proposed-call output
 # ---------------------------------------------------------------------------
-# The executor maps proposed stdout onto its bounded diagnostic channel so the
-# application process never receives a broker-facing descriptor. In the trusted
-# frozen/proposed oracle, any actor diagnostic bytes make the test fail closed;
-# therefore a direct API call cannot hide unexpected stdout from redirect_stdout
-# assertions. The PR-controlled current floor retains ordinary stderr semantics
-# and is independently rerun through the direct sandbox.
 def _require_silent_actor(bridge):
     diagnostic_bytes = object.__getattribute__(bridge, "diagnostic_bytes")
     base.require(
@@ -268,26 +330,15 @@ def _bridge_close(self):
 # ---------------------------------------------------------------------------
 # Deterministic runtime discovery + execution
 # ---------------------------------------------------------------------------
-# Discovery and execution must observe the same trusted module objects and HOME
-# state. A separate enumeration child followed by per-test workers imports the
-# test modules twice and changes their observable setup state. Instead, import
-# every sorted module once, build the complete runtime suite, then execute those
-# exact selected TestCase objects in the same authenticated worker and actor.
 def _runtime_module_names(root: Path) -> list[str]:
     supervised_current = bool(os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"))
     paths = sorted((root / "tests").glob("test*.py"))
     base.require(paths, "empty frozen test floor")
     modules: list[str] = []
     for path in paths:
-        base.require(
-            path.is_file() and not path.is_symlink(),
-            "invalid frozen test file",
-        )
+        base.require(path.is_file() and not path.is_symlink(), "invalid frozen test file")
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        if (
-            round3.round2.previous._current_suite_only(tree, path)
-            and not supervised_current
-        ):
+        if round3.round2.previous._current_suite_only(tree, path) and not supervised_current:
             continue
         modules.append(path.stem)
     base.require(
@@ -318,9 +369,7 @@ def _serial_suite_worker(root: Path, modules: list[str]):
                     "invalid serial-suite test module",
                 )
                 source_text = path.read_text(encoding="utf-8")
-                tree = base._TestTransform().visit(
-                    ast.parse(source_text, filename=str(path))
-                )
+                tree = base._TestTransform().visit(ast.parse(source_text, filename=str(path)))
                 ast.fix_missing_locations(tree)
                 module = types.ModuleType(module_name)
                 module.__file__ = str(path)
@@ -328,19 +377,12 @@ def _serial_suite_worker(root: Path, modules: list[str]):
                     **vars(builtins),
                     "__import__": importer,
                 }
-                module.__dict__["_remote_object_setattr"] = (
-                    base._remote_object_setattr
-                )
+                module.__dict__["_remote_object_setattr"] = base._remote_object_setattr
                 sys.modules[module_name] = module
                 loaded.append(module_name)
-                exec(
-                    compile(tree, str(path), "exec", dont_inherit=True),
-                    module.__dict__,
-                )
+                exec(compile(tree, str(path), "exec", dont_inherit=True), module.__dict__)
                 suite = base.unittest.defaultTestLoader.loadTestsFromModule(module)
-                identities.extend(
-                    round3.round2._flatten_suite(suite, module_name)
-                )
+                identities.extend(round3.round2._flatten_suite(suite, module_name))
                 suites.append(suite)
 
             base.require(
@@ -351,10 +393,7 @@ def _serial_suite_worker(root: Path, modules: list[str]):
             for suite in suites:
                 suite.run(result)
 
-        base.require(
-            bridge.fatal is None,
-            f"RPC failure was caught by a test: {bridge.fatal}",
-        )
+        base.require(bridge.fatal is None, f"RPC failure was caught by a test: {bridge.fatal}")
         base.require(
             result.testsRun == len(identities)
             and not (
@@ -394,9 +433,7 @@ def _serial_suite_child(root: Path):
     modules = _runtime_module_names(root)
     identities = _serial_suite_worker(root.resolve(), modules)
     payload = base._wire_dump([list(identity) for identity in identities])
-    mac = hmac.new(
-        secret, b"SERIAL-SUITE:" + payload, hashlib.sha256
-    ).hexdigest()
+    mac = hmac.new(secret, b"SERIAL-SUITE:" + payload, hashlib.sha256).hexdigest()
     print(
         "trusted_serial_suite="
         + mac
@@ -416,24 +453,17 @@ def _deterministic_expected_tests(root: Path):
     )
     modules = _runtime_module_names(root)
     secret = base.secrets.token_bytes(32)
-    command = [
-        sys.executable,
-        "-I",
-        str(Path(__file__).resolve()),
-        "--execute-all-root",
-        str(root),
-    ]
+    command = [sys.executable, "-I", str(Path(__file__).resolve()), "--execute-all-root", str(root)]
     rc, diagnostic, timed_out = base._run_process_bounded(
         command,
         cwd=root,
         env=dict(os.environ),
-        timeout_seconds=240,
+        timeout_seconds=220,
         input_bytes=secret.hex().encode("ascii"),
     )
     base.require(
         not timed_out and rc == 0,
-        "trusted serial runtime suite failed: "
-        f"rc={rc}\n{diagnostic}",
+        "trusted serial runtime suite failed: " f"rc={rc}\n{diagnostic}",
     )
     lines = diagnostic.splitlines()
     prefix = "trusted_serial_suite="
@@ -446,12 +476,8 @@ def _deterministic_expected_tests(root: Path):
         mac, encoded = record.split(":", 1)
         payload = base64.b64decode(encoded, validate=True)
     except (ValueError, base64.binascii.Error) as exc:
-        raise base.SupervisionFailure(
-            "malformed authenticated serial runtime suite"
-        ) from exc
-    expected = hmac.new(
-        secret, b"SERIAL-SUITE:" + payload, hashlib.sha256
-    ).hexdigest()
+        raise base.SupervisionFailure("malformed authenticated serial runtime suite") from exc
+    expected = hmac.new(secret, b"SERIAL-SUITE:" + payload, hashlib.sha256).hexdigest()
     base.require(
         hmac.compare_digest(mac, expected),
         "serial runtime suite authentication failed",
@@ -481,21 +507,14 @@ def _deterministic_expected_tests(root: Path):
     return identities
 
 
-def _authenticated_run_one(
-    root, python_bin, identity, timeout_seconds, *, local_test=False
-):
+def _authenticated_run_one(root, python_bin, identity, timeout_seconds, *, local_test=False):
     global _AUTHENTICATED_SUITE_REPLAY
     if _AUTHENTICATED_SUITE_REPLAY is None:
         return _legacy_run_one(
-            root,
-            python_bin,
-            identity,
-            timeout_seconds,
-            local_test=local_test,
+            root, python_bin, identity, timeout_seconds, local_test=local_test
         )
     base.require(
-        bool(_AUTHENTICATED_SUITE_REPLAY)
-        and _AUTHENTICATED_SUITE_REPLAY[0] == identity,
+        bool(_AUTHENTICATED_SUITE_REPLAY) and _AUTHENTICATED_SUITE_REPLAY[0] == identity,
         "authenticated frozen-suite replay order changed",
     )
     del _AUTHENTICATED_SUITE_REPLAY[0]
@@ -526,8 +545,6 @@ def _remote_bool(self):
 
 
 class _RemoteIterator:
-    """Trusted iterator wrapper that advances one actor item per ``next``."""
-
     __slots__ = ("_bridge", "_iterator")
 
     def __init__(self, bridge, iterator):
@@ -548,9 +565,7 @@ def _remote_iter(self):
     try:
         iterator_method = bridge.request("getattr", self, "__iter__")
     except AttributeError as exc:
-        raise base.SupervisionFailure(
-            "remote iterable without explicit __iter__ is unsupported"
-        ) from exc
+        raise base.SupervisionFailure("remote iterable without explicit __iter__ is unsupported") from exc
     iterator = bridge.request("call", iterator_method, (), {})
     base.require(
         type(iterator) is base._Remote,
@@ -567,9 +582,7 @@ def _remote_render(self, template: str, label: str) -> str:
     try:
         byte_length = len(rendered.encode("utf-8"))
     except UnicodeError as exc:
-        raise base.SupervisionFailure(
-            f"proposed {label} is not valid UTF-8 text"
-        ) from exc
+        raise base.SupervisionFailure(f"proposed {label} is not valid UTF-8 text") from exc
     base.require(
         byte_length <= base.MAX_DIAGNOSTIC_BYTES,
         f"proposed {label} exceeds diagnostic budget",
@@ -700,11 +713,7 @@ def _remote_observation_self_test():
                     and kwargs == {},
                     "remote representation call envelope changed",
                 )
-                return (
-                    "actual-proposed-repr"
-                    if formatter[1] == "{!r}"
-                    else "actual-proposed-str"
-                )
+                return "actual-proposed-repr" if formatter[1] == "{!r}" else "actual-proposed-str"
             raise base.SupervisionFailure(
                 "unexpected remote observation self-test operation"
             )
@@ -713,19 +722,10 @@ def _remote_observation_self_test():
     view = base._Remote(bridge, 1, "dict_keys")
     base.require(bool(view), "nonempty mapping view observed as false")
     spoofed = base._Remote(bridge, 3, "list")
-    base.require(
-        not bool(spoofed),
-        "user type name spoofed exact-builtin truth semantics",
-    )
+    base.require(not bool(spoofed), "user type name spoofed exact-builtin truth semantics")
     obj = base._Remote(bridge, 2, "object")
-    base.require(
-        repr(obj) == "actual-proposed-repr",
-        "Remote repr remained a trusted synthetic placeholder",
-    )
-    base.require(
-        str(obj) == "actual-proposed-str",
-        "Remote str remained a trusted synthetic placeholder",
-    )
+    base.require(repr(obj) == "actual-proposed-repr", "Remote repr remained synthetic")
+    base.require(str(obj) == "actual-proposed-str", "Remote str remained synthetic")
     print("remote_representation=PASS actor_truth_semantics=PASS")
 
 
@@ -805,10 +805,44 @@ def _direct_output_policy_self_test():
             "direct-output guard failed for an unrelated reason",
         )
     else:
-        raise base.SupervisionFailure(
-            "direct proposed-call output was not fail-closed"
-        )
+        raise base.SupervisionFailure("direct proposed-call output was not fail-closed")
     print("direct_call_output_policy=PASS")
+
+
+def _state_preservation_self_test():
+    import tempfile
+
+    marker_name = "blue-forge-enumeration-state-" + base.secrets.token_hex(8)
+    marker = Path.home() / marker_name
+    try:
+        marker.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix="blue-forge-enumeration-state-") as temp:
+            root = Path(temp)
+            root.chmod(0o755)
+            (root / "tests").mkdir()
+            (root / "blue_forge").mkdir()
+            (root / "blue_forge/__init__.py").write_text(
+                "def probe(): return 'real'\n", encoding="utf-8"
+            )
+            (root / "tests/test_state.py").write_text(
+                "import unittest\nfrom pathlib import Path\nfrom blue_forge import probe\n"
+                f"MARKER=Path.home()/{marker_name!r}\n"
+                "SEEN=MARKER.exists()\nMARKER.write_text('seen',encoding='ascii')\n"
+                "class State(unittest.TestCase):\n"
+                " def test_preserved(self):\n"
+                "  self.assertFalse(SEEN)\n"
+                "  self.assertTrue(MARKER.exists())\n"
+                "  self.assertEqual(probe(),'real')\n",
+                encoding="utf-8",
+            )
+            identities = _serial_suite_worker(root, ["test_state"])
+            base.require(
+                identities == [("test_state", "State", "test_preserved")],
+                "serial suite state self-test selected the wrong oracle",
+            )
+    finally:
+        marker.unlink(missing_ok=True)
+    print("serial_runtime_discovery_execution=PASS")
 
 
 def _deterministic_enumeration_self_test():
@@ -831,12 +865,10 @@ def _deterministic_enumeration_self_test():
         _AUTHENTICATED_SUITE_REPLAY is None,
         "authenticated suite replay did not consume exact execution order",
     )
-    print("serial_runtime_discovery_execution=PASS")
+    _state_preservation_self_test()
 
 
-def _final_boundary_self_test(
-    python_bin, timeout_seconds, *, local_test=False
-):
+def _final_boundary_self_test(python_bin, timeout_seconds, *, local_test=False):
     _legacy_final_boundary_self_test(
         python_bin, timeout_seconds, local_test=local_test
     )
@@ -865,10 +897,9 @@ _enumerate_module_parent = round3._enumerate_module_parent
 
 
 def _main():
-    if (
-        len(sys.argv) == 3
-        and sys.argv[1] == "--execute-all-root"
-    ):
+    if len(sys.argv) == 2 and not sys.argv[1].startswith("-"):
+        return _executor_entry(Path(sys.argv[1]).resolve())
+    if len(sys.argv) == 3 and sys.argv[1] == "--execute-all-root":
         _serial_suite_child(Path(sys.argv[2]))
         return 0
     return round3._main()
