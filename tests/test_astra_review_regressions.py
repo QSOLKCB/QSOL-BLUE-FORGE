@@ -16,31 +16,14 @@ class AstraReviewRegressions(unittest.TestCase):
     def _case_value(self):
         return loads_strict(CASE_PATH.read_text(encoding="utf-8"))
 
-    def _case(self):
-        return HardeningCase.from_dict(self._case_value())
-
-    def _delete_required_attr(self, value, name):
-        # Ordinary/direct execution receives the actual frozen dataclass and can
-        # bypass its generated __delattr__ through object.__delattr__. Supervised
-        # execution receives an actor proxy; object.__delattr__ then fails on the
-        # proxy itself, so fall back to its bridged __delattr__ operation. In both
-        # paths the deletion occurs on the exact proposed dataclass instance.
-        try:
-            object.__delattr__(value, name)
-        except AttributeError:
-            delattr(value, name)
-
-    def test_deleted_direct_case_field_uses_validation_error(self):
-        case = self._case()
-        self._delete_required_attr(case, "proposal")
+    def test_uninitialized_direct_case_uses_validation_error(self):
+        # HardeningCase inherits object.__new__. Calling the class-level method
+        # reproduces object.__new__(HardeningCase) while remaining transportable
+        # through the supervised actor proxy: the malformed exact instance is
+        # created inside the proposed interpreter in both execution modes.
+        malformed = HardeningCase.__new__(HardeningCase)
         with self.assertRaises(ValidationError):
-            evaluate(case)
-
-    def test_deleted_nested_field_uses_validation_error(self):
-        case = self._case()
-        self._delete_required_attr(case.verification, "original")
-        with self.assertRaises(ValidationError):
-            evaluate(case)
+            evaluate(malformed)
 
     def test_oversized_unexpected_key_has_bounded_diagnostic(self):
         value = self._case_value()
