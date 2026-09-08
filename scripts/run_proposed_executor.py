@@ -13,9 +13,12 @@ mode also masks procfs, removing /proc/self/mem as a protection bypass.
 
 Operation selection remains on the subinterpreter control thread. Proposed
 calls enter a fresh transport-free wrapper whose arguments are locals, not a
-shared dispatch dictionary. Namespace mutation fails closed before an observation
-is accepted. Kernel isolation and the existing audit/thread/tracing guards remain
-required. This is tested observation isolation, not universal Python attestation.
+shared dispatch dictionary. Request graph reconstruction uses a one-shot
+empty-global decoder that is destroyed before proposed Python runs; no mutable
+decoder implementation class remains discoverable in the proposed interpreter.
+Namespace mutation fails closed before an observation is accepted. Kernel
+isolation and the existing audit/thread/tracing guards remain required. This is
+tested observation isolation, not universal Python attestation.
 """
 from __future__ import annotations
 
@@ -89,10 +92,20 @@ _bf_map = map
 _bf_enumerate = enumerate
 _bf_min = min
 _bf_float_hex = float.hex
+_bf_float_fromhex = float.fromhex
 _bf_dict_items = dict.items
 _bf_dict_values = dict.values
+_bf_dict_pop = dict.pop
+_bf_dict_setitem = dict.__setitem__
+_bf_dict_update = dict.update
+_bf_dict_copy = dict.copy
 _bf_list_iter = list.__iter__
+_bf_list_extend = list.extend
 _bf_set_iter = set.__iter__
+_bf_set_update = set.update
+_bf_object_getattribute = object.__getattribute__
+_bf_compile = compile
+_bf_exec = exec
 _bf_deque = collections.deque
 _bf_partial = functools.partial
 _bf_methodcaller = operator.methodcaller
@@ -122,7 +135,11 @@ if _spec is None or _spec.loader is None:
     raise _bf_RuntimeError("trusted executor implementation support is unavailable")
 _support = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_support)
-_bf_graph_decoder = _support._GraphDecoder
+# The support module also serves the trusted worker, but its mutable decoder
+# class must never survive in this proposed interpreter. Remove its only module
+# root before retaining any support functions whose globals keep the module
+# dictionary alive.
+_bf_dict_pop(_support.__dict__, "_GraphDecoder", None)
 _bf_encode_data = _support._encode_data
 _bf_require = _support.require
 _bf_max_nodes = _support.MAX_GRAPH_NODES
@@ -140,6 +157,28 @@ _bf_EVENT_READ = _support.selectors.EVENT_READ
 _bf_kill_group = _support._kill_group
 _bf_settrace_all_threads = _support.threading.settrace_all_threads
 _bf_setprofile_all_threads = _support.threading.setprofile_all_threads
+_bf_b64decode = _support.base64.b64decode
+_bf_MagicMock = _support.mock.MagicMock
+_bf_io_module = _support.io
+_bf_Any = _support.Any
+_bf_json_module = _support.json
+_bf_unittest_module = _support.unittest
+_bf_copy_module = _support.copy
+
+# Freeze the builtins needed by trusted boundary recipes before any proposed
+# import can mutate the subinterpreter's builtins module.
+_bf_builtin_snapshot = _bf_dict(
+    _bf_object_getattribute(builtins, "__dict__")
+)
+_bf_builtin_exceptions = {}
+for _bf_builtin_name, _bf_builtin_candidate in _bf_dict_items(_bf_builtin_snapshot):
+    if (
+        _bf_type(_bf_builtin_name) is _bf_str
+        and _bf_type(_bf_builtin_candidate) is _bf_type
+        and _bf_Exception in _bf_type.__getattribute__(_bf_builtin_candidate, "__mro__")
+    ):
+        _bf_builtin_exceptions[_bf_builtin_name] = _bf_builtin_candidate
+del _bf_builtin_name, _bf_builtin_candidate
 
 
 def _bf_run_cli_bounded(
@@ -293,6 +332,10 @@ finally:
 del (_bf_trace_probe, _bf_ignore_expected_unraisable, _bf_saved_unraisablehook,
      _bf_trace_setter, _bf_trace_getter, _bf_hook_attr, _bf_label)
 _bf_modules.pop("_blue_forge_executor_support", None)
+# The support module dictionary is retained indirectly by trusted helper
+# functions, but its decoder class was removed before those references were
+# captured. Drop the direct module/spec roots as well.
+del _support, _spec
 _bf_modules["_xxsubinterpreters"] = None
 _bf_modules["gc"] = None
 _bf_modules["_thread"] = None
@@ -321,10 +364,132 @@ def bounded_iterate(value, iter_fn, tuple_fn, islice_fn, len_fn, limit, error_ty
     if len_fn(items) > limit:
         raise error_type("executor iteration budget exceeded")
     return items
+
+def decode_graph(recurse, value, nodes, handles, cache, classes, deps):
+    (type_fn, len_fn, require_fn, int_type, int_fn, float_fromhex_fn,
+     b64decode_fn, builtin_exceptions, magic_mock, dict_type, list_type,
+     tuple_type, frozenset_type, set_type, object_type, dict_setitem,
+     dict_update, dict_copy, list_extend, set_update, object_getattribute,
+     compile_fn, exec_fn, builtin_snapshot, io_module, any_type, path_type,
+     json_module, unittest_module, copy_module, str_type) = deps
+    require_fn(type_fn(value) is list_type and len_fn(value) == 2,
+               "invalid transport value")
+    tag, data = value
+    require_fn(type_fn(tag) is str_type, "invalid transport tag")
+    if tag == "scalar":
+        return data
+    if tag == "int":
+        return int_fn(data)
+    if tag == "float":
+        return float_fromhex_fn(data)
+    if tag == "bytes":
+        return b64decode_fn(data, validate=True)
+    if tag == "remote":
+        require_fn(type_fn(data) is int_type and data in handles,
+                   "invalid remote handle")
+        return handles[data]
+    require_fn(tag == "node" and type_fn(data) is int_type
+               and 0 <= data < len_fn(nodes), "invalid transport reference")
+    if data in cache:
+        return cache[data]
+    node = nodes[data]
+    require_fn(type_fn(node) is dict_type, "invalid transport graph node")
+    kind = node.get("kind")
+    if kind in {"mock", "exception"}:
+        name = node.get("error")
+        cls = builtin_exceptions.get(name)
+        require_fn(type_fn(name) is str_type and type_fn(cls) is type_fn,
+                   "unsupported fixture exception")
+        obj = cls(node.get("message"))
+        if kind == "mock":
+            obj = magic_mock(side_effect=obj)
+        cache[data] = obj
+        return obj
+    if kind == "dict":
+        base = dict_type
+    elif kind == "list":
+        base = list_type
+    elif kind == "tuple":
+        base = tuple_type
+    elif kind == "frozenset":
+        base = frozenset_type
+    elif kind == "set":
+        base = set_type
+    else:
+        require_fn(kind == "object", "unsupported transport node kind")
+        base = object_type
+    recipe = node.get("class")
+    cls = base
+    if recipe is not None:
+        require_fn(type_fn(recipe) is dict_type, "invalid boundary class recipe")
+        key = recipe.get("source")
+        name = recipe.get("name")
+        require_fn(type_fn(key) is str_type and type_fn(name) is str_type,
+                   "invalid boundary class recipe")
+        if key not in classes:
+            namespace = {
+                "__builtins__": dict_copy(builtin_snapshot),
+                "io": io_module,
+                "Any": any_type,
+                "Path": path_type,
+                "json": json_module,
+                "unittest": unittest_module,
+                "copy": copy_module,
+            }
+            code = compile_fn("from __future__ import annotations\n" + key,
+                              "<frozen-boundary-class>", "exec")
+            exec_fn(code, namespace)
+            candidate = namespace.get(name)
+            require_fn(type_fn(candidate) is type_fn,
+                       "boundary class recipe did not define a class")
+            classes[key] = candidate
+        cls = classes[key]
+    items = node.get("items")
+    if kind in {"tuple", "frozenset"}:
+        require_fn(type_fn(items) is list_type, "invalid transport node items")
+        children = [recurse(recurse, child, nodes, handles, cache, classes, deps)
+                    for child in items]
+        obj = base.__new__(cls, children)
+        cache[data] = obj
+    else:
+        obj = base.__new__(cls)
+        cache[data] = obj
+        if kind == "dict":
+            require_fn(type_fn(items) is list_type, "invalid transport node items")
+            for pair in items:
+                require_fn(type_fn(pair) is list_type and len_fn(pair) == 2,
+                           "invalid dictionary transport item")
+                key_value = recurse(recurse, pair[0], nodes, handles, cache, classes, deps)
+                child_value = recurse(recurse, pair[1], nodes, handles, cache, classes, deps)
+                dict_setitem(obj, key_value, child_value)
+        elif kind == "list":
+            require_fn(type_fn(items) is list_type, "invalid transport node items")
+            list_extend(obj, [recurse(recurse, child, nodes, handles, cache, classes, deps)
+                              for child in items])
+        elif kind == "set":
+            require_fn(type_fn(items) is list_type, "invalid transport node items")
+            set_update(obj, [recurse(recurse, child, nodes, handles, cache, classes, deps)
+                             for child in items])
+    if "state" in node:
+        state = recurse(recurse, node["state"], nodes, handles, cache, classes, deps)
+        require_fn(type_fn(state) is dict_type, "invalid boundary object state")
+        dict_update(object_getattribute(obj, "__dict__"), state)
+    return obj
 ''', "<blue-forge-proposed-operation>", "exec"), _bf_compile_namespace)
 _bf_call_code = _bf_compile_namespace["execute_action"].__code__
 _bf_iterate_code = _bf_compile_namespace["bounded_iterate"].__code__
+_bf_decode_code = _bf_compile_namespace["decode_graph"].__code__
 del _bf_compile_namespace
+
+_bf_decode_dependencies = (
+    _bf_type, _bf_len, _bf_require, _bf_int, _bf_int, _bf_float_fromhex,
+    _bf_b64decode, _bf_builtin_exceptions, _bf_MagicMock, _bf_dict, _bf_list,
+    _bf_tuple, _bf_frozenset, _bf_set, _bf_object, _bf_dict_setitem,
+    _bf_dict_update, _bf_dict_copy, _bf_list_extend, _bf_set_update,
+    _bf_object_getattribute, _bf_compile, _bf_exec, _bf_builtin_snapshot,
+    _bf_io_module, _bf_Any, Path, _bf_json_module, _bf_unittest_module,
+    _bf_copy_module, _bf_str,
+)
 
 sys.path.insert(0, _bf_str(_BF_ROOT))
 os.chdir(_BF_ROOT)
@@ -553,8 +718,25 @@ def _bf_process_one(raw):
     _bf_require(_bf_type(request.get("nodes")) is _bf_list, "invalid executor graph")
     _bf_require(_bf_type(request.get("arguments")) is _bf_list, "invalid executor arguments")
     _bf_require(_bf_type(request.get("sync")) is _bf_list, "invalid executor sync set")
-    decoder = _bf_graph_decoder(request["nodes"], _bf_handles)
-    arguments = [decoder.decode(value) for value in request["arguments"]]
+
+    # Decode the request before entering any proposed operation. The callable is
+    # rebuilt from an immutable code object with empty globals for this request
+    # only and is destroyed before import/getattr/call dispatch begins.
+    cache = {}
+    classes = {}
+    decode, decode_record = _bf_fresh_function(_bf_decode_code)
+    try:
+        arguments = [
+            decode(
+                decode, value, request["nodes"], _bf_handles, cache, classes,
+                _bf_decode_dependencies,
+            )
+            for value in request["arguments"]
+        ]
+    finally:
+        _bf_check_namespace(decode_record)
+        del decode, decode_record, classes
+
     data_indices = _bf_argument_data_indices(request["nodes"], request["arguments"])
     watched = {}
     state_sync = []
@@ -562,10 +744,10 @@ def _bf_process_one(raw):
         _bf_require(
             _bf_type(key) is _bf_int
             and 0 <= key < _bf_len(request["nodes"])
-            and key in decoder.cache,
+            and key in cache,
             "invalid executor sync reference",
         )
-        candidate = decoder.cache[key]
+        candidate = cache[key]
         signature = _bf_container_signature(candidate)
         if signature is not None:
             if key in data_indices:
@@ -607,7 +789,7 @@ def _bf_process_one(raw):
         ok, observed, message = _bf_detached_execute(action, arguments)
     for key, before in _bf_dict_items(watched):
         _bf_require(
-            _bf_container_signature(decoder.cache[key]) == before,
+            _bf_container_signature(cache[key]) == before,
             "proposed operation mutated exact container argument",
         )
     if ok:
@@ -621,7 +803,7 @@ def _bf_process_one(raw):
     states = {}
     for key in state_sync:
         states[_bf_str(key)] = _bf_encode_data(
-            _bf_object.__getattribute__(decoder.cache[key], "__dict__"))
+            _bf_object.__getattribute__(cache[key], "__dict__"))
     observation["states"] = states
     payload = _bf_marshal_dumps(observation, 4)
     _bf_require(_bf_len(payload) <= _BF_MAX_FRAME_BYTES,
