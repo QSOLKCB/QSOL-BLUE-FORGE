@@ -1,4 +1,4 @@
-"""Bounded duplicate-key diagnostics layered over the reference-core validation."""
+"""Bounded duplicate-key and diagnostic-path hardening over round-20 validation."""
 from __future__ import annotations
 
 import importlib.util
@@ -20,13 +20,39 @@ MAX_EXPANDED_JSON_NODES = round20.MAX_EXPANDED_JSON_NODES
 MAX_JSON_BYTES = round20.MAX_JSON_BYTES
 MAX_CANONICAL_BYTES = round20.MAX_CANONICAL_BYTES
 MAX_JSON_TEXT_BYTES = round20.MAX_JSON_TEXT_BYTES
+MAX_DIAGNOSTIC_PATH_CHARS = 512
 
-_member_path = round20._member_path
 _has_unpaired_surrogate = round20._has_unpaired_surrogate
 
 
+def _clip_diagnostic(text: str, limit: int, suffix: str) -> str:
+    if len(text) <= limit:
+        return text
+    keep = max(0, limit - len(suffix))
+    return text[:keep] + suffix
+
+
+def _member_path(path: str, key: str) -> str:
+    """Render a control-safe member path with a fixed cumulative size ceiling."""
+    ancestor = _clip_diagnostic(
+        path, 192, "...<ancestors elided>"
+    )
+    rendered = _clip_diagnostic(
+        json.dumps(key, ensure_ascii=True), 256, "...<key elided>"
+    )
+    return _clip_diagnostic(
+        f"{ancestor}[{rendered}]",
+        MAX_DIAGNOSTIC_PATH_CHARS,
+        "...<path elided>",
+    )
+
+
 def install(core: Any) -> None:
-    """Install the retained validators, then harden parse-time object keys."""
+    """Install retained validators, then harden parse keys and diagnostic paths."""
+    # round20.validate_json_value resolves _member_path from its module globals at
+    # call time. Replace only that diagnostic renderer before installation; all
+    # semantic validation and resource ceilings remain the retained implementation.
+    round20._member_path = _member_path
     round20.install(core)
 
     def validate_object_key(key: Any) -> str:
