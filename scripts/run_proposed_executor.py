@@ -80,12 +80,19 @@ _bf_bytes = bytes
 _bf_bytearray = bytearray
 _bf_dict = dict
 _bf_list = list
+_bf_set = set
+_bf_frozenset = frozenset
 _bf_any = any
 _bf_id = id
 _bf_hasattr = hasattr
 _bf_map = map
 _bf_enumerate = enumerate
 _bf_min = min
+_bf_float_hex = float.hex
+_bf_dict_items = dict.items
+_bf_dict_values = dict.values
+_bf_list_iter = list.__iter__
+_bf_set_iter = set.__iter__
 _bf_deque = collections.deque
 _bf_partial = functools.partial
 _bf_methodcaller = operator.methodcaller
@@ -127,6 +134,7 @@ _bf_temporary_directory = _support.tempfile.TemporaryDirectory
 _bf_Popen = _support.subprocess.Popen
 _bf_PIPE = _support.subprocess.PIPE
 _bf_STDOUT = _support.subprocess.STDOUT
+_bf_TimeoutExpired = _support.subprocess.TimeoutExpired
 _bf_DefaultSelector = _support.selectors.DefaultSelector
 _bf_EVENT_READ = _support.selectors.EVENT_READ
 _bf_kill_group = _support._kill_group
@@ -134,16 +142,26 @@ _bf_settrace_all_threads = _support.threading.settrace_all_threads
 _bf_setprofile_all_threads = _support.threading.setprofile_all_threads
 
 
-def _bf_run_cli_bounded(command, root, environment, merge_stderr=False):
+def _bf_run_cli_bounded(
+    command, root, environment, merge_stderr=False, timeout_seconds=10.0
+):
     if _bf_type(merge_stderr) is not _bf_bool:
         raise _bf_RuntimeError("CLI stderr merge mode must be boolean")
+    if (
+        _bf_type(timeout_seconds) not in (_bf_int, _bf_float)
+        or _bf_type(timeout_seconds) is _bf_bool
+        or not (0 < timeout_seconds <= 15.0)
+    ):
+        raise _bf_RuntimeError("CLI timeout exceeds actor budget")
     stderr_target = _bf_STDOUT if merge_stderr else _bf_PIPE
     process = _bf_Popen(command, cwd=root, env=environment,
                         start_new_session=True, stdout=_bf_PIPE, stderr=stderr_target)
     outputs = [_bf_bytearray()] if merge_stderr else [_bf_bytearray(), _bf_bytearray()]
     streams = (process.stdout,) if merge_stderr else (process.stdout, process.stderr)
     selector = _bf_DefaultSelector()
-    deadline = _bf_monotonic() + 10.0
+    deadline = _bf_monotonic() + timeout_seconds
+    timed_out = False
+    rc = -9
     try:
         for index, stream in _bf_enumerate(streams):
             _bf_set_blocking(stream.fileno(), False)
@@ -151,7 +169,8 @@ def _bf_run_cli_bounded(command, root, environment, merge_stderr=False):
         while selector.get_map():
             remaining = deadline - _bf_monotonic()
             if remaining <= 0:
-                raise _bf_RuntimeError("CLI lifetime budget exceeded")
+                timed_out = True
+                break
             for key, _mask in selector.select(_bf_min(0.05, remaining)):
                 try:
                     chunk = _bf_os_read(key.fileobj.fileno(), 8192)
@@ -165,13 +184,18 @@ def _bf_run_cli_bounded(command, root, environment, merge_stderr=False):
                 if _bf_len(destination) + _bf_len(chunk) > _BF_MAX_FRAME_BYTES:
                     raise _bf_RuntimeError("CLI output budget exceeded")
                 destination.extend(chunk)
-        remaining = deadline - _bf_monotonic()
-        if remaining <= 0:
-            raise _bf_RuntimeError("CLI lifetime budget exceeded")
-        rc = process.wait(timeout=remaining)
+        if not timed_out:
+            remaining = deadline - _bf_monotonic()
+            if remaining <= 0:
+                timed_out = True
+            else:
+                try:
+                    rc = process.wait(timeout=remaining)
+                except _bf_TimeoutExpired:
+                    timed_out = True
         if merge_stderr:
-            return rc, _bf_bytes(outputs[0]), b""
-        return rc, _bf_bytes(outputs[0]), _bf_bytes(outputs[1])
+            return rc, _bf_bytes(outputs[0]), b"", timed_out
+        return rc, _bf_bytes(outputs[0]), _bf_bytes(outputs[1]), timed_out
     finally:
         _bf_kill_group(process)
         selector.close()
@@ -180,8 +204,6 @@ def _bf_run_cli_bounded(command, root, environment, merge_stderr=False):
                 stream.close()
 
 
-# Retain the existing import/thread/tracing restrictions and block any later
-# audit-hook registration before proposed modules are imported.
 def _bf_make_execution_guard(blocked, error_type):
     allowed = [None]
     def arm(target):
@@ -210,10 +232,6 @@ _bf_arm_thread_start, _bf_execution_guard = _bf_make_execution_guard(
 _bf_addaudithook(_bf_execution_guard)
 del _bf_execution_guard, _bf_make_execution_guard
 
-
-# CPython may suppress RuntimeError raised by an existing audit hook during
-# sys.addaudithook(). Verify the security property by effect: an attempted
-# later hook must never observe a subsequent custom audit event.
 _bf_audit_hook_probe = _bf_deque()
 def _bf_candidate_audit_hook(event, args):
     del args
@@ -250,7 +268,6 @@ del _bf_thread_guard_self_test, _bf_thread_guard_probe, _bf_thread_guard_deadlin
 
 def _bf_trace_probe(*args):
     return _bf_trace_probe
-
 def _bf_ignore_expected_unraisable(unraisable):
     del unraisable
 
@@ -287,9 +304,6 @@ _bf_modules["_testinternalcapi"] = None
 if _bf_hasattr(sys, "_current_frames"):
     sys._current_frames = None
 
-# Neither code object uses globals. A new namespace and function are created
-# per invocation; the control thread independently checks the namespace later.
-# In particular, there is no persistent getattr_fn/import_module dispatch map.
 _bf_compile_namespace = {"__builtins__": {}}
 exec(compile(r'''
 def execute_action(function, arguments, keywords, exception_type, str_type):
@@ -340,9 +354,6 @@ def _bf_check_namespace(record):
 
 
 def _bf_select_operation(action, arguments):
-    # This function runs ONLY on the private control thread, never as an
-    # ancestor of proposed Python. Return native operations or existing API
-    # functions; no reference to this dispatch function enters their globals.
     plain = {
         "module": _bf_import_module, "getattr": _bf_getattr,
         "setattr": _bf_setattr, "delattr": _bf_delattr,
@@ -383,7 +394,6 @@ def _bf_detached_execute(action, arguments):
             _bf_sleep(0.001)
     finally:
         _bf_modules["__main__"] = _bf_actual_main
-    # Validate before consuming either a value or an exception from the call.
     _bf_check_namespace(record)
     if extra_record is not None:
         _bf_check_namespace(extra_record)
@@ -394,6 +404,69 @@ def _bf_detached_execute(action, arguments):
             or _bf_type(outcome[0]) is not _bf_bool):
         raise _bf_RuntimeError("detached executor produced a malformed outcome")
     return outcome
+
+
+def _bf_argument_data_indices(nodes, encoded_arguments):
+    found = _bf_set()
+    stack = _bf_list(encoded_arguments)
+    while stack:
+        encoded = stack.pop()
+        if _bf_type(encoded) is _bf_list:
+            if (
+                _bf_len(encoded) == 2
+                and encoded[0] == "node"
+                and _bf_type(encoded[1]) is _bf_int
+            ):
+                index = encoded[1]
+                _bf_require(0 <= index < _bf_len(nodes), "invalid sync graph reference")
+                if index in found:
+                    continue
+                found.add(index)
+                node = nodes[index]
+                _bf_require(_bf_type(node) is _bf_dict, "invalid sync graph node")
+                items = node.get("items")
+                if items is not None:
+                    stack.append(items)
+            else:
+                stack.extend(encoded)
+        elif _bf_type(encoded) is _bf_dict:
+            stack.extend(_bf_dict_values(encoded))
+    return found
+
+
+def _bf_value_token(value):
+    t = _bf_type(value)
+    if value is None:
+        return (0, None)
+    if t is _bf_bool:
+        return (1, value)
+    if t is _bf_str:
+        return (2, value)
+    if t is _bf_int:
+        return (3, value)
+    if t is _bf_bytes:
+        return (4, value)
+    if t is _bf_float:
+        return (5, _bf_float_hex(value))
+    return (6, _bf_id(value))
+
+
+def _bf_container_signature(value):
+    t = _bf_type(value)
+    if t is _bf_dict:
+        return (0, _bf_tuple(
+            (_bf_value_token(key), _bf_value_token(child))
+            for key, child in _bf_dict_items(value)
+        ))
+    if t is _bf_list:
+        return (1, _bf_tuple(
+            _bf_value_token(child) for child in _bf_list_iter(value)
+        ))
+    if t is _bf_set:
+        return (2, _bf_frozenset(
+            _bf_value_token(child) for child in _bf_set_iter(value)
+        ))
+    return None
 
 
 def _bf_result(value):
@@ -482,32 +555,61 @@ def _bf_process_one(raw):
     _bf_require(_bf_type(request.get("sync")) is _bf_list, "invalid executor sync set")
     decoder = _bf_graph_decoder(request["nodes"], _bf_handles)
     arguments = [decoder.decode(value) for value in request["arguments"]]
+    data_indices = _bf_argument_data_indices(request["nodes"], request["arguments"])
+    watched = {}
+    state_sync = []
+    for key in request["sync"]:
+        _bf_require(
+            _bf_type(key) is _bf_int
+            and 0 <= key < _bf_len(request["nodes"])
+            and key in decoder.cache,
+            "invalid executor sync reference",
+        )
+        candidate = decoder.cache[key]
+        signature = _bf_container_signature(candidate)
+        if signature is not None:
+            if key in data_indices:
+                watched[key] = signature
+        else:
+            state_sync.append(key)
     action = request["action"]
     if action == "cli":
-        # CLI orchestration never enters an in-process proposed call frame.
         try:
             if _bf_len(arguments) == 3:
                 cli_args, case_bytes, environment = arguments
                 merge_stderr = False
-            else:
-                _bf_require(_bf_len(arguments) == 4, "invalid CLI executor arguments")
+                timeout_seconds = 10.0
+            elif _bf_len(arguments) == 4:
                 cli_args, case_bytes, environment, merge_stderr = arguments
+                timeout_seconds = 10.0
+            else:
+                _bf_require(_bf_len(arguments) == 5, "invalid CLI executor arguments")
+                cli_args, case_bytes, environment, merge_stderr, timeout_seconds = arguments
+            _bf_require(_bf_type(merge_stderr) is _bf_bool,
+                        "CLI stderr merge mode must be boolean")
             _bf_require(
-                _bf_type(merge_stderr) is _bf_bool,
-                "CLI stderr merge mode must be boolean",
+                _bf_type(timeout_seconds) in (_bf_int, _bf_float)
+                and _bf_type(timeout_seconds) is not _bf_bool
+                and 0 < timeout_seconds <= 15.0,
+                "CLI timeout exceeds actor budget",
             )
             with _bf_temporary_directory() as temp:
                 path = Path(temp) / "case.json"
                 path.write_bytes(case_bytes)
                 command = [sys.executable, "-m", "blue_forge", cli_args[0], _bf_str(path)]
                 observed = _bf_run_cli_bounded(
-                    command, _BF_ROOT, environment, merge_stderr
+                    command, _BF_ROOT, environment, merge_stderr, timeout_seconds
                 )
             ok, message = True, ""
         except _bf_BaseException as exc:
             ok, observed, message = False, exc, _bf_str(exc)
     else:
         ok, observed, message = _bf_detached_execute(action, arguments)
+    for key, before in _bf_dict_items(watched):
+        _bf_require(
+            _bf_container_signature(decoder.cache[key]) == before,
+            "proposed operation mutated exact container argument",
+        )
     if ok:
         if action == "module":
             _bf_capture_exports()
@@ -517,10 +619,9 @@ def _bf_process_one(raw):
     else:
         observation = {"ok": False, "error": _bf_exception_key(observed), "message": message}
     states = {}
-    for key in request.get("sync", []):
-        if key in decoder.cache:
-            states[_bf_str(key)] = _bf_encode_data(
-                _bf_object.__getattribute__(decoder.cache[key], "__dict__"))
+    for key in state_sync:
+        states[_bf_str(key)] = _bf_encode_data(
+            _bf_object.__getattribute__(decoder.cache[key], "__dict__"))
     observation["states"] = states
     payload = _bf_marshal_dumps(observation, 4)
     _bf_require(_bf_len(payload) <= _BF_MAX_FRAME_BYTES,
@@ -632,15 +733,6 @@ def _prctl(libc, operation: int, argument: int = 0) -> int:
 
 
 class _Mailbox:
-    """One bounded slot; native process-shared semaphores, no backing fd.
-
-    Linux's 64-bit sem_t fits in an aligned 64-byte reservation. Neither the
-    mappings nor their native pointers are shared into the proposed interpreter.
-    Semaphore publication supplies the inter-process memory-ordering boundary.
-    The application child can additionally revoke all access to a mailbox VMA;
-    mprotect state is process-local, so the transport parent's mapping remains
-    usable while proposed Python runs with the child-side response pages blocked.
-    """
     HEADER = 128
     DATA = 144
 
@@ -662,7 +754,7 @@ class _Mailbox:
     def protect(self, writable: bool):
         if type(writable) is not bool:
             raise RuntimeError("invalid executor mailbox protection mode")
-        protection = (1 | 2) if writable else 0  # PROT_READ|PROT_WRITE / PROT_NONE
+        protection = (1 | 2) if writable else 0
         if self.libc.mprotect(self.address, self.length, protection) != 0:
             raise OSError(ctypes.get_errno(), "executor mailbox protection failed")
 
@@ -714,11 +806,9 @@ class _Mailbox:
 
 
 def _remove_inherited_transport(libc, parent_pid):
-    _prctl(libc, 1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    _prctl(libc, 1, signal.SIGKILL)
     if os.getppid() != parent_pid:
         raise RuntimeError("executor transport parent disappeared during fork")
-    # There is no fallback that leaves the upstream pipe reachable by proposed
-    # Python. Anonymous mailboxes have no fd to preserve here.
     null = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
     try:
         os.dup2(null, 0)
@@ -732,7 +822,6 @@ def _remove_inherited_transport(libc, parent_pid):
     os.closerange(3, limit)
     sys.stdout = sys.stderr
     sys.__stdout__ = sys.stderr
-    # Actual descriptor identity, not just replacement Python stream objects.
     if os.fstat(1) != os.fstat(2):
         raise RuntimeError("executor diagnostic descriptor separation failed")
 
@@ -754,9 +843,6 @@ def _application_loop(root, support_path, requests, responses):
             generation, payload = requests.receive(seconds=35.0)
             if generation != expected:
                 raise RuntimeError("executor application generation mismatch")
-            # The parent has a separate VMA for this shared mapping. Revoke all
-            # access only in the application child before any proposed frame can
-            # run, then restore RW after run_string has fully returned/failed.
             responses.protect(False)
             try:
                 try:
@@ -780,8 +866,8 @@ def _application_loop(root, support_path, requests, responses):
 class _Application:
     def __init__(self, root, support_path):
         libc = _native_api()
-        _prctl(libc, 4, 0)  # PR_SET_DUMPABLE: deny reopening parent fds via /proc.
-        if _prctl(libc, 3) != 0:  # PR_GET_DUMPABLE
+        _prctl(libc, 4, 0)
+        if _prctl(libc, 3) != 0:
             raise RuntimeError("executor transport is still dumpable")
         self.pid = None
         self.requests = _Mailbox(libc)
@@ -792,7 +878,7 @@ class _Application:
             raise
         parent_pid = os.getpid()
         try:
-            pid = os.fork()  # Before any subinterpreter or helper thread exists.
+            pid = os.fork()
             if pid == 0:
                 try:
                     _remove_inherited_transport(libc, parent_pid)
@@ -847,8 +933,6 @@ def main() -> int:
         raise RuntimeError("trusted executor support is unavailable or writable")
     loads, dumps = marshal.loads, marshal.dumps
     wire_in = sys.stdin.buffer
-    # Own the broker-facing output independently. Rebinding both stdout objects
-    # otherwise releases their TextIOWrapper and closes sys.stdout.buffer.
     wire_out = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
     sys.stdout = sys.stderr
     sys.__stdout__ = sys.stderr
@@ -862,7 +946,6 @@ def main() -> int:
                 return 0
             payload = dumps({key: request[key] for key in ("action", "nodes", "arguments", "sync")}, 4)
             observation = application.observe(generation, payload)
-            # Neither this process nor the broker imports proposed code.
             response = _response_from_observation(request["sequence"], observation)
             _write_frame(wire_out, response, dumps)
         raise RuntimeError("executor operation budget exceeded")
