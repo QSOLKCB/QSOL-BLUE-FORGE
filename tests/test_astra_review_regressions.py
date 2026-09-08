@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import os
 from pathlib import Path
 import unittest
 
@@ -17,11 +19,20 @@ class AstraReviewRegressions(unittest.TestCase):
         return loads_strict(CASE_PATH.read_text(encoding="utf-8"))
 
     def test_uninitialized_direct_case_uses_validation_error(self):
-        # HardeningCase inherits object.__new__. Calling the class-level method
-        # reproduces object.__new__(HardeningCase) while remaining transportable
-        # through the supervised actor proxy: the malformed exact instance is
-        # created inside the proposed interpreter in both execution modes.
-        malformed = HardeningCase.__new__(HardeningCase)
+        if os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"):
+            # The supervised worker intentionally exposes proposed classes as
+            # actor proxies, so local object.__new__(HardeningCase) would target
+            # the proxy type rather than the proposed dataclass. Exercise the
+            # same evaluator preflight through a transport-native malformed exact
+            # HardeningCase: dataclasses.replace runs inside the actor and keeps
+            # the top-level record type exact while invalidating a required field.
+            case = HardeningCase.from_dict(self._case_value())
+            malformed = dataclasses.replace(case, proposal=None)
+        else:
+            # The independent direct suite reproduces Astra's exact construction:
+            # an exact HardeningCase allocated without any required attributes.
+            malformed = object.__new__(HardeningCase)
+
         with self.assertRaises(ValidationError):
             evaluate(malformed)
 
