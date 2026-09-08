@@ -46,6 +46,9 @@ _legacy_run_one = base.run_one
 _legacy_bridge_close = base._Bridge.close
 _legacy_base_main = base.main
 
+# These CPython audit events sit below Python module aliases. A cached reference
+# such as pathlib.os.system therefore cannot escape merely because it points at
+# the original os module rather than the facade installed in sys.modules.
 _NATIVE_PROCESS_AUDIT_EVENTS = frozenset(
     {
         "subprocess.Popen",
@@ -86,10 +89,14 @@ def _cached_process_audit_guard(event, args):
     )
 
 
+# Audit hooks are process-global and non-removable. The guard is deliberately
+# inert before/after a live trusted bridge, so supervisor bootstrap and actor
+# creation remain governed by the already-retained boundary.
 sys.addaudithook(_cached_process_audit_guard)
 
 
 def _python_cli_flags(command, kwargs, root: Path) -> tuple[str, ...]:
+    """Return the validated interpreter flags from a proposed CLI invocation."""
     normalized, _changed = round3._normalize_python_command(command, kwargs, root)
     if type(normalized) not in (list, tuple):
         return ()
@@ -132,6 +139,8 @@ def _python_cli_flags(command, kwargs, root: Path) -> tuple[str, ...]:
 
 
 class _CliFlagBridge:
+    """Add final-layer Python flags to the retained CLI request envelope."""
+
     __slots__ = ("_bridge", "root")
 
     def __init__(self, bridge):
@@ -184,6 +193,7 @@ def _hardened_test_importer(bridge):
 
 
 def _patched_executor_bootstrap(executor) -> str:
+    """Patch only retained CLI command construction before proposed Python exists."""
     bootstrap = executor._SUBINTERPRETER_BOOTSTRAP
     capture = "_bf_modules = sys.modules\n"
     capture_replacement = capture + "_bf_sys_executable = sys.executable\n"
@@ -228,6 +238,7 @@ def _patched_executor_bootstrap(executor) -> str:
 
 
 def _executor_entry(root: Path) -> int:
+    """Run the retained executor with the reviewed CLI-flag patch in memory."""
     spec = importlib.util.spec_from_file_location(
         "_blue_forge_retained_executor", _RETAINED_EXECUTOR
     )
@@ -247,16 +258,28 @@ def _executor_entry(root: Path) -> int:
         sys.argv = prior_argv
 
 
+# The baseline-owned first-stage broker checks this path for root ownership and
+# non-writability before spawning it. Re-enter this pinned final supervisor as
+# the executor wrapper, so no new unpinned control file is introduced.
 round3.round2.previous._EXECUTOR = Path(__file__).resolve()
 
 
+# ---------------------------------------------------------------------------
+# Proposed-source provenance
+# ---------------------------------------------------------------------------
 def _require_private_proposed_source(root: Path):
     source_root = root / "blue_forge"
     files = sorted(source_root.glob("*.py"))
     base.require(bool(files), "proposed source tree is empty")
     for path in files:
-        base.require(path.is_file() and not path.is_symlink(), "invalid proposed source file")
-        base.require(not os.access(path, os.R_OK), "proposed source is readable from trusted worker")
+        base.require(
+            path.is_file() and not path.is_symlink(),
+            "invalid proposed source file",
+        )
+        base.require(
+            not os.access(path, os.R_OK),
+            "proposed source is readable from trusted worker",
+        )
 
 
 def _check_private_proposed_root(root: Path, *, local_test: bool) -> None:
@@ -276,6 +299,9 @@ def _worker_run(root, identity, *, local_test=False):
     return _legacy_worker_run(root, identity, local_test=local_test)
 
 
+# ---------------------------------------------------------------------------
+# Direct proposed-call output
+# ---------------------------------------------------------------------------
 def _require_silent_actor(bridge):
     diagnostic_bytes = object.__getattribute__(bridge, "diagnostic_bytes")
     base.require(
@@ -301,6 +327,9 @@ def _bridge_close(self):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Deterministic runtime discovery + execution
+# ---------------------------------------------------------------------------
 def _runtime_module_names(root: Path) -> list[str]:
     supervised_current = bool(os.environ.get("BLUE_FORGE_SUPERVISED_MARKER"))
     paths = sorted((root / "tests").glob("test*.py"))
@@ -335,7 +364,10 @@ def _serial_suite_worker(root: Path, modules: list[str]):
         with round3._trusted_test_facades(importer):
             for module_name in modules:
                 path = root / "tests" / (module_name + ".py")
-                base.require(path.is_file() and not path.is_symlink(), "invalid serial-suite test module")
+                base.require(
+                    path.is_file() and not path.is_symlink(),
+                    "invalid serial-suite test module",
+                )
                 source_text = path.read_text(encoding="utf-8")
                 tree = base._TestTransform().visit(ast.parse(source_text, filename=str(path)))
                 ast.fix_missing_locations(tree)
@@ -352,6 +384,7 @@ def _serial_suite_worker(root: Path, modules: list[str]):
                 suite = base.unittest.defaultTestLoader.loadTestsFromModule(module)
                 identities.extend(round3.round2._flatten_suite(suite, module_name))
                 suites.append(suite)
+
             base.require(
                 identities and len(identities) == len(set(identities)),
                 "empty or duplicate serial runtime test floor",
@@ -359,6 +392,7 @@ def _serial_suite_worker(root: Path, modules: list[str]):
             result = base.unittest.TestResult()
             for suite in suites:
                 suite.run(result)
+
         base.require(bridge.fatal is None, f"RPC failure was caught by a test: {bridge.fatal}")
         base.require(
             result.testsRun == len(identities)
@@ -433,7 +467,10 @@ def _deterministic_expected_tests(root: Path):
     )
     lines = diagnostic.splitlines()
     prefix = "trusted_serial_suite="
-    base.require(lines and lines[-1].startswith(prefix), "missing authenticated serial runtime suite")
+    base.require(
+        lines and lines[-1].startswith(prefix),
+        "missing authenticated serial runtime suite",
+    )
     record = lines[-1][len(prefix):]
     try:
         mac, encoded = record.split(":", 1)
@@ -441,7 +478,10 @@ def _deterministic_expected_tests(root: Path):
     except (ValueError, base64.binascii.Error) as exc:
         raise base.SupervisionFailure("malformed authenticated serial runtime suite") from exc
     expected = hmac.new(secret, b"SERIAL-SUITE:" + payload, hashlib.sha256).hexdigest()
-    base.require(hmac.compare_digest(mac, expected), "serial runtime suite authentication failed")
+    base.require(
+        hmac.compare_digest(mac, expected),
+        "serial runtime suite authentication failed",
+    )
     value = base._wire_load(payload)
     base.require(type(value) is list, "serial runtime suite is not a list")
     module_set = set(modules)
@@ -470,7 +510,9 @@ def _deterministic_expected_tests(root: Path):
 def _authenticated_run_one(root, python_bin, identity, timeout_seconds, *, local_test=False):
     global _AUTHENTICATED_SUITE_REPLAY
     if _AUTHENTICATED_SUITE_REPLAY is None:
-        return _legacy_run_one(root, python_bin, identity, timeout_seconds, local_test=local_test)
+        return _legacy_run_one(
+            root, python_bin, identity, timeout_seconds, local_test=local_test
+        )
     base.require(
         bool(_AUTHENTICATED_SUITE_REPLAY) and _AUTHENTICATED_SUITE_REPLAY[0] == identity,
         "authenticated frozen-suite replay order changed",
@@ -492,6 +534,9 @@ def _deterministic_base_main(*args, **kwargs):
     return _legacy_base_main(*args, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Remote observation
+# ---------------------------------------------------------------------------
 def _remote_bool(self):
     bridge = object.__getattribute__(self, "_bridge")
     value = bridge.request("truth", self)
@@ -522,7 +567,10 @@ def _remote_iter(self):
     except AttributeError as exc:
         raise base.SupervisionFailure("remote iterable without explicit __iter__ is unsupported") from exc
     iterator = bridge.request("call", iterator_method, (), {})
-    base.require(type(iterator) is base._Remote, "proposed __iter__ did not return a remote iterator")
+    base.require(
+        type(iterator) is base._Remote,
+        "proposed __iter__ did not return a remote iterator",
+    )
     return _RemoteIterator(bridge, iterator)
 
 
@@ -535,7 +583,10 @@ def _remote_render(self, template: str, label: str) -> str:
         byte_length = len(rendered.encode("utf-8"))
     except UnicodeError as exc:
         raise base.SupervisionFailure(f"proposed {label} is not valid UTF-8 text") from exc
-    base.require(byte_length <= base.MAX_DIAGNOSTIC_BYTES, f"proposed {label} exceeds diagnostic budget")
+    base.require(
+        byte_length <= base.MAX_DIAGNOSTIC_BYTES,
+        f"proposed {label} exceeds diagnostic budget",
+    )
     return rendered
 
 
@@ -574,7 +625,9 @@ def _cached_process_self_test():
                 "cached native-launch guard failed for unrelated reason",
             )
         else:
-            raise base.SupervisionFailure("cached os.system reference bypassed trusted process mediation")
+            raise base.SupervisionFailure(
+                "cached os.system reference bypassed trusted process mediation"
+            )
     finally:
         base._ACTIVE_BRIDGE = prior
     print("cached_native_process_mediation=PASS")
@@ -631,9 +684,13 @@ def _remote_observation_self_test():
     class FakeBridge:
         def request(self, action, *arguments):
             if action == "len":
-                raise base.SupervisionFailure("Remote truth used unauthenticated type-name length shortcut")
+                raise base.SupervisionFailure(
+                    "Remote truth used unauthenticated type-name length shortcut"
+                )
             if action == "export":
-                raise base.SupervisionFailure("mapping-view truth incorrectly used actor export")
+                raise base.SupervisionFailure(
+                    "mapping-view truth incorrectly used actor export"
+                )
             if action == "truth":
                 remote = arguments[0]
                 handle = object.__getattribute__(remote, "_handle")
@@ -657,7 +714,9 @@ def _remote_observation_self_test():
                     "remote representation call envelope changed",
                 )
                 return "actual-proposed-repr" if formatter[1] == "{!r}" else "actual-proposed-str"
-            raise base.SupervisionFailure("unexpected remote observation self-test operation")
+            raise base.SupervisionFailure(
+                "unexpected remote observation self-test operation"
+            )
 
     bridge = FakeBridge()
     view = base._Remote(bridge, 1, "dict_keys")
@@ -705,21 +764,32 @@ def _remote_iteration_self_test():
                 if self.next_count == 1:
                     return "first"
                 raise StopIteration
-            raise base.SupervisionFailure("lazy iteration used eager or unexpected actor operation")
+            raise base.SupervisionFailure(
+                "lazy iteration used eager or unexpected actor operation"
+            )
 
     bridge = IteratorBridge()
     source = base._Remote(bridge, 1, "generator")
     iterator = iter(source)
-    base.require(bridge.actions == ["getattr", "call"], "Remote iteration consumed values while creating the iterator")
+    base.require(
+        bridge.actions == ["getattr", "call"],
+        "Remote iteration consumed values while creating the iterator",
+    )
     base.require(next(iterator) == "first", "Remote iterator lost its first item")
-    base.require(bridge.actions == ["getattr", "call", "next"], "Remote iterator eagerly consumed more than one item")
+    base.require(
+        bridge.actions == ["getattr", "call", "next"],
+        "Remote iterator eagerly consumed more than one item",
+    )
     try:
         next(iterator)
     except StopIteration:
         pass
     else:
         raise base.SupervisionFailure("Remote iterator lost StopIteration")
-    base.require("iterate" not in bridge.actions, "Remote iterator fell back to eager actor materialization")
+    base.require(
+        "iterate" not in bridge.actions,
+        "Remote iterator fell back to eager actor materialization",
+    )
     print("remote_lazy_iteration=PASS")
 
 
@@ -730,7 +800,10 @@ def _direct_output_policy_self_test():
     try:
         _require_silent_actor(NoisyBridge())
     except base.SupervisionFailure as exc:
-        base.require("emitted output" in str(exc), "direct-output guard failed for an unrelated reason")
+        base.require(
+            "emitted output" in str(exc),
+            "direct-output guard failed for an unrelated reason",
+        )
     else:
         raise base.SupervisionFailure("direct proposed-call output was not fail-closed")
     print("direct_call_output_policy=PASS")
@@ -748,7 +821,9 @@ def _state_preservation_self_test():
             root.chmod(0o755)
             (root / "tests").mkdir()
             (root / "blue_forge").mkdir()
-            (root / "blue_forge/__init__.py").write_text("def probe(): return 'real'\n", encoding="utf-8")
+            (root / "blue_forge/__init__.py").write_text(
+                "def probe(): return 'real'\n", encoding="utf-8"
+            )
             (root / "tests/test_state.py").write_text(
                 "import unittest\nfrom pathlib import Path\nfrom blue_forge import probe\n"
                 f"MARKER=Path.home()/{marker_name!r}\n"
@@ -774,24 +849,37 @@ def _deterministic_enumeration_self_test():
     global _AUTHENTICATED_SUITE_REPLAY
     marker = lambda root: []
     base.expected_tests = marker
-    base.require(base.expected_tests is marker, "deterministic execution self-test could not install override")
+    base.require(
+        base.expected_tests is marker,
+        "deterministic execution self-test could not install override",
+    )
     _restore_serial_expected_tests()
-    base.require(base.expected_tests is _deterministic_expected_tests, "serial runtime suite execution was not restored")
+    base.require(
+        base.expected_tests is _deterministic_expected_tests,
+        "serial runtime suite execution was not restored",
+    )
     identity = ("test_state", "State", "test_preserved")
     _AUTHENTICATED_SUITE_REPLAY = [identity]
     _authenticated_run_one(Path.cwd(), sys.executable, identity, 1)
-    base.require(_AUTHENTICATED_SUITE_REPLAY is None, "authenticated suite replay did not consume exact execution order")
+    base.require(
+        _AUTHENTICATED_SUITE_REPLAY is None,
+        "authenticated suite replay did not consume exact execution order",
+    )
     _state_preservation_self_test()
 
 
 def _final_boundary_self_test(python_bin, timeout_seconds, *, local_test=False):
-    _legacy_final_boundary_self_test(python_bin, timeout_seconds, local_test=local_test)
+    _legacy_final_boundary_self_test(
+        python_bin, timeout_seconds, local_test=local_test
+    )
     _remote_observation_self_test()
     _remote_iteration_self_test()
     _direct_output_policy_self_test()
     _deterministic_enumeration_self_test()
 
 
+# Round-3 and retained functions resolve these globals dynamically. Patch every
+# effective importer/worker hook while preserving all prior checks.
 round3._hardened_test_importer = _hardened_test_importer
 round3.round2._hardened_test_importer = _hardened_test_importer
 round3.round2.previous._test_importer = _hardened_test_importer
@@ -803,6 +891,7 @@ round3.round2.previous._self_test_subprocess_facade = _subprocess_policy_self_te
 round3._final_boundary_self_test = _final_boundary_self_test
 round3.round2.previous._self_test_dispatch_and_descriptors = _final_boundary_self_test
 
+# Compatibility names used by the governed launcher/current-suite scheduler.
 previous = round3.previous
 _enumerate_module_parent = round3._enumerate_module_parent
 
