@@ -95,11 +95,29 @@ while frame is not None:
 del frame
 def probe(): return 'wrong'
 '''
+    decoder = r'''
+target = None
+for candidate in object.__subclasses__():
+    if getattr(candidate, '__name__', None) == '_GraphDecoder':
+        target = candidate
+        break
+if target is not None:
+    original = target.decode
+    def replacement(self, value):
+        observed = original(self, value)
+        if observed == 'probe':
+            return 'forged'
+        return observed
+    target.decode = replacement
+def probe(): return 'wrong'
+def forged(): return 'real'
+'''
     for name, candidate_source in (
         ("dispatch", dispatch),
         ("descriptors", descriptors),
         ("reopening", reopening),
         ("mutation", mutation),
+        ("decoder", decoder),
     ):
         with tempfile.TemporaryDirectory(
             prefix="blue-forge-boundary-selftest-"
@@ -518,6 +536,7 @@ def _hardened_test_importer(bridge):
     safe_flags = {"-I", "-E", "-s", "-S", "-B", "-P", "-u"}
     safe_xoptions = {"utf8", "utf8=1", "utf8=0"}
     shell_programs = {"sh", "bash", "dash", "zsh", "ksh", "mksh"}
+    timeout_programs = {"timeout", "gtimeout"}
 
     def exact_sequence(command):
         if type(command) not in (list, tuple):
@@ -648,6 +667,15 @@ def _hardened_test_importer(bridge):
                 ),
                 "unsupported env-wrapped proposed application execution",
             )
+        if items and Path(items[0]).name in timeout_programs:
+            base.require(
+                not any(
+                    "blue_forge" in item
+                    or _looks_like_proposed_path(item, bridge.root)
+                    for item in items[1:]
+                ),
+                "timeout-wrapped proposed application execution is not allowed",
+            )
         wrapped = shell_wrapped_arguments(items)
         if wrapped:
             base.require(
@@ -686,6 +714,19 @@ def _hardened_test_importer(bridge):
                     items[index + 1] != "blue_forge",
                     "proposed CLI must use the actor bridge",
                 )
+
+    def relay_inherited(fd, payload):
+        base.require(type(payload) is bytes, "invalid actor CLI output")
+        view = memoryview(payload)
+        while view:
+            try:
+                written = os.write(fd, view)
+            except OSError as exc:
+                raise base.SupervisionFailure(
+                    "failed to relay proposed CLI output"
+                ) from exc
+            base.require(written > 0, "failed to relay proposed CLI output")
+            view = view[written:]
 
     def bridged_run(command, kwargs, details):
         subcommand, path, env_overrides = details
@@ -785,7 +826,15 @@ def _hardened_test_importer(bridge):
         rc, stdout, stderr, timed_out = bridge.request(
             "cli", [subcommand], payload, environment, merge_stderr, actor_timeout
         )
+        base.require(
+            type(stdout) is bytes and type(stderr) is bytes,
+            "invalid actor CLI output",
+        )
         base.require(type(timed_out) is bool, "invalid actor CLI timeout observation")
+        if stdout_mode is None and stdout:
+            relay_inherited(1, stdout)
+        if stderr_mode is None and stderr:
+            relay_inherited(2, stderr)
         if timed_out:
             if timeout is None:
                 raise base.SupervisionFailure(
@@ -1083,6 +1132,26 @@ def _subprocess_policy_self_test():
             merged.stdout == b"merged" and merged.stderr is None,
             "bridged subprocess.run did not preserve actor-side stderr merge",
         )
+        read_fd, write_fd = os.pipe()
+        saved_stdout = os.dup(1)
+        inherited = None
+        try:
+            os.dup2(write_fd, 1)
+            os.close(write_fd)
+            inherited = proxy.run(
+                command, stderr=subprocess.DEVNULL, check=True
+            )
+        finally:
+            os.dup2(saved_stdout, 1)
+            os.close(saved_stdout)
+        inherited_bytes = os.read(read_fd, 8192)
+        os.close(read_fd)
+        base.require(
+            inherited is not None
+            and inherited.stdout is None
+            and inherited_bytes == b"bridged",
+            "bridged subprocess.run discarded inherited stdout",
+        )
         try:
             proxy.run(command, capture_output=True, timeout=0.125)
         except subprocess.TimeoutExpired as exc:
@@ -1129,6 +1198,7 @@ def _subprocess_policy_self_test():
         unsupported_env = [
             "env", "-i", sys.executable, "-m", "blue_forge", "verify", str(case)
         ]
+        timeout_wrapped = ["timeout", "5", *command]
         for operation in (
             lambda: proxy.Popen(command),
             lambda: proxy.run(
@@ -1136,6 +1206,7 @@ def _subprocess_policy_self_test():
             ),
             lambda: proxy.run(shell_wrapped),
             lambda: proxy.run(unsupported_env),
+            lambda: proxy.run(timeout_wrapped),
         ):
             try:
                 operation()
