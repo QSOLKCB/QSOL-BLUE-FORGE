@@ -13,12 +13,12 @@ mode also masks procfs, removing /proc/self/mem as a protection bypass.
 
 Operation selection remains on the subinterpreter control thread. Proposed
 calls enter a fresh transport-free wrapper whose arguments are locals, not a
-shared dispatch dictionary. Request graph reconstruction uses a one-shot
-empty-global decoder that is destroyed before proposed Python runs; no mutable
-decoder implementation class remains discoverable in the proposed interpreter.
-Namespace mutation fails closed before an observation is accepted. Kernel
-isolation and the existing audit/thread/tracing guards remain required. This is
-tested observation isolation, not universal Python attestation.
+shared dispatch dictionary. Request graph reconstruction and response encoding
+use one-shot empty-global functions reconstructed from immutable code objects;
+no mutable decoder/encoder function or closure remains reachable while proposed
+Python executes. Namespace mutation fails closed before an observation is
+accepted. Kernel isolation and the existing audit/thread/tracing guards remain
+required. This is tested observation isolation, not universal Python attestation.
 """
 from __future__ import annotations
 
@@ -135,13 +135,14 @@ if _spec is None or _spec.loader is None:
     raise _bf_RuntimeError("trusted executor implementation support is unavailable")
 _support = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_support)
-# The support module also serves the trusted worker, but its mutable decoder
-# class must never survive in this proposed interpreter. Remove its only module
-# root before retaining any support functions whose globals keep the module
-# dictionary alive.
-_bf_dict_pop(_support.__dict__, "_GraphDecoder", None)
-_bf_encode_data = _support._encode_data
-_bf_require = _support.require
+# Support classes remain discoverable through object.__subclasses__() even when
+# their module name is removed. Scrub every retained response-encoder root from
+# the support dictionary before proposed code can run. Response encoding below
+# is reconstructed independently from an immutable code object after each
+# proposed call has fully unwound.
+for _bf_support_name in ("_GraphDecoder", "_GraphEncoder", "_encode_data"):
+    _bf_dict_pop(_support.__dict__, _bf_support_name, None)
+del _bf_support_name
 _bf_max_nodes = _support.MAX_GRAPH_NODES
 _bf_islice = _support.itertools.islice
 _bf_deepcopy = _support.copy.deepcopy
@@ -158,6 +159,7 @@ _bf_kill_group = _support._kill_group
 _bf_settrace_all_threads = _support.threading.settrace_all_threads
 _bf_setprofile_all_threads = _support.threading.setprofile_all_threads
 _bf_b64decode = _support.base64.b64decode
+_bf_b2a_base64 = _support.base64.binascii.b2a_base64
 _bf_MagicMock = _support.mock.MagicMock
 _bf_io_module = _support.io
 _bf_Any = _support.Any
@@ -179,6 +181,11 @@ for _bf_builtin_name, _bf_builtin_candidate in _bf_dict_items(_bf_builtin_snapsh
     ):
         _bf_builtin_exceptions[_bf_builtin_name] = _bf_builtin_candidate
 del _bf_builtin_name, _bf_builtin_candidate
+
+
+def _bf_require(condition, reason):
+    if not condition:
+        raise _bf_RuntimeError(reason)
 
 
 def _bf_run_cli_bounded(
@@ -332,9 +339,9 @@ finally:
 del (_bf_trace_probe, _bf_ignore_expected_unraisable, _bf_saved_unraisablehook,
      _bf_trace_setter, _bf_trace_getter, _bf_hook_attr, _bf_label)
 _bf_modules.pop("_blue_forge_executor_support", None)
-# The support module dictionary is retained indirectly by trusted helper
-# functions, but its decoder class was removed before those references were
-# captured. Drop the direct module/spec roots as well.
+# The support module dictionary may remain indirectly reachable through support
+# classes, but the live response encoder and mutable encoder class roots were
+# removed before proposed imports. Drop the direct module/spec roots as well.
 del _support, _spec
 _bf_modules["_xxsubinterpreters"] = None
 _bf_modules["gc"] = None
@@ -364,6 +371,45 @@ def bounded_iterate(value, iter_fn, tuple_fn, islice_fn, len_fn, limit, error_ty
     if len_fn(items) > limit:
         raise error_type("executor iteration budget exceeded")
     return items
+
+def encode_data(value, budget, depth):
+    budget[0] -= 1
+    if budget[0] < 0 or depth > 64:
+        raise error_type("actor data export exceeds budget")
+    t = type_fn(value)
+    if value is None or t is bool_type or t is str_type:
+        return ["scalar", value]
+    if t is int_type:
+        return ["int", integer_text_fn(value)]
+    if t is bytes_type:
+        return ["bytes", bytes_decode_fn(b2a_base64_fn(value, newline=False), "ascii")]
+    if t is float_type:
+        return ["float", float_hex_fn(value)]
+    if t is dict_type:
+        return [
+            "dict",
+            [
+                [
+                    encode_data(key, budget, depth + 1),
+                    encode_data(child, budget, depth + 1),
+                ]
+                for key, child in dict_items_fn(value)
+            ],
+        ]
+    if t is list_type:
+        tag = "list"
+    elif t is tuple_type:
+        tag = "tuple"
+    elif t is set_type:
+        tag = "set"
+    elif t is frozenset_type:
+        tag = "frozenset"
+    else:
+        raise error_type("actor export is not builtin data")
+    return [
+        tag,
+        [encode_data(child, budget, depth + 1) for child in iter_fn(value)],
+    ]
 
 def decode_graph(value, nodes, handles, cache, classes):
     require_fn(type_fn(value) is list_type and len_fn(value) == 2,
@@ -472,14 +518,13 @@ def decode_graph(value, nodes, handles, cache, classes):
 ''', "<blue-forge-proposed-operation>", "exec"), _bf_compile_namespace)
 _bf_call_code = _bf_compile_namespace["execute_action"].__code__
 _bf_iterate_code = _bf_compile_namespace["bounded_iterate"].__code__
+_bf_encode_code = _bf_compile_namespace["encode_data"].__code__
 _bf_decode_code = _bf_compile_namespace["decode_graph"].__code__
 del _bf_compile_namespace
 
-# A template of trusted primitive references is copied into a private globals
-# dictionary for each request. Recursive decode calls therefore use direct
-# global lookups instead of unpacking a large dependency tuple at every node,
-# while the resulting function and its private globals are still destroyed before
-# any proposed import/getattr/call begins.
+# Templates contain only captured immutable/builtin/C-level primitives. A fresh
+# private globals dictionary is constructed per decode/encode operation and is
+# destroyed before proposed Python can run again.
 _bf_decode_globals_template = {
     "type_fn": _bf_type,
     "len_fn": _bf_len,
@@ -515,6 +560,28 @@ _bf_decode_globals_template = {
 }
 _bf_decode_global_count = _bf_len(_bf_decode_globals_template) + 2
 
+_bf_encode_globals_template = {
+    "type_fn": _bf_type,
+    "bool_type": _bf_bool,
+    "str_type": _bf_str,
+    "int_type": _bf_int,
+    "bytes_type": _bf_bytes,
+    "float_type": _bf_float,
+    "dict_type": _bf_dict,
+    "list_type": _bf_list,
+    "tuple_type": _bf_tuple,
+    "set_type": _bf_set,
+    "frozenset_type": _bf_frozenset,
+    "integer_text_fn": _bf_str,
+    "float_hex_fn": _bf_float_hex,
+    "b2a_base64_fn": _bf_b2a_base64,
+    "bytes_decode_fn": _bf_bytes.decode,
+    "dict_items_fn": _bf_dict_items,
+    "iter_fn": _bf_iter,
+    "error_type": _bf_RuntimeError,
+}
+_bf_encode_global_count = _bf_len(_bf_encode_globals_template) + 2
+
 sys.path.insert(0, _bf_str(_BF_ROOT))
 os.chdir(_BF_ROOT)
 sys.stdout = sys.stderr
@@ -540,6 +607,25 @@ def _bf_check_namespace(record):
     if (_bf_type(key) is not _bf_str or key != "__builtins__"
             or namespace[key] is not empty_builtins or _bf_len(empty_builtins) != 0):
         raise _bf_RuntimeError("proposed operation mutated its invocation namespace")
+
+
+def _bf_encode_observation(value):
+    encode_globals = _bf_dict_copy(_bf_encode_globals_template)
+    encode_globals["__builtins__"] = {}
+    encoder = _bf_FunctionType(_bf_encode_code, encode_globals)
+    encode_globals["encode_data"] = encoder
+    try:
+        return encoder(value, [_bf_max_nodes], 0)
+    finally:
+        _bf_require(
+            _bf_len(encode_globals) == _bf_encode_global_count
+            and encode_globals.get("encode_data") is encoder
+            and _bf_type(encode_globals.get("__builtins__")) is _bf_dict
+            and _bf_len(encode_globals["__builtins__"]) == 0,
+            "response encoder namespace was mutated",
+        )
+        _bf_dict_pop(encode_globals, "encode_data", None)
+        del encoder, encode_globals
 
 
 def _bf_select_operation(action, arguments):
@@ -662,7 +748,7 @@ def _bf_result(value):
     if value is None or _bf_type(value) in (
         _bf_str, _bf_bytes, _bf_int, _bf_float, _bf_bool
     ):
-        return ["data", _bf_encode_data(value)]
+        return ["data", _bf_encode_observation(value)]
     if _bf_type(value) is _bf_tuple:
         return ["tuple", [_bf_result(item) for item in value]]
     oid = _bf_id(value)
@@ -828,13 +914,13 @@ def _bf_process_one(raw):
         if action == "module":
             _bf_capture_exports()
         observation = {"ok": True, "value": (
-            ["data", _bf_encode_data(_bf_encode_data(observed))]
+            ["data", _bf_encode_observation(_bf_encode_observation(observed))]
             if action == "export" else _bf_result(observed))}
     else:
         observation = {"ok": False, "error": _bf_exception_key(observed), "message": message}
     states = {}
     for key in state_sync:
-        states[_bf_str(key)] = _bf_encode_data(
+        states[_bf_str(key)] = _bf_encode_observation(
             _bf_object.__getattribute__(cache[key], "__dict__"))
     observation["states"] = states
     payload = _bf_marshal_dumps(observation, 4)
