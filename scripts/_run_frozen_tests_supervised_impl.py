@@ -83,6 +83,8 @@ def _make_wire_codec():
     join = str.join
     maximum = MAX_FRAME_BYTES
     error = SupervisionFailure
+    length = len
+    enumerate_fn = enumerate
 
     def dump(value):
         chunks = []
@@ -90,7 +92,7 @@ def _make_wire_codec():
 
         def emit(text):
             nonlocal size
-            size += len(text)
+            size += length(text)
             if size > maximum:
                 raise error("wire frame exceeds byte budget")
             chunks.append(text)
@@ -109,14 +111,14 @@ def _make_wire_codec():
                 emit(quote(obj))
             elif t is list or t is tuple:
                 emit("[")
-                for i, child in enumerate(obj):
+                for i, child in enumerate_fn(obj):
                     if i:
                         emit(",")
                     visit(child, depth + 1)
                 emit("]")
             elif t is dict:
                 emit("{")
-                for i, (key, child) in enumerate(items(obj)):
+                for i, (key, child) in enumerate_fn(items(obj)):
                     if kind(key) is not str:
                         raise error("wire object key is not an exact string")
                     if i:
@@ -132,10 +134,10 @@ def _make_wire_codec():
         return encode(join("", chunks), "ascii")
 
     def load(raw):
-        if kind(raw) is not bytes or len(raw) > maximum:
+        if kind(raw) is not bytes or length(raw) > maximum:
             raise error("invalid or oversized wire frame")
         try:
-            return decode(raw.decode("ascii"))
+            return decode(bytes.decode(raw, "ascii"))
         except (ValueError, UnicodeError, RecursionError) as exc:
             raise error("malformed wire JSON") from exc
 
@@ -143,6 +145,137 @@ def _make_wire_codec():
 
 
 _wire_dump, _wire_load = _make_wire_codec()
+
+
+# Proposed code can mutate the subinterpreter's builtins module. Capture every
+# scalar type/converter and container primitive used by actor data observations
+# before any proposed import, so response encoding never resolves attacker-
+# replaced names such as builtins.str at observation time.
+def _make_data_codec():
+    kind = type
+    length = len
+    bool_type = bool
+    str_type = str
+    int_type = int
+    bytes_type = bytes
+    float_type = float
+    dict_type = dict
+    list_type = list
+    tuple_type = tuple
+    set_type = set
+    frozenset_type = frozenset
+    integer_text = str
+    float_hex = float.hex
+    float_fromhex = float.fromhex
+    b64encode = base64.b64encode
+    b64decode = base64.b64decode
+    bytes_decode = bytes.decode
+    dict_items = dict.items
+    iterator = iter
+    error = SupervisionFailure
+    maximum_nodes = MAX_GRAPH_NODES
+    key_types = (str_type, int_type, bool_type, bytes_type, float_type, tuple_type)
+    container_tags = {
+        list_type: "list",
+        tuple_type: "tuple",
+        set_type: "set",
+        frozenset_type: "frozenset",
+    }
+    constructors = {
+        "list": list_type,
+        "tuple": tuple_type,
+        "set": set_type,
+        "frozenset": frozenset_type,
+    }
+
+    def check(condition, reason):
+        if not condition:
+            raise error(reason)
+
+    def encode_data(value, *, budget=None, depth=0):
+        """Export only bounded exact builtin data without mutable globals."""
+        if budget is None:
+            budget = [maximum_nodes]
+        budget[0] -= 1
+        check(budget[0] >= 0 and depth <= 64, "actor data export exceeds budget")
+        t = kind(value)
+        if value is None or t is bool_type or t is str_type:
+            return ["scalar", value]
+        if t is int_type:
+            return ["int", integer_text(value)]
+        if t is bytes_type:
+            return ["bytes", bytes_decode(b64encode(value), "ascii")]
+        if t is float_type:
+            return ["float", float_hex(value)]
+        if t is dict_type:
+            return [
+                "dict",
+                [
+                    [
+                        encode_data(k, budget=budget, depth=depth + 1),
+                        encode_data(v, budget=budget, depth=depth + 1),
+                    ]
+                    for k, v in dict_items(value)
+                ],
+            ]
+        if t in container_tags:
+            return [
+                container_tags[t],
+                [encode_data(v, budget=budget, depth=depth + 1) for v in iterator(value)],
+            ]
+        raise error("actor export is not builtin data")
+
+    def decode_data(value, *, budget=None, depth=0):
+        if budget is None:
+            budget = [maximum_nodes]
+        budget[0] -= 1
+        check(
+            budget[0] >= 0
+            and depth <= 64
+            and kind(value) is list_type
+            and length(value) == 2,
+            "invalid actor data envelope",
+        )
+        tag, data = value
+        if tag == "scalar":
+            check(
+                data is None or kind(data) in (bool_type, str_type),
+                "invalid scalar response",
+            )
+            return data
+        if tag == "int":
+            check(
+                kind(data) is str_type and length(data) <= 5000,
+                "invalid integer response",
+            )
+            return int_type(data)
+        if tag == "float":
+            check(kind(data) is str_type, "invalid float response")
+            return float_fromhex(data)
+        if tag == "bytes":
+            check(kind(data) is str_type, "invalid bytes response")
+            return b64decode(data, validate=True)
+        check(kind(data) is list_type, "invalid container response")
+        if tag == "dict":
+            out = dict_type()
+            for pair in iterator(data):
+                check(
+                    kind(pair) is list_type and length(pair) == 2,
+                    "invalid mapping entry",
+                )
+                key = decode_data(pair[0], budget=budget, depth=depth + 1)
+                check(kind(key) in key_types, "invalid mapping key")
+                check(key not in out, "duplicate actor mapping key")
+                out[key] = decode_data(pair[1], budget=budget, depth=depth + 1)
+            return out
+        check(tag in constructors, "unknown actor data tag")
+        items = [decode_data(v, budget=budget, depth=depth + 1) for v in iterator(data)]
+        return constructors[tag](items)
+
+    return encode_data, decode_data
+
+
+_encode_data, _decode_data = _make_data_codec()
 
 
 def _kill_group(process: subprocess.Popen) -> None:
@@ -430,66 +563,13 @@ class _GraphDecoder:
         return obj
 
 
-def _encode_data(value, *, budget=None, depth=0):
-    """Export only bounded builtin data, without executing object constructors."""
-    if budget is None:
-        budget = [MAX_GRAPH_NODES]
-    budget[0] -= 1
-    require(budget[0] >= 0 and depth <= 64, "actor data export exceeds budget")
-    t = type(value)
-    if value is None or t is bool or t is str:
-        return ["scalar", value]
-    if t is int:
-        return ["int", str(value)]
-    if t is bytes:
-        return ["bytes", base64.b64encode(value).decode("ascii")]
-    if t is float:
-        return ["float", value.hex()]
-    if t is dict:
-        return ["dict", [[_encode_data(k, budget=budget, depth=depth+1),
-                          _encode_data(v, budget=budget, depth=depth+1)] for k, v in value.items()]]
-    if t in (list, tuple, set, frozenset):
-        return [t.__name__, [_encode_data(v, budget=budget, depth=depth+1) for v in value]]
-    raise SupervisionFailure("actor export is not builtin data")
-
-
-def _decode_data(value, *, budget=None, depth=0):
-    if budget is None:
-        budget = [MAX_GRAPH_NODES]
-    budget[0] -= 1
-    require(budget[0] >= 0 and depth <= 64 and type(value) is list and len(value) == 2,
-            "invalid actor data envelope")
-    tag, data = value
-    if tag == "scalar":
-        require(data is None or type(data) in (bool, str), "invalid scalar response")
-        return data
-    if tag == "int":
-        require(type(data) is str and len(data) <= 5000, "invalid integer response")
-        return int(data)
-    if tag == "float":
-        return float.fromhex(data)
-    if tag == "bytes":
-        return base64.b64decode(data, validate=True)
-    require(type(data) is list, "invalid container response")
-    if tag == "dict":
-        out = {}
-        for pair in data:
-            require(type(pair) is list and len(pair) == 2, "invalid mapping entry")
-            key = _decode_data(pair[0], budget=budget, depth=depth+1)
-            require(type(key) in (str, int, bool, bytes, float, tuple), "invalid mapping key")
-            require(key not in out, "duplicate actor mapping key")
-            out[key] = _decode_data(pair[1], budget=budget, depth=depth+1)
-        return out
-    require(tag in {"list", "tuple", "set", "frozenset"}, "unknown actor data tag")
-    items = [_decode_data(v, budget=budget, depth=depth+1) for v in data]
-    return {"list": list, "tuple": tuple, "set": set, "frozenset": frozenset}[tag](items)
-
-
-
-def _run_cli_bounded(command, root, environment):
+def _run_cli_bounded(command, root, environment, merge_stderr=False):
+    require(type(merge_stderr) is bool, "CLI stderr merge mode must be boolean")
+    stderr_target = subprocess.STDOUT if merge_stderr else subprocess.PIPE
     process = subprocess.Popen(command, cwd=root, env=environment, start_new_session=True,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    outputs = [bytearray(), bytearray()]
+                               stdout=subprocess.PIPE, stderr=stderr_target)
+    outputs = [bytearray()] if merge_stderr else [bytearray(), bytearray()]
+    streams = (process.stdout,) if merge_stderr else (process.stdout, process.stderr)
     overflow = threading.Event()
 
     def drain(stream, destination):
@@ -503,7 +583,7 @@ def _run_cli_bounded(command, root, environment):
             stream.close()
 
     readers = [threading.Thread(target=drain, args=pair, daemon=True)
-               for pair in zip((process.stdout, process.stderr), outputs)]
+               for pair in zip(streams, outputs)]
     for reader in readers:
         reader.start()
     try:
@@ -514,6 +594,8 @@ def _run_cli_bounded(command, root, environment):
             reader.join(timeout=2)
     require(not overflow.is_set() and not any(t.is_alive() for t in readers),
             "CLI output budget exceeded or descendants retained output")
+    if merge_stderr:
+        return rc, bytes(outputs[0]), b""
     return rc, bytes(outputs[0]), bytes(outputs[1])
 
 
@@ -588,12 +670,18 @@ def _actor(root):
             elif action == "export":
                 value = _encode_data(arguments[0])
             elif action == "cli":
-                cli_args, case_bytes, environment = arguments
+                if len(arguments) == 3:
+                    cli_args, case_bytes, environment = arguments
+                    merge_stderr = False
+                else:
+                    require(len(arguments) == 4, "invalid CLI actor arguments")
+                    cli_args, case_bytes, environment, merge_stderr = arguments
+                require(type(merge_stderr) is bool, "CLI stderr merge mode must be boolean")
                 with tempfile.TemporaryDirectory() as temp:
                     path = Path(temp) / "case.json"
                     path.write_bytes(case_bytes)
                     command = [sys.executable, "-m", "blue_forge", cli_args[0], str(path)]
-                    value = _run_cli_bounded(command, root, environment)
+                    value = _run_cli_bounded(command, root, environment, merge_stderr)
             else:
                 raise SupervisionFailure("unknown actor operation")
             response = {"sequence": request["sequence"], "ok": True,
@@ -633,6 +721,8 @@ class _Bridge:
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         start_new_session=True, bufsize=0)
         self.tail = bytearray()
+        self.diagnostic_bytes = 0
+        self.diagnostic_overflow = threading.Event()
         self.sequence = 0
         self.fatal = None
         self.refs = {}
@@ -642,9 +732,23 @@ class _Bridge:
         self.reader.start()
 
     def _drain(self):
-        while chunk := self.process.stderr.read(8192):
-            self.tail.extend(chunk)
-            del self.tail[:-MAX_DIAGNOSTIC_BYTES]
+        try:
+            while chunk := self.process.stderr.read(8192):
+                self.diagnostic_bytes += len(chunk)
+                self.tail.extend(chunk)
+                del self.tail[:-MAX_DIAGNOSTIC_BYTES]
+                if self.diagnostic_bytes > MAX_DIAGNOSTIC_BYTES and not self.diagnostic_overflow.is_set():
+                    self.diagnostic_overflow.set()
+                    self.fatal = "actor diagnostic output budget exceeded"
+                    # The control FIFO is a trusted namespace-lifetime kill switch.
+                    # Closing it prevents a noisy actor from continuing to stream
+                    # unbounded diagnostics after the budget has been crossed.
+                    if self.control_fd is not None:
+                        os.close(self.control_fd)
+                        self.control_fd = None
+        except (OSError, ValueError) as exc:
+            if self.fatal is None:
+                self.fatal = "actor diagnostic drain failed: " + str(exc)
 
     def _result(self, item):
         require(type(item) is list and len(item) == 2, "invalid actor result")
@@ -672,6 +776,10 @@ class _Bridge:
         selector.register(self.process.stdout, selectors.EVENT_READ)
         try:
             while True:
+                require(
+                    not self.diagnostic_overflow.is_set(),
+                    "actor diagnostic output budget exceeded",
+                )
                 remaining = deadline - time.monotonic()
                 require(remaining > 0, "proposed RPC timeout")
                 events = selector.select(remaining)
@@ -690,6 +798,10 @@ class _Bridge:
                         if b"\n" in output:
                             line, remainder = bytes(output).split(b"\n", 1)
                             require(not remainder and not pending, "unexpected actor protocol output")
+                            require(
+                                not self.diagnostic_overflow.is_set(),
+                                "actor diagnostic output budget exceeded",
+                            )
                             return _wire_load(line)
         finally:
             selector.close()
@@ -740,7 +852,10 @@ class _Bridge:
         return _decode_data(self.request("export", value))
 
     def close(self):
-        self.process.stdin.close()
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
         if self.control_fd is not None:
             os.close(self.control_fd)
             self.control_fd = None
@@ -757,6 +872,10 @@ class _Bridge:
             self.process.stderr.close()
         require(self.process.returncode == 0, "isolated actor launcher failed during cleanup")
         require(not self.reader.is_alive(), "actor stderr descendants survived namespace teardown")
+        require(
+            not self.diagnostic_overflow.is_set(),
+            "actor diagnostic output budget exceeded",
+        )
 
 
 class _ProxyLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
@@ -803,7 +922,10 @@ def _test_importer(bridge):
             env = dict(kwargs.get("env") or os.environ)
             # Do not propagate worker/supervisor configuration into proposed CLI.
             env = {k: v for k, v in env.items() if not k.startswith("BLUE_FORGE_")}
-            rc, stdout, stderr = bridge.request("cli", list(command[3:]), payload, env)
+            merge_stderr = kwargs.get("stderr") == subprocess.STDOUT
+            rc, stdout, stderr = bridge.request(
+                "cli", list(command[3:]), payload, env, merge_stderr
+            )
             if kwargs.get("text") or kwargs.get("universal_newlines"):
                 encoding = kwargs.get("encoding") or "utf-8"
                 stdout, stderr = stdout.decode(encoding), stderr.decode(encoding)
@@ -915,6 +1037,73 @@ def _self_test(python_bin, timeout_seconds, *, local_test=False):
             else:
                 raise SupervisionFailure("oracle accepted attack " + name)
 
+
+def _self_test_scalar_codec(python_bin, timeout_seconds, *, local_test=False):
+    with tempfile.TemporaryDirectory(prefix="blue-forge-scalar-codec-selftest-") as temp:
+        root = Path(temp)
+        root.chmod(0o755)
+        (root / "tests").mkdir()
+        (root / "blue_forge").mkdir()
+        (root / "blue_forge/__init__.py").write_text(
+            "import builtins\n"
+            "builtins.str=lambda value:'1'\n"
+            "def probe(): return 0\n",
+            encoding="utf-8",
+        )
+        (root / "tests/test_scalar.py").write_text(
+            "import unittest\nfrom blue_forge import probe\n"
+            "class Scalar(unittest.TestCase):\n"
+            " def test_truth(self): self.assertEqual(probe(), 0)\n"
+            " def test_forgery(self): self.assertEqual(probe(), 1)\n",
+            encoding="utf-8",
+        )
+        run_one(
+            root, python_bin, ("test_scalar", "Scalar", "test_truth"),
+            timeout_seconds, local_test=local_test,
+        )
+        try:
+            run_one(
+                root, python_bin, ("test_scalar", "Scalar", "test_forgery"),
+                timeout_seconds, local_test=local_test,
+            )
+        except SupervisionFailure:
+            return
+        raise SupervisionFailure("proposed builtins mutation forged scalar observation")
+
+
+def _self_test_diagnostic_budget(python_bin, timeout_seconds, *, local_test=False):
+    with tempfile.TemporaryDirectory(prefix="blue-forge-diagnostic-selftest-") as temp:
+        root = Path(temp)
+        root.chmod(0o755)
+        (root / "tests").mkdir()
+        (root / "blue_forge").mkdir()
+        (root / "blue_forge/__init__.py").write_text(
+            "import os\n"
+            "def quiet(): return 'real'\n"
+            "def noisy():\n"
+            f" os.write(2,b'x'*{MAX_DIAGNOSTIC_BYTES + 8192})\n"
+            " return 'real'\n",
+            encoding="utf-8",
+        )
+        (root / "tests/test_diagnostic.py").write_text(
+            "import unittest\nfrom blue_forge import quiet,noisy\n"
+            "class Diagnostic(unittest.TestCase):\n"
+            " def test_quiet(self): self.assertEqual(quiet(), 'real')\n"
+            " def test_noisy(self): self.assertEqual(noisy(), 'real')\n",
+            encoding="utf-8",
+        )
+        run_one(
+            root, python_bin, ("test_diagnostic", "Diagnostic", "test_quiet"),
+            timeout_seconds, local_test=local_test,
+        )
+        try:
+            run_one(
+                root, python_bin, ("test_diagnostic", "Diagnostic", "test_noisy"),
+                timeout_seconds, local_test=local_test,
+            )
+        except SupervisionFailure:
+            return
+        raise SupervisionFailure("actor diagnostic overflow was accepted")
 
 
 def _self_test_boundary_transport(python_bin, timeout_seconds, *, local_test=False):
@@ -1050,6 +1239,8 @@ def main(argv=None):
             require(args.root is not None, "missing frozen root")
             require(not args.local_test or os.environ.get("GITHUB_ACTIONS") != "true", "local-test mode cannot authorize CI")
             _self_test(args.python, args.timeout_seconds, local_test=args.local_test)
+            _self_test_scalar_codec(args.python, args.timeout_seconds, local_test=args.local_test)
+            _self_test_diagnostic_budget(args.python, args.timeout_seconds, local_test=args.local_test)
             _self_test_boundary_transport(args.python, args.timeout_seconds, local_test=args.local_test)
             _self_test_encoder_failure(args.python, args.timeout_seconds, local_test=args.local_test)
             if not args.local_test:

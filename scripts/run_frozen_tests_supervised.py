@@ -517,6 +517,7 @@ def _hardened_test_importer(bridge):
 
     safe_flags = {"-I", "-E", "-s", "-S", "-B", "-P", "-u"}
     safe_xoptions = {"utf8", "utf8=1", "utf8=0"}
+    shell_programs = {"sh", "bash", "dash", "zsh", "ksh", "mksh"}
 
     def exact_sequence(command):
         if type(command) not in (list, tuple):
@@ -567,6 +568,34 @@ def _hardened_test_importer(bridge):
         )
         return cli[0], Path(cli[1])
 
+    def shell_wrapped_arguments(items):
+        """Return command-interpreter arguments, including env/busybox wrappers."""
+        if not items:
+            return ()
+        start = 0
+        program = Path(items[start]).name
+        if program == "env":
+            found = None
+            for index, token in enumerate(items[1:], 1):
+                if Path(token).name in shell_programs or Path(token).name == "busybox":
+                    found = index
+                    break
+            if found is None:
+                return ()
+            start = found
+            program = Path(items[start]).name
+        if program == "busybox":
+            if start + 1 >= len(items):
+                return ()
+            candidate = Path(items[start + 1]).name
+            if candidate not in shell_programs:
+                return ()
+            start += 1
+            program = candidate
+        if program not in shell_programs:
+            return ()
+        return tuple(items[start + 1 :])
+
     def reject_direct_proposed(command, *, shell=False):
         base.require(
             shell is not True,
@@ -581,6 +610,16 @@ def _hardened_test_importer(bridge):
         items = exact_sequence(command)
         if items is None:
             return
+        wrapped = shell_wrapped_arguments(items)
+        if wrapped:
+            base.require(
+                not any(
+                    "blue_forge" in item
+                    or _looks_like_proposed_path(item, bridge.root)
+                    for item in wrapped
+                ),
+                "shell-wrapped proposed application execution is not allowed",
+            )
         try:
             same_python = bool(items) and (
                 Path(items[0]).resolve()
@@ -702,12 +741,10 @@ def _hardened_test_importer(bridge):
             len(payload) <= 2 * 1024 * 1024,
             "proposed CLI case transport budget exceeded",
         )
+        merge_stderr = stderr_mode == subprocess.STDOUT
         rc, stdout, stderr = bridge.request(
-            "cli", [subcommand], payload, environment
+            "cli", [subcommand], payload, environment, merge_stderr
         )
-        if stderr_mode == subprocess.STDOUT:
-            stdout = stdout + stderr
-            stderr = b""
         text_mode = bool(
             kwargs.get("text")
             or kwargs.get("universal_newlines")
@@ -937,6 +974,12 @@ def _subprocess_policy_self_test():
                 arguments[0] == ["verify"],
                 "subprocess self-test lost CLI action",
             )
+            base.require(
+                len(arguments) == 4 and type(arguments[3]) is bool,
+                "subprocess self-test lost stderr merge mode",
+            )
+            if arguments[3]:
+                return 0, b"merged", b""
             return 0, b"bridged", b"diagnostic"
 
     with tempfile.TemporaryDirectory(
@@ -965,6 +1008,16 @@ def _subprocess_policy_self_test():
             and completed.stderr == b"diagnostic",
             "bridged subprocess.run lost captured output",
         )
+        merged = proxy.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+        base.require(
+            merged.stdout == b"merged" and merged.stderr is None,
+            "bridged subprocess.run did not preserve actor-side stderr merge",
+        )
         base.require(
             proxy.check_output(command) == b"bridged",
             "bridged subprocess.check_output failed",
@@ -992,11 +1045,17 @@ def _subprocess_policy_self_test():
             "subprocess facade leaked outside trusted test scope",
         )
 
+        shell_wrapped = [
+            "/bin/sh",
+            "-c",
+            f"{sys.executable} -m blue_forge verify {case}",
+        ]
         for operation in (
             lambda: proxy.Popen(command),
             lambda: proxy.run(
                 [sys.executable, "-c", "import blue_forge"]
             ),
+            lambda: proxy.run(shell_wrapped),
         ):
             try:
                 operation()
